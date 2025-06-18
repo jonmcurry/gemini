@@ -42,26 +42,39 @@ async def create_claim(
         logger.error("Error saving claim to database", claim_id=claim_data.claim_id, error=str(e), exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to save claim to database.")
 
-# Import the processing service
+# Imports for background batch processing
+from fastapi import BackgroundTasks
 from ...processing.claims_processing_service import ClaimProcessingService
+from ...core.database.db_session import AsyncSessionLocal # Import the session factory
 
-@router.post("/process-batch/", summary="Trigger Batch Processing of Claims")
-async def trigger_batch_processing(
-    db: AsyncSession = Depends(get_db_session),
-    batch_size: int = 100 # Example: make batch_size configurable via query param
+# This is a new helper function that will run in the background.
+# It's responsible for creating its own DB session.
+async def run_batch_processing_background(batch_size: int):
+    logger.info("Background task started: run_batch_processing_background", batch_size=batch_size)
+    # Create a new session for this background task
+    async with AsyncSessionLocal() as session:
+        try:
+            service = ClaimProcessingService(db_session=session)
+            await service.process_pending_claims_batch(batch_size=batch_size)
+            logger.info("Background task finished: run_batch_processing_background", batch_size=batch_size)
+        except Exception as e:
+            logger.error("Error in background batch processing task", error=str(e), exc_info=True, batch_size=batch_size)
+            # Consider how to signal this failure if needed (e.g., update a status in DB)
+        # Session is automatically closed by 'async with'
+
+@router.post("/process-batch/", summary="Trigger Batch Processing of Claims (Background)")
+async def trigger_batch_processing_background(
+    background_tasks: BackgroundTasks, # Add BackgroundTasks dependency
+    # db: AsyncSession = Depends(get_db_session), # DB session no longer directly used by endpoint logic
+    batch_size: int = 100
 ):
     """
-    Triggers a batch processing run for pending claims.
-    Fetches, validates, and calculates RVUs (mocked) for a batch of claims.
+    Triggers a background batch processing run for pending claims.
+    The API will return immediately.
     """
-    logger.info(f"Received request to process batch of claims.", batch_size=batch_size)
+    logger.info(f"Received request to process batch of claims in background.", batch_size=batch_size)
 
-    service = ClaimProcessingService(db_session=db)
+    background_tasks.add_task(run_batch_processing_background, batch_size=batch_size)
 
-    try:
-        result = await service.process_pending_claims_batch(batch_size=batch_size)
-        logger.info("Batch processing API call completed.", batch_size=batch_size, result=result)
-        return result
-    except Exception as e:
-        logger.error("Error during batch processing trigger via API", error=str(e), exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during batch processing: {str(e)}")
+    logger.info("Batch processing task added to background.", batch_size=batch_size)
+    return {"message": "Batch processing started in the background.", "batch_size": batch_size}

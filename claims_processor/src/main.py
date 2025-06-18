@@ -9,6 +9,14 @@ logger = structlog.get_logger(__name__)
 
 app = FastAPI()
 
+# Import for shutdown event
+from .core.cache.cache_manager import close_global_cache_manager
+
+@app.on_event("shutdown")
+async def app_shutdown():
+    logger.info("Application shutdown: closing global cache manager.")
+    await close_global_cache_manager()
+
 app.include_router(claims_routes.router, prefix="/api/v1/claims", tags=["claims"])
 
 @app.get("/health")

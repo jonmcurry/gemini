@@ -1,17 +1,18 @@
+import asyncio # Import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from sqlalchemy.orm import joinedload # For eager loading
+from sqlalchemy.orm import joinedload
 import structlog
-from typing import List # Import List
-from datetime import datetime, timezone # Import datetime, timezone
-from decimal import Decimal # Import Decimal
+from typing import List, Dict, Any # Import Dict, Any
+from datetime import datetime, timezone
+from decimal import Decimal
 
-# Assuming ClaimModel is correctly imported from:
+from ..core.config.settings import get_settings # Import get_settings
 from ..core.database.models.claims_db import ClaimModel
-# Import ProcessableClaim for data conversion and ClaimValidator for validation
-from ..api.models.claim_models import ProcessableClaim # ProcessableClaimLineItem is part of ProcessableClaim
+from ..api.models.claim_models import ProcessableClaim
 from .validation.claim_validator import ClaimValidator
-from .rvu_service import RVUService # Import RVUService
+from .rvu_service import RVUService
+from ..core.cache.cache_manager import get_cache_manager
 
 logger = structlog.get_logger(__name__)
 
@@ -19,7 +20,16 @@ class ClaimProcessingService:
     def __init__(self, db_session: AsyncSession):
         self.db = db_session
         self.validator = ClaimValidator()
-        self.rvu_service = RVUService() # Instantiate RVUService
+
+        cache_manager = get_cache_manager()
+        self.rvu_service = RVUService(cache_manager=cache_manager)
+
+        settings = get_settings()
+        self.concurrent_processing_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_CLAIM_PROCESSING)
+        logger.info("ClaimProcessingService initialized",
+                    db_session_id=id(db_session),
+                    cache_manager_id=id(cache_manager),
+                    concurrency_limit=settings.MAX_CONCURRENT_CLAIM_PROCESSING)
 
 
     async def process_pending_claims_batch(self, batch_size: int = 100):
@@ -30,70 +40,54 @@ class ClaimProcessingService:
         3. Calculate RVUs for valid claims.
         4. Update claim statuses and details in the database.
         """
-        logger.info("Starting batch processing of claims", batch_size=batch_size)
+        logger.info("Starting batch processing of claims with concurrency", batch_size=batch_size)
 
-        pending_db_claims_list = await self._fetch_pending_claims(batch_size)
-        if not pending_db_claims_list:
+        fetched_db_claims = await self._fetch_pending_claims(batch_size)
+
+        if not fetched_db_claims:
             logger.info("No pending claims to process.")
-            return {"message": "No pending claims to process.", "attempted_claims": 0, "validated_count": 0, "failed_validation_count": 0, "processed_for_rvu_count": 0}
+            return {"message": "No pending claims to process.", "attempted_claims": 0, "conversion_errors":0, "failed_validation_count": 0, "failed_rvu_count":0, "successfully_processed_count": 0, "other_exceptions":0}
 
-        # Create a map for easy lookup of the original DB objects
-        pending_db_claims_map = {claim.id: claim for claim in pending_db_claims_list}
-        logger.info(f"Fetched {len(pending_db_claims_map)} claims for processing.")
+        logger.info(f"Fetched {len(fetched_db_claims)} claims for concurrent processing.")
 
-        validated_count = 0
-        failed_validation_count = 0 # Includes conversion errors and validation rule failures
+        tasks = [self._process_single_claim_concurrently(db_claim) for db_claim in fetched_db_claims]
+
+        processing_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        attempted_claims = len(fetched_db_claims)
+        conversion_errors_count = 0
+        failed_validation_count = 0
         processed_for_rvu_count = 0
+        failed_rvu_count = 0
+        other_exceptions_count = 0
 
-        for db_claim_id, original_db_claim in pending_db_claims_map.items():
-            processable_claim: ProcessableClaim = None
-            try:
-                # Convert SQLAlchemy model to Pydantic model for validation and processing
-                processable_claim = ProcessableClaim.model_validate(original_db_claim)
-            except Exception as e:
-                logger.error("Failed to convert DB claim to Pydantic model", claim_db_id=original_db_claim.id, error=str(e), exc_info=True)
-                # Use original_db_claim for the update method as processable_claim might be None
-                await self._update_claim_and_lines_in_db(original_db_claim, None, "conversion_error", validation_errors=[f"Pydantic conversion error: {str(e)}"])
-                failed_validation_count +=1
-                continue
+        for result in processing_results:
+            if isinstance(result, Exception):
+                logger.error("Unhandled exception in concurrent claim processing task", error=str(result), exc_info=result)
+                other_exceptions_count +=1
+            elif isinstance(result, dict):
+                status = result.get("status")
+                if status == "conversion_error":
+                    conversion_errors_count +=1
+                elif status == "validation_failed":
+                    failed_validation_count += 1
+                elif status == "rvu_calculation_failed":
+                    failed_rvu_count +=1
+                elif status == "processing_complete":
+                    processed_for_rvu_count += 1
 
-            validation_errors = self.validator.validate_claim(processable_claim)
-            if validation_errors:
-                logger.warn("Claim validation failed", claim_id=processable_claim.claim_id, errors=validation_errors)
-                await self._update_claim_and_lines_in_db(original_db_claim, processable_claim, "validation_failed", validation_errors=validation_errors)
-                failed_validation_count += 1
-                continue
-
-            logger.info("Claim validation successful", claim_id=processable_claim.claim_id)
-            validated_count += 1
-
-            # RVU Calculation
-            try:
-                await self.rvu_service.calculate_rvu_for_claim(processable_claim, self.db) # Modifies processable_claim
-                logger.info("RVU calculation successful for claim", claim_id=processable_claim.claim_id)
-                # Persist changes (including RVUs on lines) and set status to processing_complete
-                await self._update_claim_and_lines_in_db(original_db_claim, processable_claim, "processing_complete")
-                processed_for_rvu_count += 1
-            except Exception as e:
-                logger.error("RVU calculation failed for claim", claim_id=processable_claim.claim_id, error=str(e), exc_info=True)
-                # Mark claim as failed in RVU calculation step
-                await self._update_claim_and_lines_in_db(original_db_claim, processable_claim, "rvu_calculation_failed", validation_errors=[f"RVU calculation error: {str(e)}"])
-                # This claim passed validation but failed RVU. It's not counted in processed_for_rvu_count.
-                # It was already counted in validated_count.
-
-        logger.info("Batch processing finished.",
-                    attempted_claims=len(pending_db_claims_map),
-                    validated_count=validated_count,
-                    failed_validation_count=failed_validation_count,
-                    processed_for_rvu_count=processed_for_rvu_count)
-
-        return {
-            "message": "Batch processing finished.",
-            "attempted_claims": len(pending_db_claims_map),
-            "validated_count": validated_count,
-            "failed_validation_count": failed_validation_count,
-            "successfully_processed_count": processed_for_rvu_count # Claims that completed all steps including RVU
+        final_summary = {
+            "message": "Concurrent batch processing finished.",
+            "attempted_claims": attempted_claims,
+            "conversion_errors": conversion_errors_count,
+            "validation_failures": failed_validation_count,
+            "rvu_calculation_failures": failed_rvu_count,
+            "successfully_processed_count": processed_for_rvu_count,
+            "other_exceptions" : other_exceptions_count
         }
+        logger.info("Concurrent batch processing summary.", **final_summary)
+
+        return final_summary
 
 
     async def _fetch_pending_claims(self, batch_size: int) -> list[ClaimModel]:
@@ -123,11 +117,45 @@ class ClaimProcessingService:
 
     # Old _update_claim_status_in_db is removed by replacing the whole file content,
     # effectively replacing it with _update_claim_and_lines_in_db or requiring its recreation if separate logic is needed.
-    # For this subtask, we assume _update_claim_and_lines_in_db is the comprehensive method.
+
+    async def _process_single_claim_concurrently(self, db_claim: ClaimModel) -> Dict[str, Any]:
+        """
+        Processes a single claim through validation, RVU calculation, and DB update.
+        Manages concurrency using the service's semaphore.
+        Returns a dictionary with processing outcome.
+        """
+        async with self.concurrent_processing_semaphore:
+            logger.info("Starting processing for a single claim concurrently", claim_id=db_claim.claim_id, db_id=db_claim.id)
+            processable_claim: ProcessableClaim = None # Ensure it's defined in this scope
+            try:
+                processable_claim = ProcessableClaim.model_validate(db_claim)
+            except Exception as e:
+                logger.error("Pydantic conversion error for claim", claim_db_id=db_claim.id, error=str(e), exc_info=True)
+                await self._update_claim_and_lines_in_db(db_claim, None, "conversion_error", validation_errors=[f"Pydantic conversion error: {str(e)}"])
+                return {"db_id": db_claim.id, "claim_id": db_claim.claim_id, "status": "conversion_error", "error": str(e)}
+
+            validation_errors = self.validator.validate_claim(processable_claim)
+            if validation_errors:
+                logger.warn("Claim validation failed (concurrent)", claim_id=processable_claim.claim_id, errors=validation_errors)
+                await self._update_claim_and_lines_in_db(db_claim, processable_claim, "validation_failed", validation_errors=validation_errors)
+                return {"db_id": db_claim.id, "claim_id": processable_claim.claim_id, "status": "validation_failed", "errors": validation_errors}
+
+            logger.info("Claim validation successful (concurrent)", claim_id=processable_claim.claim_id)
+
+            try:
+                await self.rvu_service.calculate_rvu_for_claim(processable_claim, self.db)
+                logger.info("RVU calculation successful (concurrent)", claim_id=processable_claim.claim_id)
+                await self._update_claim_and_lines_in_db(db_claim, processable_claim, "processing_complete")
+                return {"db_id": db_claim.id, "claim_id": processable_claim.claim_id, "status": "processing_complete"}
+            except Exception as e:
+                logger.error("RVU calculation failed (concurrent)", claim_id=processable_claim.claim_id, error=str(e), exc_info=True)
+                # Ensure processable_claim is passed here, it might have partial RVU data or be needed for context
+                await self._update_claim_and_lines_in_db(db_claim, processable_claim, "rvu_calculation_failed", validation_errors=[f"RVU calculation error: {str(e)}"])
+                return {"db_id": db_claim.id, "claim_id": processable_claim.claim_id, "status": "rvu_calculation_failed", "error": str(e)}
 
     async def _update_claim_and_lines_in_db(self,
                                          db_claim_to_update: ClaimModel,
-                                         processed_pydantic_claim: ProcessableClaim, # Can be None if conversion failed
+                                         processed_pydantic_claim: Optional[ProcessableClaim], # Made Optional
                                          new_status: str,
                                          validation_errors: List[str] = None):
         """
