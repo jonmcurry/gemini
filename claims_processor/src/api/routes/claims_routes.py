@@ -27,10 +27,8 @@ async def create_claim(
     # Create a dictionary of fields present in ClaimModel from claim_data
     # This ensures only fields defined in ClaimCreate that are also in ClaimModel are passed
     # model_dump() will include all fields from ClaimCreate, including optional ones if provided
-    claim_model_data = claim_data.model_dump(exclude_unset=True) # exclude_unset=True is good for partial updates, but here we want all provided fields
+    claim_model_data = claim_data.model_dump(exclude_unset=True)
 
-    # Ensure all required fields for ClaimModel are present if not covered by defaults
-    # For this example, ClaimCreate and ClaimModel have aligned required fields or defaults in ClaimModel
     db_claim = ClaimModel(**claim_model_data)
 
     try:
@@ -39,8 +37,31 @@ async def create_claim(
         await db.refresh(db_claim)
         logger.info("Claim saved to database successfully", claim_id=db_claim.claim_id, db_id=db_claim.id)
         return db_claim
-    except Exception as e: # Catch generic SQLAlchemyError or other DB errors
+    except Exception as e:
         await db.rollback()
         logger.error("Error saving claim to database", claim_id=claim_data.claim_id, error=str(e), exc_info=True)
-        # Consider more specific error handling for production
         raise HTTPException(status_code=500, detail="Failed to save claim to database.")
+
+# Import the processing service
+from ...processing.claims_processing_service import ClaimProcessingService
+
+@router.post("/process-batch/", summary="Trigger Batch Processing of Claims")
+async def trigger_batch_processing(
+    db: AsyncSession = Depends(get_db_session),
+    batch_size: int = 100 # Example: make batch_size configurable via query param
+):
+    """
+    Triggers a batch processing run for pending claims.
+    Fetches, validates, and calculates RVUs (mocked) for a batch of claims.
+    """
+    logger.info(f"Received request to process batch of claims.", batch_size=batch_size)
+
+    service = ClaimProcessingService(db_session=db)
+
+    try:
+        result = await service.process_pending_claims_batch(batch_size=batch_size)
+        logger.info("Batch processing API call completed.", batch_size=batch_size, result=result)
+        return result
+    except Exception as e:
+        logger.error("Error during batch processing trigger via API", error=str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during batch processing: {str(e)}")
