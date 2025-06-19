@@ -79,6 +79,9 @@ class ProcessableClaim(BaseModel):
     ml_score: Optional[float] = None
     ml_derived_decision: Optional[str] = None # e.g., "ML_APPROVED", "ML_REJECTED"
 
+    # New field for processing duration
+    processing_duration_ms: Optional[float] = None # Duration in milliseconds
+
     # If using Pydantic V2
     model_config = {"from_attributes": True}
     # class Config: # For Pydantic V1
