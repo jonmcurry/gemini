@@ -1,6 +1,0 @@
-procedure_code,rvu_value,description
-99213,2.11,"Office visit, established patient, level 3"
-99214,3.28,"Office visit, established patient, level 4"
-80053,0.85,"Comprehensive metabolic panel"
-99203,1.92,"Office visit, new patient, level 3"
-DEFAULT_RVU,1.00,"Default RVU for unlisted or unspecified procedures"
