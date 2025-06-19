@@ -8,3 +8,5 @@ alembic>=1.13.0
 psycopg2-binary
 pydantic-settings>=2.1.0
 aiomcache>=0.7.0
+numpy>=1.24.0
+pandas>=2.1.0

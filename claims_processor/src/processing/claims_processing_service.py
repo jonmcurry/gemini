@@ -7,12 +7,24 @@ from typing import List, Dict, Any # Import Dict, Any
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from ..core.config.settings import get_settings # Import get_settings
+import asyncio
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.orm import joinedload
+import structlog
+from typing import List, Dict, Any, Optional # Added Optional
+from datetime import datetime, timezone
+from decimal import Decimal
+
+from ..core.config.settings import get_settings
 from ..core.database.models.claims_db import ClaimModel
 from ..api.models.claim_models import ProcessableClaim
 from .validation.claim_validator import ClaimValidator
 from .rvu_service import RVUService
 from ..core.cache.cache_manager import get_cache_manager
+# Import ML components
+from .ml_pipeline.feature_extractor import FeatureExtractor
+from .ml_pipeline.optimized_predictor import OptimizedPredictor
 
 logger = structlog.get_logger(__name__)
 
@@ -24,12 +36,18 @@ class ClaimProcessingService:
         cache_manager = get_cache_manager()
         self.rvu_service = RVUService(cache_manager=cache_manager)
 
-        settings = get_settings()
-        self.concurrent_processing_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_CLAIM_PROCESSING)
+        current_settings = get_settings() # Use a consistent variable name
+        self.concurrent_processing_semaphore = asyncio.Semaphore(current_settings.MAX_CONCURRENT_CLAIM_PROCESSING)
+
+        # Initialize ML components
+        self.feature_extractor = FeatureExtractor() # Uses settings in its own __init__
+        self.predictor = OptimizedPredictor(model_path=current_settings.ML_MODEL_PATH)
+
         logger.info("ClaimProcessingService initialized",
                     db_session_id=id(db_session),
                     cache_manager_id=id(cache_manager),
-                    concurrency_limit=settings.MAX_CONCURRENT_CLAIM_PROCESSING)
+                    concurrency_limit=current_settings.MAX_CONCURRENT_CLAIM_PROCESSING,
+                    ml_model_path=current_settings.ML_MODEL_PATH)
 
 
     async def process_pending_claims_batch(self, batch_size: int = 100):
@@ -42,23 +60,34 @@ class ClaimProcessingService:
         """
         logger.info("Starting batch processing of claims with concurrency", batch_size=batch_size)
 
+        logger.info("Starting batch processing of claims with concurrency", batch_size=batch_size)
+
         fetched_db_claims = await self._fetch_pending_claims(batch_size)
 
         if not fetched_db_claims:
             logger.info("No pending claims to process.")
-            return {"message": "No pending claims to process.", "attempted_claims": 0, "conversion_errors":0, "failed_validation_count": 0, "failed_rvu_count":0, "successfully_processed_count": 0, "other_exceptions":0}
+            # Updated return structure for consistency
+            return {
+                "message": "No pending claims to process.", "attempted_claims": 0,
+                "conversion_errors":0, "validation_failures": 0,
+                "ml_approved_count": 0, "ml_rejected_count": 0, "ml_error_count": 0,
+                "rvu_calculation_failures":0, "successfully_processed_count": 0,
+                "other_exceptions":0
+            }
 
         logger.info(f"Fetched {len(fetched_db_claims)} claims for concurrent processing.")
 
         tasks = [self._process_single_claim_concurrently(db_claim) for db_claim in fetched_db_claims]
-
         processing_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         attempted_claims = len(fetched_db_claims)
         conversion_errors_count = 0
         failed_validation_count = 0
-        processed_for_rvu_count = 0
+        processed_for_rvu_count = 0 # Successfully completed all steps including RVU
         failed_rvu_count = 0
+        ml_approved_count = 0
+        ml_rejected_count = 0
+        ml_error_count = 0 # For ML processing errors or unexpected formats
         other_exceptions_count = 0
 
         for result in processing_results:
@@ -67,6 +96,12 @@ class ClaimProcessingService:
                 other_exceptions_count +=1
             elif isinstance(result, dict):
                 status = result.get("status")
+                ml_decision = result.get("ml_decision", "N/A")
+
+                if ml_decision == "ML_APPROVED": ml_approved_count += 1
+                elif ml_decision == "ML_REJECTED": ml_rejected_count += 1
+                elif ml_decision.startswith("ML_ERROR") or ml_decision == "ML_PROCESSING_ERROR": ml_error_count +=1
+
                 if status == "conversion_error":
                     conversion_errors_count +=1
                 elif status == "validation_failed":
@@ -81,6 +116,9 @@ class ClaimProcessingService:
             "attempted_claims": attempted_claims,
             "conversion_errors": conversion_errors_count,
             "validation_failures": failed_validation_count,
+            "ml_approved_count": ml_approved_count,
+            "ml_rejected_count": ml_rejected_count,
+            "ml_error_count": ml_error_count,
             "rvu_calculation_failures": failed_rvu_count,
             "successfully_processed_count": processed_for_rvu_count,
             "other_exceptions" : other_exceptions_count
@@ -118,46 +156,77 @@ class ClaimProcessingService:
     # Old _update_claim_status_in_db is removed by replacing the whole file content,
     # effectively replacing it with _update_claim_and_lines_in_db or requiring its recreation if separate logic is needed.
 
+
     async def _process_single_claim_concurrently(self, db_claim: ClaimModel) -> Dict[str, Any]:
-        """
-        Processes a single claim through validation, RVU calculation, and DB update.
-        Manages concurrency using the service's semaphore.
-        Returns a dictionary with processing outcome.
-        """
         async with self.concurrent_processing_semaphore:
             logger.info("Starting processing for a single claim concurrently", claim_id=db_claim.claim_id, db_id=db_claim.id)
-            processable_claim: ProcessableClaim = None # Ensure it's defined in this scope
+            processable_claim: ProcessableClaim = None
+            ml_decision = "N/A" # Default ML decision
+            ml_confidence_score = 0.0
+
             try:
                 processable_claim = ProcessableClaim.model_validate(db_claim)
             except Exception as e:
                 logger.error("Pydantic conversion error for claim", claim_db_id=db_claim.id, error=str(e), exc_info=True)
                 await self._update_claim_and_lines_in_db(db_claim, None, "conversion_error", validation_errors=[f"Pydantic conversion error: {str(e)}"])
-                return {"db_id": db_claim.id, "claim_id": db_claim.claim_id, "status": "conversion_error", "error": str(e)}
+                return {"db_id": db_claim.id, "claim_id": db_claim.claim_id, "status": "conversion_error", "error": str(e), "ml_decision": ml_decision}
 
             validation_errors = self.validator.validate_claim(processable_claim)
             if validation_errors:
                 logger.warn("Claim validation failed (concurrent)", claim_id=processable_claim.claim_id, errors=validation_errors)
                 await self._update_claim_and_lines_in_db(db_claim, processable_claim, "validation_failed", validation_errors=validation_errors)
-                return {"db_id": db_claim.id, "claim_id": processable_claim.claim_id, "status": "validation_failed", "errors": validation_errors}
+                return {"db_id": db_claim.id, "claim_id": processable_claim.claim_id, "status": "validation_failed", "errors": validation_errors, "ml_decision": ml_decision}
 
             logger.info("Claim validation successful (concurrent)", claim_id=processable_claim.claim_id)
+
+            # --- ML Processing Step ---
+            try:
+                logger.debug("Starting ML feature extraction (stub)", claim_id=processable_claim.claim_id)
+                features = self.feature_extractor.extract_features(processable_claim)
+                logger.debug("Dummy features extracted", claim_id=processable_claim.claim_id, features_shape=features.shape)
+
+                logger.debug("Starting ML prediction (stub)", claim_id=processable_claim.claim_id)
+                prediction_scores = await self.predictor.predict_async(features)
+                logger.debug("Dummy ML prediction scores received", claim_id=processable_claim.claim_id, scores=prediction_scores)
+
+                if prediction_scores.ndim == 2 and prediction_scores.shape[0] > 0 and prediction_scores.shape[1] >= 2:
+                    prob_approve = prediction_scores[0][1]
+                    ml_confidence_score = float(prob_approve)
+
+                    current_settings = get_settings()
+                    if prob_approve >= current_settings.ML_APPROVAL_THRESHOLD:
+                        ml_decision = "ML_APPROVED"
+                        logger.info("Claim approved by ML model (stub)", claim_id=processable_claim.claim_id, score=prob_approve, threshold=current_settings.ML_APPROVAL_THRESHOLD)
+                    else:
+                        ml_decision = "ML_REJECTED"
+                        logger.warn("Claim rejected by ML model (stub)", claim_id=processable_claim.claim_id, score=prob_approve, threshold=current_settings.ML_APPROVAL_THRESHOLD)
+                else:
+                    logger.warn("Unexpected ML prediction score format", claim_id=processable_claim.claim_id, scores_shape=prediction_scores.shape)
+                    ml_decision = "ML_ERROR_UNEXPECTED_FORMAT"
+            except Exception as ml_exc:
+                logger.error("Error during ML processing step (stub)", claim_id=processable_claim.claim_id, error=str(ml_exc), exc_info=True)
+                ml_decision = "ML_PROCESSING_ERROR"
+            # --- End ML Processing Step ---
 
             try:
                 await self.rvu_service.calculate_rvu_for_claim(processable_claim, self.db)
                 logger.info("RVU calculation successful (concurrent)", claim_id=processable_claim.claim_id)
-                await self._update_claim_and_lines_in_db(db_claim, processable_claim, "processing_complete")
-                return {"db_id": db_claim.id, "claim_id": processable_claim.claim_id, "status": "processing_complete"}
+                await self._update_claim_and_lines_in_db(db_claim, processable_claim, "processing_complete",
+                                                         ml_log_info={"ml_decision": ml_decision, "ml_score": ml_confidence_score})
+                return {"db_id": db_claim.id, "claim_id": processable_claim.claim_id, "status": "processing_complete", "ml_decision": ml_decision}
             except Exception as e:
                 logger.error("RVU calculation failed (concurrent)", claim_id=processable_claim.claim_id, error=str(e), exc_info=True)
-                # Ensure processable_claim is passed here, it might have partial RVU data or be needed for context
-                await self._update_claim_and_lines_in_db(db_claim, processable_claim, "rvu_calculation_failed", validation_errors=[f"RVU calculation error: {str(e)}"])
-                return {"db_id": db_claim.id, "claim_id": processable_claim.claim_id, "status": "rvu_calculation_failed", "error": str(e)}
+                await self._update_claim_and_lines_in_db(db_claim, processable_claim, "rvu_calculation_failed",
+                                                         validation_errors=[f"RVU calculation error: {str(e)}"],
+                                                         ml_log_info={"ml_decision": ml_decision, "ml_score": ml_confidence_score})
+                return {"db_id": db_claim.id, "claim_id": processable_claim.claim_id, "status": "rvu_calculation_failed", "error": str(e), "ml_decision": ml_decision}
 
     async def _update_claim_and_lines_in_db(self,
                                          db_claim_to_update: ClaimModel,
-                                         processed_pydantic_claim: Optional[ProcessableClaim], # Made Optional
+                                         processed_pydantic_claim: Optional[ProcessableClaim],
                                          new_status: str,
-                                         validation_errors: List[str] = None):
+                                         validation_errors: List[str] = None,
+                                         ml_log_info: Optional[Dict] = None): # New parameter
         """
         Updates the claim and its line items in the database based on the processed Pydantic model.
         Also updates the claim's processing status.
