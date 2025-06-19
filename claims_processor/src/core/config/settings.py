@@ -15,6 +15,11 @@ class Settings(BaseSettings):
 
     # RVU data file path
     RVU_DATA_FILE_PATH: str = "data/rvu_data.csv" # Default path
+
+    # ML Model settings
+    ML_MODEL_PATH: Optional[str] = "models/dummy_claim_model.tflite"
+    ML_FEATURE_COUNT: int = 7
+    ML_APPROVAL_THRESHOLD: float = 0.8
     # Add other settings as needed later
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_file_encoding='utf-8')
