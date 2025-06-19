@@ -10,3 +10,4 @@ pydantic-settings>=2.1.0
 aiomcache>=0.7.0
 numpy>=1.24.0
 pandas>=2.1.0
+tflite-runtime

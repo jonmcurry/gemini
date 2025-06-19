@@ -75,6 +75,10 @@ class ProcessableClaim(BaseModel):
 
     line_items: List[ProcessableClaimLineItem] = []
 
+    # New fields for ML results
+    ml_score: Optional[float] = None
+    ml_derived_decision: Optional[str] = None # e.g., "ML_APPROVED", "ML_REJECTED"
+
     # If using Pydantic V2
     model_config = {"from_attributes": True}
     # class Config: # For Pydantic V1
