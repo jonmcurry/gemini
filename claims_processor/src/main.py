@@ -11,13 +11,16 @@ app = FastAPI()
 
 # Import for shutdown event
 from .core.cache.cache_manager import close_global_cache_manager
+# Import new router
+from .api.routes import data_transfer_routes
 
 @app.on_event("shutdown")
 async def app_shutdown():
     logger.info("Application shutdown: closing global cache manager.")
     await close_global_cache_manager()
 
-app.include_router(claims_routes.router, prefix="/api/v1/claims", tags=["claims"])
+app.include_router(claims_routes.router, prefix="/api/v1/claims", tags=["Claims Processing"]) # Renamed tag for clarity
+app.include_router(data_transfer_routes.router, prefix="/api/v1/data-transfer", tags=["Data Transfer"]) # Add new router
 
 @app.get("/health")
 async def health_check():
