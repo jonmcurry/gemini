@@ -13,9 +13,6 @@ class Settings(BaseSettings):
     # Concurrency settings
     MAX_CONCURRENT_CLAIM_PROCESSING: int = 10 # Default value
 
-    # RVU data file path
-    RVU_DATA_FILE_PATH: str = "data/rvu_data.csv" # Default path
-
     # ML Model settings
     ML_MODEL_PATH: Optional[str] = "models/dummy_claim_model.tflite"
     ML_FEATURE_COUNT: int = 7
