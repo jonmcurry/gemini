@@ -6,7 +6,7 @@ import structlog
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 from decimal import Decimal
-import time # For measuring duration
+import time
 
 from ..core.config.settings import get_settings
 from ..core.database.models.claims_db import ClaimModel
@@ -17,7 +17,6 @@ from ..core.cache.cache_manager import get_cache_manager
 from .ml_pipeline.feature_extractor import FeatureExtractor
 from .ml_pipeline.optimized_predictor import OptimizedPredictor
 
-# Import Metric Objects
 from ..core.monitoring.metrics import (
     CLAIMS_PROCESSED_TOTAL,
     CLAIM_PROCESSING_DURATION_SECONDS,
@@ -33,16 +32,12 @@ class ClaimProcessingService:
     def __init__(self, db_session: AsyncSession):
         self.db = db_session
         self.validator = ClaimValidator()
-
         cache_manager = get_cache_manager()
         self.rvu_service = RVUService(cache_manager=cache_manager)
-
         current_settings = get_settings()
         self.concurrent_processing_semaphore = asyncio.Semaphore(current_settings.MAX_CONCURRENT_CLAIM_PROCESSING)
-
         self.feature_extractor = FeatureExtractor()
         self.predictor = OptimizedPredictor(model_path=current_settings.ML_MODEL_PATH)
-
         logger.info("ClaimProcessingService initialized",
                     db_session_id=id(db_session),
                     cache_manager_id=id(cache_manager),
@@ -51,124 +46,128 @@ class ClaimProcessingService:
 
     async def _process_single_claim_concurrently(self, db_claim: ClaimModel) -> Dict[str, Any]:
         start_time = time.monotonic()
-        # Default status for metric if an unexpected error occurs before specific status is set
         status_for_metric: str = "unknown_processing_error"
-        ml_decision_for_metric_label: str = "ML_NOT_REACHED" # For ML_PREDICTIONS_TOTAL label
+        ml_decision_for_metric_label: str = "ML_NOT_REACHED"
         ml_confidence_score_for_metric: float = 0.0
+        current_duration_ms: Optional[float] = None
+        processable_claim_instance: Optional[ProcessableClaim] = None
 
-        # Return dictionary structure
         result_dict = {
             "db_id": db_claim.id,
-            "claim_id": db_claim.claim_id, # Use original claim_id from db_claim for consistency in return
-            "status": status_for_metric, # Will be updated
-            "ml_decision": ml_decision_for_metric_label, # Will be updated
-            "errors": None, # Placeholder for errors
-            "error_detail_str": None # Placeholder for error string
+            "claim_id": db_claim.claim_id,
+            "status": status_for_metric,
+            "ml_decision": ml_decision_for_metric_label,
+            "errors": None,
+            "error_detail_str": None
         }
 
         try:
             async with self.concurrent_processing_semaphore:
                 logger.debug("Starting processing for a single claim concurrently", claim_id=db_claim.claim_id, db_id=db_claim.id)
-                processable_claim: ProcessableClaim
 
-                # 1. Pydantic Conversion
                 try:
-                    processable_claim = ProcessableClaim.model_validate(db_claim)
-                    result_dict["claim_id"] = processable_claim.claim_id # Update with Pydantic model's claim_id if needed
+                    processable_claim_instance = ProcessableClaim.model_validate(db_claim)
+                    result_dict["claim_id"] = processable_claim_instance.claim_id
                 except Exception as e:
                     status_for_metric = "conversion_error"
-                    logger.error("Pydantic conversion error for claim", claim_db_id=db_claim.id, error=str(e), exc_info=True)
-                    await self._update_claim_and_lines_in_db(db_claim, None, status_for_metric, validation_errors=[f"Pydantic conversion error: {str(e)}"])
+                    logger.error("Pydantic conversion error", claim_db_id=db_claim.id, error=str(e), exc_info=True)
+                    current_duration_ms = (time.monotonic() - start_time) * 1000.0
+                    await self._update_claim_and_lines_in_db(db_claim, None, status_for_metric,
+                                                             duration_ms=current_duration_ms,
+                                                             validation_errors=[f"Pydantic conversion error: {str(e)}"])
                     result_dict.update({"status": status_for_metric, "error_detail_str": str(e)})
-                    return result_dict # Early exit
+                    return result_dict
 
-                # 2. Validation
-                validation_errors = self.validator.validate_claim(processable_claim)
+                validation_errors = self.validator.validate_claim(processable_claim_instance)
                 if validation_errors:
                     status_for_metric = "validation_failed"
-                    logger.warn("Claim validation failed (concurrent)", claim_id=processable_claim.claim_id, errors=validation_errors)
-                    await self._update_claim_and_lines_in_db(db_claim, processable_claim, status_for_metric, validation_errors=validation_errors)
-                    result_dict.update({"status": status_for_metric, "errors": validation_errors})
-                    return result_dict # Early exit
+                    logger.warn("Claim validation failed", claim_id=processable_claim_instance.claim_id, errors=validation_errors)
+                    current_duration_ms = (time.monotonic() - start_time) * 1000.0
+                    processable_claim_instance.processing_duration_ms = current_duration_ms
+                    await self._update_claim_and_lines_in_db(db_claim, processable_claim_instance, status_for_metric,
+                                                             duration_ms=current_duration_ms,
+                                                             validation_errors=validation_errors)
+                    result_dict.update({"status": status_for_metric, "errors": validation_errors, "ml_decision": "N/A"})
+                    return result_dict
 
-                logger.info("Claim validation successful (concurrent)", claim_id=processable_claim.claim_id)
+                logger.info("Claim validation successful", claim_id=processable_claim_instance.claim_id)
 
-                # 3. ML Processing Step
                 try:
-                    features = self.feature_extractor.extract_features(processable_claim)
+                    features = self.feature_extractor.extract_features(processable_claim_instance)
                     prediction_scores = await self.predictor.predict_async(features)
-
                     if prediction_scores.ndim == 2 and prediction_scores.shape[0] > 0 and prediction_scores.shape[1] >= 2:
                         prob_approve = prediction_scores[0][1]
                         ml_confidence_score_for_metric = float(prob_approve)
                         ML_PREDICTION_CONFIDENCE_SCORE.observe(ml_confidence_score_for_metric)
-
                         current_settings = get_settings()
                         if prob_approve >= current_settings.ML_APPROVAL_THRESHOLD:
                             ml_decision_for_metric_label = "ML_APPROVED"
-                            logger.info("Claim approved by ML model", claim_id=processable_claim.claim_id, score=ml_confidence_score_for_metric)
                         else:
                             ml_decision_for_metric_label = "ML_REJECTED"
-                            logger.warn("Claim rejected by ML model", claim_id=processable_claim.claim_id, score=ml_confidence_score_for_metric)
                     else:
                         ml_decision_for_metric_label = "ML_ERROR_UNEXPECTED_FORMAT"
-                        logger.warn("Unexpected ML prediction score format", claim_id=processable_claim.claim_id, scores_shape=prediction_scores.shape)
                 except Exception as ml_exc:
                     ml_decision_for_metric_label = "ML_PROCESSING_ERROR"
-                    logger.error("Error during ML processing step", claim_id=processable_claim.claim_id, error=str(ml_exc), exc_info=True)
+                    logger.error("Error during ML processing step", claim_id=processable_claim_instance.claim_id, error=str(ml_exc), exc_info=True)
 
                 ML_PREDICTIONS_TOTAL.labels(ml_decision_outcome=ml_decision_for_metric_label).inc()
-                processable_claim.ml_score = ml_confidence_score_for_metric
-                processable_claim.ml_derived_decision = ml_decision_for_metric_label
+                processable_claim_instance.ml_score = ml_confidence_score_for_metric
+                processable_claim_instance.ml_derived_decision = ml_decision_for_metric_label
                 result_dict["ml_decision"] = ml_decision_for_metric_label
+                log_ml_info = {"ml_decision": ml_decision_for_metric_label, "ml_score": ml_confidence_score_for_metric}
 
                 if ml_decision_for_metric_label == "ML_REJECTED":
                     status_for_metric = "ml_rejected"
-                    await self._update_claim_and_lines_in_db(
-                        db_claim, processable_claim, status_for_metric,
-                        ml_log_info={"ml_decision": ml_decision_for_metric_label, "ml_score": ml_confidence_score_for_metric}
-                    )
+                    logger.warn("Claim rejected by ML model", claim_id=processable_claim_instance.claim_id, score=ml_confidence_score_for_metric)
+                    current_duration_ms = (time.monotonic() - start_time) * 1000.0
+                    processable_claim_instance.processing_duration_ms = current_duration_ms
+                    await self._update_claim_and_lines_in_db(db_claim, processable_claim_instance, status_for_metric,
+                                                             duration_ms=current_duration_ms, ml_log_info=log_ml_info)
                     result_dict["status"] = status_for_metric
-                    return result_dict # Early exit
+                    return result_dict
 
-                # 4. RVU Calculation
                 try:
-                    await self.rvu_service.calculate_rvu_for_claim(processable_claim, self.db)
+                    await self.rvu_service.calculate_rvu_for_claim(processable_claim_instance, self.db)
                     status_for_metric = "processing_complete"
-                    logger.info("RVU calculation successful (concurrent)", claim_id=processable_claim.claim_id)
-                    await self._update_claim_and_lines_in_db(
-                        db_claim, processable_claim, status_for_metric,
-                        ml_log_info={"ml_decision": ml_decision_for_metric_label, "ml_score": ml_confidence_score_for_metric}
-                    )
+                    logger.info("RVU calculation successful", claim_id=processable_claim_instance.claim_id)
+                    current_duration_ms = (time.monotonic() - start_time) * 1000.0
+                    processable_claim_instance.processing_duration_ms = current_duration_ms
+                    await self._update_claim_and_lines_in_db(db_claim, processable_claim_instance, status_for_metric,
+                                                             duration_ms=current_duration_ms, ml_log_info=log_ml_info)
                     result_dict["status"] = status_for_metric
-                    return result_dict # Success exit
+                    return result_dict
                 except Exception as e_rvu:
                     status_for_metric = "rvu_calculation_failed"
-                    logger.error("RVU calculation failed (concurrent)", claim_id=processable_claim.claim_id, error=str(e_rvu), exc_info=True)
-                    await self._update_claim_and_lines_in_db(
-                        db_claim, processable_claim, status_for_metric,
-                        validation_errors=[f"RVU calculation error: {str(e_rvu)}"], # Using validation_errors to pass error string
-                        ml_log_info={"ml_decision": ml_decision_for_metric_label, "ml_score": ml_confidence_score_for_metric}
-                    )
+                    logger.error("RVU calculation failed", claim_id=processable_claim_instance.claim_id, error=str(e_rvu), exc_info=True)
+                    current_duration_ms = (time.monotonic() - start_time) * 1000.0
+                    if processable_claim_instance: processable_claim_instance.processing_duration_ms = current_duration_ms
+                    await self._update_claim_and_lines_in_db(db_claim, processable_claim_instance, status_for_metric,
+                                                             duration_ms=current_duration_ms,
+                                                             validation_errors=[f"RVU calculation error: {str(e_rvu)}"],
+                                                             ml_log_info=log_ml_info)
                     result_dict.update({"status": status_for_metric, "error_detail_str": str(e_rvu)})
-                    return result_dict # RVU failure exit
-
-        except Exception as final_e: # Catch any other unexpected error during the whole guarded process
-            status_for_metric = "unknown_processing_error" # Or could be more specific if identifiable
-            logger.error("Unhandled error in single claim processing under semaphore", claim_id=db_claim.claim_id, error=str(final_e), exc_info=True)
-            # Attempt to update DB with an error status if possible, but processable_claim might not be defined
-            # This path is tricky; the error might be before processable_claim is made.
-            # For now, this error won't update DB status here, but will be counted in batch summary.
-            result_dict.update({"status": status_for_metric, "error_detail_str": str(final_e), "ml_decision": ml_decision_for_metric_label})
-            # We still increment CLAIMS_PROCESSED_TOTAL in finally, so this status is important.
-            raise # Re-raise to be caught by asyncio.gather's return_exceptions=True
-
+                    return result_dict
+        except Exception as final_e:
+            status_for_metric = "unknown_processing_error"
+            logger.error("Unhandled error in single claim processing", claim_id=db_claim.claim_id, error=str(final_e), exc_info=True)
+            result_dict.update({"status": status_for_metric, "error_detail_str": str(final_e)})
+            # If processable_claim_instance exists, try to set duration before re-raising for Prometheus.
+            # This path is if semaphore itself or something outside the main try-catch within semaphore fails.
+            if processable_claim_instance and hasattr(processable_claim_instance, 'processing_duration_ms'):
+                 current_duration_ms_outer_exc = (time.monotonic() - start_time) * 1000.0
+                 processable_claim_instance.processing_duration_ms = current_duration_ms_outer_exc
+            raise
         finally:
-            duration = time.monotonic() - start_time
-            CLAIM_PROCESSING_DURATION_SECONDS.observe(duration)
-            CLAIMS_PROCESSED_TOTAL.labels(final_status=status_for_metric).inc() # Increment based on determined status
+            final_duration_sec = time.monotonic() - start_time
+            CLAIM_PROCESSING_DURATION_SECONDS.observe(final_duration_sec)
+            CLAIMS_PROCESSED_TOTAL.labels(final_status=status_for_metric).inc()
+            # Ensure the Pydantic model has the duration if it was processed to a point where it exists
+            if processable_claim_instance and processable_claim_instance.processing_duration_ms is None:
+                 processable_claim_instance.processing_duration_ms = final_duration_sec * 1000.0
+            # This doesn't help persist it if not already done before return. Persistence is handled before returns.
 
     async def process_pending_claims_batch(self, batch_size: int = 100):
+        # ... (content as before, no changes here for this specific subtask) ...
         batch_start_time = time.monotonic()
         logger.info("Starting batch processing of claims with concurrency", batch_size=batch_size)
 
@@ -176,7 +175,6 @@ class ClaimProcessingService:
 
         if not fetched_db_claims:
             logger.info("No pending claims to process.")
-            # Ensure all keys are present in the return dictionary, even for no claims
             summary = {
                 "message": "No pending claims to process.", "attempted_claims": 0,
                 "conversion_errors":0, "validation_failures": 0,
@@ -195,7 +193,6 @@ class ClaimProcessingService:
         tasks = [self._process_single_claim_concurrently(db_claim) for db_claim in fetched_db_claims]
         processing_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Initialize counters
         attempted_claims = len(fetched_db_claims)
         conversion_errors_count = 0
         failed_validation_count = 0
@@ -208,7 +205,7 @@ class ClaimProcessingService:
         other_exceptions_count = 0
 
         for result in processing_results:
-            if isinstance(result, Exception): # Unhandled exception from _process_single_claim_concurrently
+            if isinstance(result, Exception):
                 logger.error("Task failed with unhandled exception in asyncio.gather results", exception_type=type(result).__name__, error_detail=str(result))
                 other_exceptions_count +=1
             elif isinstance(result, dict):
@@ -224,8 +221,6 @@ class ClaimProcessingService:
                 elif status == "ml_rejected": stopped_by_ml_rejection_count += 1
                 elif status == "rvu_calculation_failed": failed_rvu_count +=1
                 elif status == "processing_complete": successfully_processed_count += 1
-                # "unknown_processing_error" from task will be caught by `isinstance(result, Exception)` if re-raised,
-                # or if returned as dict, would need specific handling here. Assuming it's re-raised from task.
 
         batch_duration_seconds = time.monotonic() - batch_start_time
         CLAIMS_BATCH_PROCESSING_DURATION_SECONDS.observe(batch_duration_seconds)
@@ -249,14 +244,13 @@ class ClaimProcessingService:
             "successfully_processed_count": successfully_processed_count,
             "other_exceptions" : other_exceptions_count,
             "batch_duration_seconds": round(batch_duration_seconds, 2),
-            "throughput_claims_per_second": CLAIMS_THROUGHPUT_LAST_BATCH._value.get() # For logging current Gauge value
+            "throughput_claims_per_second": CLAIMS_THROUGHPUT_LAST_BATCH._value.get()
         }
         logger.info("Concurrent batch processing summary.", **final_summary)
 
         return final_summary
 
     async def _fetch_pending_claims(self, batch_size: int) -> list[ClaimModel]:
-        # ... (definition as before) ...
         logger.info("Fetching pending claims from database", batch_size=batch_size)
         stmt = (
             select(ClaimModel)
@@ -277,19 +271,30 @@ class ClaimProcessingService:
                                          db_claim_to_update: ClaimModel,
                                          processed_pydantic_claim: Optional[ProcessableClaim],
                                          new_status: str,
+                                         duration_ms: Optional[float] = None, # New parameter
                                          validation_errors: List[str] = None,
                                          ml_log_info: Optional[Dict] = None):
-        # ... (definition as before) ...
         if db_claim_to_update is None:
             logger.error("Cannot update claim in DB: SQLAlchemy model instance is None.")
             return
 
-        logger.info("Updating claim and lines in DB", claim_db_id=db_claim_to_update.id, new_status=new_status, ml_info=ml_log_info or "N/A")
+        logger.info("Updating claim and lines in DB", claim_db_id=db_claim_to_update.id, new_status=new_status, ml_info=ml_log_info or "N/A", duration_ms=duration_ms)
         try:
             db_claim_to_update.processing_status = new_status
 
+            if duration_ms is not None:
+                db_claim_to_update.processing_duration_ms = int(duration_ms)
+
+            if processed_pydantic_claim: # Check if Pydantic model exists (it won't for early conversion error)
+                if processed_pydantic_claim.ml_score is not None:
+                    # Ensure conversion to Decimal for Numeric field if ml_score is float
+                    db_claim_to_update.ml_score = Decimal(str(processed_pydantic_claim.ml_score))
+                if processed_pydantic_claim.ml_derived_decision is not None:
+                    db_claim_to_update.ml_derived_decision = processed_pydantic_claim.ml_derived_decision
+
             if validation_errors:
                 logger.warn("Storing/logging errors for claim", claim_id=db_claim_to_update.claim_id, errors=validation_errors)
+                # Example: db_claim_to_update.error_details = {"errors": validation_errors} # If such a field exists
 
             if new_status == "processing_complete" and processed_pydantic_claim:
                 map_pydantic_line_items = {line.id: line for line in processed_pydantic_claim.line_items}
