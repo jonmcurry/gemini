@@ -7,13 +7,15 @@
 
 from .claims_db import ClaimModel, ClaimLineItemModel
 from .audit_log_db import AuditLogModel
-from .claims_production_db import ClaimsProductionModel # Added this line
+from .claims_production_db import ClaimsProductionModel
+from .rvu_data_db import RVUDataModel # Add this line
 
 # Optional: Define __all__ to control what `from .models import *` imports
 # __all__ = [
 #     "ClaimModel",
 #     "ClaimLineItemModel",
 #     "AuditLogModel",
-#     "ClaimsProductionModel", # Added this line
+#     "ClaimsProductionModel",
+#     "RVUDataModel", # Add to __all__ if using it
 #     # "Base" # if re-exporting Base
 # ]

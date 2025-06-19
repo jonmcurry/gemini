@@ -12,7 +12,8 @@ from claims_processor.src.core.database.db_session import Base # Import Base fro
 # Explicitly import all model classes that inherit from Base for Alembic's metadata
 from claims_processor.src.core.database.models.claims_db import ClaimModel, ClaimLineItemModel
 from claims_processor.src.core.database.models.audit_log_db import AuditLogModel
-from claims_processor.src.core.database.models.claims_production_db import ClaimsProductionModel # Add this
+from claims_processor.src.core.database.models.claims_production_db import ClaimsProductionModel
+from claims_processor.src.core.database.models.rvu_data_db import RVUDataModel # Add this
 
 
 from sqlalchemy import pool # Keep this, it might be used by engine_from_config if that path is taken
