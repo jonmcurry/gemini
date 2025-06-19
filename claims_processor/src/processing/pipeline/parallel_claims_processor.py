@@ -3,15 +3,19 @@ from typing import List, Optional, Tuple, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from sqlalchemy.orm import joinedload, selectinload
+import numpy as np
+from sqlalchemy.sql import insert
+from decimal import Decimal
+from datetime import datetime, timezone # Ensure datetime, timezone are imported
 
 from ....core.cache.cache_manager import CacheManager
 from ....api.models.claim_models import ProcessableClaim
 from ....core.database.models.claims_db import ClaimModel
+from ....core.database.models.claims_production_db import ClaimsProductionModel
 from ..validation.claim_validator import ClaimValidator
 from ..rvu_service import RVUService
 from ..ml_pipeline.feature_extractor import FeatureExtractor
 from ..ml_pipeline.optimized_predictor import OptimizedPredictor
-import numpy as np
 
 logger = structlog.get_logger(__name__)
 
@@ -90,7 +94,6 @@ class ParallelClaimsProcessor:
         logger.info(f"Validating {len(claims_data)} claims.")
         valid_claims_list: List[ProcessableClaim] = []
         invalid_claims_list: List[ProcessableClaim] = []
-
         for claim_idx, claim in enumerate(claims_data):
             if (claim_idx + 1) % 100 == 0:
                 logger.debug(f"Validation progress for batch '{claim.batch_id}': {claim_idx + 1}/{len(claims_data)} claims checked.")
@@ -99,14 +102,10 @@ class ParallelClaimsProcessor:
                 valid_claims_list.append(claim)
             else:
                 logger.info(
-                    "Claim failed validation",
-                    claim_id=claim.claim_id,
-                    db_claim_id=claim.id,
-                    batch_id=claim.batch_id,
-                    errors=validation_errors
+                    "Claim failed validation", claim_id=claim.claim_id, db_claim_id=claim.id,
+                    batch_id=claim.batch_id, errors=validation_errors
                 )
                 invalid_claims_list.append(claim)
-
         batch_id_for_log = claims_data[0].batch_id if claims_data and claims_data[0].batch_id else 'N/A'
         logger.info(f"Validation complete for batch '{batch_id_for_log}'. Valid: {len(valid_claims_list)}, Invalid: {len(invalid_claims_list)}")
         return valid_claims_list, invalid_claims_list
@@ -125,86 +124,151 @@ class ParallelClaimsProcessor:
                 processed_count += 1
             except Exception as e:
                 logger.error(
-                    "Error during RVU calculation for claim",
-                    claim_id=claim.claim_id, db_claim_id=claim.id,
+                    "Error during RVU calculation for claim", claim_id=claim.claim_id, db_claim_id=claim.id,
                     batch_id=claim.batch_id, error=str(e), exc_info=True
                 )
-        logger.info(f"RVU calculation attempted for {len(claims)} claims. Successfully processed (or attempted with errors): {processed_count}.")
+        logger.info(f"RVU calculation attempted for {len(claims)} claims. Processed calls to service: {processed_count}.")
 
     async def _apply_ml_predictions(self, claims: List[ProcessableClaim]) -> None:
-        """
-        Applies ML predictions to a list of claims using FeatureExtractor and OptimizedPredictor.
-        Modifies claims in-place with ml_score and ml_derived_decision.
-        """
         if not claims:
             logger.info("No claims provided for ML prediction.")
             return
-
         logger.info(f"Applying ML predictions for {len(claims)} claims.")
-
         features_batch_for_predictor: List[np.ndarray] = []
         claims_with_features: List[ProcessableClaim] = []
-
         for claim_idx, claim in enumerate(claims):
             if (claim_idx + 1) % 50 == 0:
                 logger.info(f"ML Feature Extraction progress: {claim_idx + 1}/{len(claims)} claims processed.")
-
             try:
                 features_array_2d = self.feature_extractor.extract_features(claim)
-
                 if features_array_2d is not None:
-                    # OptimizedPredictor.predict_batch expects a list of 1D arrays if it processes them one by one,
-                    # or a single 2D array if it can batch predict.
-                    # The current OptimizedPredictor.predict_batch iterates a list of 1D arrays.
-                    # FeatureExtractor returns (1, N). We need to ensure this matches.
-                    # The implemented OptimizedPredictor.predict_batch handles reshaping (1,N) to (N,) internally.
-                    # So we can append the (1,N) array.
                     features_batch_for_predictor.append(features_array_2d)
                     claims_with_features.append(claim)
                 else:
                     logger.warn("Feature extraction failed or returned None for claim", claim_id=claim.claim_id, db_claim_id=claim.id)
-                    claim.ml_derived_decision = "ML_SKIPPED_NO_FEATURES"
-                    claim.ml_score = None
-
+                    claim.ml_derived_decision = "ML_SKIPPED_NO_FEATURES"; claim.ml_score = None
             except Exception as e:
                 logger.error("Error during feature extraction for claim", claim_id=claim.claim_id, error=str(e), exc_info=True)
-                claim.ml_derived_decision = "ML_SKIPPED_EXTRACTION_ERROR"
-                claim.ml_score = None
-
+                claim.ml_derived_decision = "ML_SKIPPED_EXTRACTION_ERROR"; claim.ml_score = None
         if not features_batch_for_predictor:
             logger.info("No claims had features successfully extracted for ML prediction.")
             return
-
         logger.info(f"Sending batch of {len(features_batch_for_predictor)} feature sets to OptimizedPredictor.")
         try:
             prediction_results = await self.predictor.predict_batch(features_batch_for_predictor)
-
             if len(prediction_results) == len(claims_with_features):
                 for claim_obj, prediction_dict in zip(claims_with_features, prediction_results):
                     if "error" in prediction_dict:
                         logger.warn("ML prediction failed for claim", claim_id=claim_obj.claim_id, error=prediction_dict["error"])
-                        claim_obj.ml_derived_decision = "ML_PREDICTION_ERROR"
-                        claim_obj.ml_score = None
+                        claim_obj.ml_derived_decision = "ML_PREDICTION_ERROR"; claim_obj.ml_score = None
                     else:
                         claim_obj.ml_score = prediction_dict.get('ml_score')
                         claim_obj.ml_derived_decision = prediction_dict.get('ml_derived_decision')
-                        logger.debug("ML prediction applied to claim", claim_id=claim_obj.claim_id, score=claim_obj.ml_score, decision=claim_obj.ml_derived_decision)
+                        logger.debug("ML prediction applied", claim_id=claim_obj.claim_id, score=claim_obj.ml_score, decision=claim_obj.ml_derived_decision)
             else:
-                logger.error(
-                    f"Mismatch between number of claims sent for prediction ({len(claims_with_features)}) "
-                    f"and number of results received ({len(prediction_results)}). Cannot map results."
-                )
+                logger.error(f"Mismatch: claims sent ({len(claims_with_features)}) vs results received ({len(prediction_results)}).")
                 for claim_obj in claims_with_features:
-                    claim_obj.ml_derived_decision = "ML_PREDICTION_BATCH_ERROR"
-                    claim_obj.ml_score = None
-
+                    claim_obj.ml_derived_decision = "ML_PREDICTION_BATCH_ERROR"; claim_obj.ml_score = None
         except Exception as e:
             logger.error("Error during ML batch prediction", error=str(e), exc_info=True)
             for claim_obj in claims_with_features:
-                claim_obj.ml_derived_decision = "ML_PREDICTION_BATCH_ERROR"
-                claim_obj.ml_score = None
-
+                claim_obj.ml_derived_decision = "ML_PREDICTION_BATCH_ERROR"; claim_obj.ml_score = None
         logger.info(f"ML prediction application completed for {len(claims_with_features)} claims.")
+
+    async def _transfer_claims_to_production(
+        self,
+        session: AsyncSession,
+        claims_to_transfer: List[ProcessableClaim],
+        batch_processing_metrics: Optional[Dict[str, Any]] = None
+    ) -> int:
+        # ... (Existing implementation from prior step) ...
+        if not claims_to_transfer:
+            logger.info("No claims provided for transfer to production.")
+            return 0
+        logger.info(f"Preparing {len(claims_to_transfer)} claims for transfer to production table.")
+        throughput_for_batch = None
+        if batch_processing_metrics and 'throughput_achieved' in batch_processing_metrics:
+            try:
+                throughput_for_batch = Decimal(str(batch_processing_metrics['throughput_achieved']))
+            except Exception:
+                logger.warn("Could not parse 'throughput_achieved' for batch", exc_info=True)
+
+        insert_data_list = []
+        for claim in claims_to_transfer:
+            data = {
+                "id": claim.id, "claim_id": claim.claim_id, "facility_id": claim.facility_id,
+                "patient_account_number": claim.patient_account_number,
+                "patient_first_name": claim.patient_first_name, "patient_last_name": claim.patient_last_name,
+                "patient_date_of_birth": claim.patient_date_of_birth,
+                "service_from_date": claim.service_from_date, "service_to_date": claim.service_to_date,
+                "total_charges": claim.total_charges,
+                "ml_prediction_score": Decimal(str(claim.ml_score)) if claim.ml_score is not None else None,
+                # risk_category is derived based on ml_score or ml_derived_decision
+                "processing_duration_ms": int(claim.processing_duration_ms) if claim.processing_duration_ms is not None else None,
+                "throughput_achieved": throughput_for_batch,
+            }
+            if claim.ml_score is not None:
+                score = Decimal(str(claim.ml_score))
+                if score >= Decimal("0.8"): data["risk_category"] = "LOW"
+                elif score >= Decimal("0.5"): data["risk_category"] = "MEDIUM"
+                else: data["risk_category"] = "HIGH"
+            elif claim.ml_derived_decision and "ERROR" in claim.ml_derived_decision.upper(): # Check if decision indicates error
+                 data["risk_category"] = "ERROR_IN_ML"
+            elif claim.ml_derived_decision == "ML_SKIPPED_NO_FEATURES" or claim.ml_derived_decision == "ML_SKIPPED_EXTRACTION_ERROR":
+                 data["risk_category"] = "ML_SKIPPED"
+            else:
+                 data["risk_category"] = "UNKNOWN"
+            insert_data_list.append(data)
+
+        if not insert_data_list:
+            logger.warn("No data mapped for production transfer.")
+            return 0
+        try:
+            stmt = insert(ClaimsProductionModel).values(insert_data_list)
+            await session.execute(stmt)
+            logger.info(f"Successfully prepared bulk insert for {len(insert_data_list)} claims into production table. Commit pending on main session.")
+            return len(insert_data_list)
+        except Exception as e:
+            logger.error("Database error during bulk insert preparation to claims_production", error=str(e), exc_info=True)
+            return 0
+
+    async def _update_staging_claims_status(
+        self,
+        session: AsyncSession,
+        transferred_claim_db_ids: List[int],
+    ) -> int:
+        if not transferred_claim_db_ids:
+            logger.info("No claim IDs provided for staging status update.")
+            return 0
+        logger.info(f"Updating staging status for {len(transferred_claim_db_ids)} transferred claims.")
+        try:
+            update_stmt = (
+                update(ClaimModel)
+                .where(ClaimModel.id.in_(transferred_claim_db_ids))
+                .values(
+                    processing_status='completed_transferred',
+                    transferred_to_prod_at=datetime.now(timezone.utc),
+                    processed_at=datetime.now(timezone.utc)
+                )
+                .execution_options(synchronize_session=False)
+            )
+            result = await session.execute(update_stmt)
+            updated_count = result.rowcount
+            logger.info(f"Successfully updated status for {updated_count} claims in staging table.")
+            if updated_count != len(transferred_claim_db_ids):
+                logger.warn(
+                    f"Mismatch in expected ({len(transferred_claim_db_ids)}) vs actual ({updated_count}) "
+                    "staging claims updated. Some IDs might not have been found or matched (already updated?)."
+                )
+            return updated_count
+        except Exception as e:
+            logger.error(
+                "Database error during staging claims status update.",
+                error=str(e),
+                num_ids_to_update=len(transferred_claim_db_ids),
+                exc_info=True
+            )
+            return 0
 
     async def process_claims_parallel(self, batch_id: Optional[str] = None, limit: int = 1000) -> Dict[str, Any]:
         logger.info("Starting parallel claims processing pipeline", batch_id=batch_id, limit=limit)
@@ -212,8 +276,12 @@ class ParallelClaimsProcessor:
             "batch_id": batch_id, "attempted_fetch_limit": limit,
             "fetched_count": 0, "validation_passed_count": 0,
             "validation_failed_count": 0,
-            "ml_prediction_attempted_count": 0, # New summary key
+            "ml_prediction_attempted_count": 0,
+            "ml_rejected_count": 0,
             "rvu_calculation_completed_count": 0,
+            "transferred_to_prod_count": 0,
+            "staging_updated_count": 0, # New summary key
+            "error": None
         }
         if not callable(self.db_session_factory):
             logger.error("db_session_factory is not callable. Cannot proceed.")
@@ -236,21 +304,61 @@ class ParallelClaimsProcessor:
                                 batch_id=batch_id,
                                 first_few_invalid_ids=[c.claim_id for c in invalid_claims[:3]])
 
+                claims_for_further_processing = []
                 if valid_claims:
-                    await self._apply_ml_predictions(valid_claims) # Call ML prediction stage
+                    await self._apply_ml_predictions(valid_claims)
                     summary["ml_prediction_attempted_count"] = len(valid_claims)
+                    ml_rejected_this_batch = 0
+                    for claim in valid_claims:
+                        if claim.ml_derived_decision != "ML_REJECTED":
+                            claims_for_further_processing.append(claim)
+                        else:
+                            ml_rejected_this_batch += 1
+                    summary["ml_rejected_count"] = ml_rejected_this_batch
+                    if ml_rejected_this_batch > 0:
+                        logger.info(f"{ml_rejected_this_batch} claims rejected by ML, will not proceed further.", batch_id=batch_id)
 
-                    # TODO: Add logic to filter claims based on ML decision if needed before RVU calc
-                    # For now, all valid_claims (post-validation) proceed to RVU regardless of ML outcome.
+                if claims_for_further_processing:
+                    await self._calculate_rvus_for_claims(session, claims_for_further_processing)
+                    summary["rvu_calculation_completed_count"] = len(claims_for_further_processing)
 
-                    await self._calculate_rvus_for_claims(session, valid_claims)
-                    summary["rvu_calculation_completed_count"] = len(valid_claims)
+                    batch_metrics = {"throughput_achieved": None}
 
-                logger.info(f"Main processing stages (fetch, validate, ML, RVU calc) complete for batch.", **summary)
+                    successfully_inserted_to_prod_count = await self._transfer_claims_to_production(
+                        session, claims_for_further_processing, batch_metrics
+                    )
+                    summary["transferred_to_prod_count"] = successfully_inserted_to_prod_count
 
+                    if successfully_inserted_to_prod_count > 0:
+                        ids_of_transferred_claims = [
+                            claim.id for claim in claims_for_further_processing # All these were attempted for transfer
+                        ]
+                        # Filter based on actual number inserted if there was a partial failure logic in transfer
+                        # Current _transfer_claims_to_production returns 0 on any failure, or len(all_attempted) on success.
+                        # So, if successfully_inserted_to_prod_count > 0, it implies all in claims_for_further_processing were part of the batch.
+                        if successfully_inserted_to_prod_count == len(claims_for_further_processing):
+                            updated_staging_count = await self._update_staging_claims_status(session, ids_of_transferred_claims)
+                            summary["staging_updated_count"] = updated_staging_count
+                            if updated_staging_count != successfully_inserted_to_prod_count:
+                                 logger.warn("Mismatch between successfully inserted to prod and updated in staging",
+                                             inserted_prod=successfully_inserted_to_prod_count, updated_staging=updated_staging_count)
+                        else:
+                            logger.warn("Partial success from _transfer_claims_to_production not fully handled for staging update logic.",
+                                        inserted_prod=successfully_inserted_to_prod_count,
+                                        candidates_for_transfer=len(claims_for_further_processing))
+                            summary["staging_updated_count"] = 0 # Or handle more gracefully
+                    else:
+                        summary["staging_updated_count"] = 0
+                else:
+                    logger.info("No claims eligible for RVU calculation or transfer after ML stage.", batch_id=batch_id)
+                    summary["rvu_calculation_completed_count"] = 0
+                    summary["transferred_to_prod_count"] = 0
+                    summary["staging_updated_count"] = 0
+
+                await session.commit()
+                logger.info(f"Main processing stages complete for batch and session committed.", **summary)
         except Exception as e:
             logger.error("Error during parallel claims processing pipeline",
                          batch_id=batch_id, error=str(e), exc_info=True)
             summary["error"] = str(e)
-
         return summary
