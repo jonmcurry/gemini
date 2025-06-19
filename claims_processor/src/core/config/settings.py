@@ -12,6 +12,9 @@ class Settings(BaseSettings):
 
     # Concurrency settings
     MAX_CONCURRENT_CLAIM_PROCESSING: int = 10 # Default value
+
+    # RVU data file path
+    RVU_DATA_FILE_PATH: str = "data/rvu_data.csv" # Default path
     # Add other settings as needed later
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_file_encoding='utf-8')
