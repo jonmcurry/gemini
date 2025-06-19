@@ -1,38 +1,45 @@
-from datetime import date, datetime
-from typing import List, Optional, Any # Added Any for line_items in helper methods for now
-# Assuming ProcessableClaim is correctly imported from its location
+from datetime import date, datetime # Keep datetime if ProcessableClaim has datetime fields
+from typing import List, Optional, Any
 from claims_processor.src.api.models.claim_models import ProcessableClaim, ProcessableClaimLineItem
 import structlog
-import numpy as np # For numerical operations and returning np.ndarray
+import numpy as np
+from decimal import Decimal # Import Decimal for type consistency if needed, though helpers return float
 
 logger = structlog.get_logger(__name__)
 
+# Define constants for feature encoding at module or class level
+INSURANCE_TYPE_MAPPING = {
+    "medicare": 1.0,
+    "medicaid": 2.0,
+    "commercial": 3.0,
+    "self-pay": 4.0,
+    # Add more as needed
+}
+DEFAULT_INSURANCE_ENCODING = 0.0 # For 'other' or None
+
+SURGERY_CODE_PREFIXES = {"S", "SURG", "10", "11"} # Example prefixes. Actual CPT ranges for surgery are 10000-69999.
+
 class FeatureExtractor:
     """
-    Extracts ML features from claims data as per REQUIREMENTS.md.
+    Extracts ML features from claims data.
     """
 
     def __init__(self):
-        # In the future, this might load configuration for feature engineering,
-        # e.g., encoding maps, scaling parameters, etc.
-        # For this version, using feature_count from settings is handled by OptimizedPredictor/ClaimProcessingService,
-        # this FeatureExtractor just produces a fixed set of 7 features as per plan.
-        # If padding/truncation was needed, self.feature_count from settings would be used here.
+        # In a real scenario, settings might provide feature_count, normalization params, etc.
+        # For this implementation, it produces a fixed set of 7 features.
+        # self.feature_count = 7 # Or get from settings if padding/truncation logic is re-added.
         logger.info("FeatureExtractor initialized.")
 
     def _calculate_patient_age(self, patient_date_of_birth: Optional[date], reference_date: Optional[date] = None) -> Optional[float]:
-        """Calculates patient age in years as of the reference date (or today)."""
         if not patient_date_of_birth:
             return None
 
-        # Use claim's service_from_date as reference if no explicit reference_date
         effective_reference_date = reference_date if reference_date else date.today()
 
         try:
-            # Ensure patient_date_of_birth is a date object
-            if not isinstance(patient_date_of_birth, date):
+            if not isinstance(patient_date_of_birth, date): # Should be handled by Pydantic, but good check
                 logger.warn("patient_date_of_birth is not a valid date object", dob_type=type(patient_date_of_birth))
-                return None # Or attempt to parse if it's a string, but Pydantic should handle this.
+                return None
 
             age = effective_reference_date.year - patient_date_of_birth.year - \
                   ((effective_reference_date.month, effective_reference_date.day) <
@@ -43,83 +50,88 @@ class FeatureExtractor:
             return None
 
     def _calculate_service_duration(self, claim: ProcessableClaim) -> float:
-        """Calculates the duration of service in days."""
         if not claim.service_from_date or not claim.service_to_date or claim.service_to_date < claim.service_from_date:
-            return 0.0 # Or a specific value indicating invalid/unknown duration
+            return 0.0
         duration = (claim.service_to_date - claim.service_from_date).days
         return float(duration + 1)
 
-    def _normalize_total_charges(self, total_charges: Any, default_max_charge: float = 100000.0) -> float:
-        """ Normalizes total charges. Using raw float value for now."""
-        try:
-            val = float(total_charges) # total_charges is Decimal from Pydantic model
-            return val
-        except (ValueError, TypeError):
-            logger.warn("Could not convert total_charges to float for normalization", value=total_charges)
-            return 0.0
-
+    def _normalize_total_charges(self, total_charges: Decimal) -> float: # Takes Decimal from Pydantic
+        # Using log1p for normalization, handles 0, avoids log(0)
+        # Ensure total_charges is float for np.log1p
+        charge_float = float(total_charges)
+        return np.log1p(charge_float if charge_float > 0 else 0.0)
 
     def _encode_insurance_type(self, insurance_type: Optional[str]) -> float:
-        """ Encodes insurance type. Placeholder logic."""
         if insurance_type:
-            # Simple placeholder. Real implementation needs a fixed mapping.
-            return float(abs(hash(insurance_type.lower())) % 100) / 100.0
-        return 0.0
+            return INSURANCE_TYPE_MAPPING.get(insurance_type.lower().strip(), DEFAULT_INSURANCE_ENCODING)
+        return DEFAULT_INSURANCE_ENCODING
 
     def _detect_surgery_codes(self, line_items: List[ProcessableClaimLineItem]) -> float:
-        """ Detects if any surgery codes are present. Placeholder logic."""
         if not line_items: return 0.0
         for item in line_items:
-            # Extremely naive placeholder. Real logic would check procedure codes against known surgical ranges/lists.
-            if item.procedure_code and ("SURG" in item.procedure_code.upper() or item.procedure_code.startswith("S")): # Example
-                 return 1.0
+            if item.procedure_code:
+                # More realistic check against CPT surgery ranges (10000-69999)
+                # This requires procedure_code to be clean numeric strings for range checks.
+                # The current prefixes are just illustrative.
+                try:
+                    # Attempt to check if it's a number first
+                    proc_code_num = int(item.procedure_code)
+                    if 10000 <= proc_code_num <= 69999:
+                        return 1.0
+                except ValueError:
+                    # If not a number, check against string prefixes (as in original placeholder)
+                    if any(item.procedure_code.upper().startswith(prefix) for prefix in SURGERY_CODE_PREFIXES):
+                        return 1.0
         return 0.0
 
     def _calculate_complexity_score(self, line_items: List[ProcessableClaimLineItem]) -> float:
-        """ Calculates a complexity score based on line items. Placeholder logic."""
         if not line_items: return 0.0
         score = 0.0
-        for item in line_items:
-            score += item.units # Example: more units = more complex
-        # Normalize score, e.g. assuming max 10 units sum is "complex"
-        return min(score, 10.0) / 10.0
+        num_lines = len(line_items)
+        total_units = sum(item.units for item in line_items if item.units is not None) # item.units is int, not Optional
+
+        score += min(num_lines / 10.0, 0.5)
+        score += min(total_units / 20.0, 0.5)
+        return min(score, 1.0)
 
     def extract_features(self, claim: ProcessableClaim) -> Optional[np.ndarray]:
-        """
-        Extracts a defined set of 7 features from a ProcessableClaim.
-        Returns a NumPy array of features (shape (7,)), or None if essential data is missing leading to error.
-        Order of features: total_charges, line_item_count, patient_age, service_duration_days,
-                          insurance_type_encoded, detect_surgery_codes, procedure_complexity_score.
-        """
         logger.debug("Extracting features for claim", claim_id=claim.claim_id)
         try:
             patient_age_val = self._calculate_patient_age(claim.patient_date_of_birth, reference_date=claim.service_from_date)
 
-            # ProcessableClaim does not have insurance_type. Passing None.
-            # This feature will be 0.0 unless ProcessableClaim is updated or data sourced differently.
-            insurance_type_encoded_val = self._encode_insurance_type(getattr(claim, 'insurance_type', None))
+            # Use the new insurance_type field from ProcessableClaim
+            insurance_type_encoded_val = self._encode_insurance_type(claim.insurance_type)
 
             features = [
                 self._normalize_total_charges(claim.total_charges),
                 float(len(claim.line_items)) if claim.line_items else 0.0,
-                patient_age_val if patient_age_val is not None else -1.0, # Impute missing age with -1 or other strategy
+                patient_age_val if patient_age_val is not None else -1.0,
                 self._calculate_service_duration(claim),
                 insurance_type_encoded_val,
                 self._detect_surgery_codes(claim.line_items),
                 self._calculate_complexity_score(claim.line_items)
             ]
 
-            # Convert to NumPy array with expected dtype (float32) and shape (1, 7)
-            # The previous feature extractor (subtask 21) padded to settings.ML_FEATURE_COUNT.
-            # This version produces a fixed set of 7 features as per the plan's example list.
-            # If ML_FEATURE_COUNT in settings is different from 7, this would need adjustment or padding.
-            # For now, assuming 7 features are always generated.
-            features_array = np.array(features, dtype=np.float32)
+            # Ensure 7 features are always produced. If fewer, this indicates an issue or need for padding.
+            # The current implementation generates exactly 7 features.
+            # If settings.ML_FEATURE_COUNT was different, padding/truncation logic would be needed here.
+            if len(features) != 7: # Fixed number of features
+                 logger.error(f"Feature extraction resulted in {len(features)} features, expected 7.", claim_id=claim.claim_id)
+                 # Decide error handling: return None, or pad/truncate. For now, log and return as is.
+                 # This would ideally align with a self.feature_count from settings if used.
 
-            # The ML model might expect shape (1, num_features) for a single prediction.
-            # Reshape if necessary based on model input specs.
-            # The OptimizedPredictor stub expects (num_samples, num_features).
-            # So, if this is for one claim, it should be (1, 7).
+            features_array = np.array(features, dtype=np.float32) # This creates a 1D array (7,)
+
+            # The OptimizedPredictor.predict_batch expects a list of features, where each feature set
+            # is a 1D np.ndarray. The old FeatureExtractor returned (1,N).
+            # The current OptimizedPredictor's predict_batch has logic to reshape (1,N) to (N,).
+            # To be safe and explicit, let's ensure this returns (1,N) as previously,
+            # as OptimizedPredictor.predict_batch expects a list of these.
+            # The _apply_ml_predictions method in ParallelClaimsProcessor collects these (1,N) arrays
+            # into a list features_batch_for_predictor: List[np.ndarray].
+            # Then OptimizedPredictor.predict_batch receives this list. Its internal loop processes
+            # each item. If item is (1,N), it reshapes.
+            # So, (1,N) output from here is consistent with current OptimizedPredictor.
             if features_array.ndim == 1:
                  features_array = features_array.reshape(1, -1)
 
@@ -128,30 +140,18 @@ class FeatureExtractor:
                 "Features extracted for claim",
                 claim_id=claim.claim_id,
                 shape=features_array.shape,
-                num_features=features_array.shape[1],
-                features_preview=features_array[0, :min(features_array.shape[1], 7)] # Log first few actual features
+                features_preview=features_array[0, :min(features_array.shape[1], 7)]
             )
             return features_array
 
         except Exception as e:
             logger.error("Failed to extract features for claim", claim_id=claim.claim_id, error=str(e), exc_info=True)
-            return None # Return None or an array of default values (e.g., zeros)
-                                # depending on how downstream ML model handles missing feature sets.
-                                # For now, None, and predictor should handle None input if necessary,
-                                # though current predictor expects ndarray.
-                                # The ClaimProcessingService will skip ML if features are None.
-                                # Let's return an empty array of expected shape to avoid breaking OptimizedPredictor input type.
-                                # Or, ensure OptimizedPredictor handles None input.
-                                # The plan for ClaimProcessingService was to skip ML if features are None.
-                                # So returning None is fine.
-
-                                # Actually, OptimizedPredictor expects np.ndarray.
-                                # Let's return a default array of zeros if extraction fails,
-                                # matching the feature_count specified in settings.
-                                # This requires getting settings here or assuming a fixed count.
-                                # The previous version of FeatureExtractor used self.feature_count from settings.
-                                # This one doesn't store it in __init__.
-                                # Let's re-add it to __init__ for consistency.
-                                # For now, this error path returns None.
-                                # The calling service (ClaimProcessingService) will check for None.
+            # Return a default array of zeros matching the expected shape (1, num_features)
+            # This requires knowing num_features. If FeatureExtractor had self.feature_count from settings:
+            # from claims_processor.src.core.config.settings import get_settings # Temporary if not in __init__
+            # settings = get_settings()
+            # default_features = np.zeros((1, settings.ML_FEATURE_COUNT), dtype=np.float32)
+            # logger.warn("Returning default features due to error", claim_id=claim.claim_id, shape=default_features.shape)
+            # return default_features
+            # For now, returning None as per previous design, and caller handles None.
             return None

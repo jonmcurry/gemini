@@ -6,7 +6,7 @@ import numpy as np
 # Attempt to import TensorFlow Lite and set a flag.
 TFLITE_AVAILABLE = False
 Interpreter = None # Default to None
-logger = structlog.get_logger(__name__) # Define logger globally
+logger = structlog.get_logger(__name__)
 
 try:
     from tflite_runtime.interpreter import Interpreter
@@ -14,9 +14,12 @@ try:
     logger.info("TensorFlow Lite runtime found.")
 except ImportError:
     logger.warn("TensorFlow Lite runtime not found. OptimizedPredictor will not be able to make real predictions if a model is loaded.")
-except Exception as e: # Catch other potential errors during import
+except Exception as e:
+    TFLITE_AVAILABLE = False # Ensure flag is false on any import error
+    Interpreter = None
     logger.error("An unexpected error occurred during tflite_runtime import.", error=str(e), exc_info=True)
 
+from ....core.config.settings import get_settings # For ML_APPROVAL_THRESHOLD
 
 class OptimizedPredictor:
     """
@@ -25,26 +28,20 @@ class OptimizedPredictor:
     """
 
     def __init__(self, model_path: str, feature_count: int = 7):
-        """
-        Initializes the OptimizedPredictor.
-
-        Args:
-            model_path: Path to the TensorFlow Lite model file.
-            feature_count: Expected number of features for the model.
-        """
         self.model_path = model_path
         self.feature_count = feature_count
-        self.interpreter: Optional[Interpreter] = None # Type hint the interpreter
-        self.input_details: Optional[List[Dict[str, Any]]] = None # More specific type hint
+        self.interpreter: Optional[Interpreter] = None
+        self.input_details: Optional[List[Dict[str, Any]]] = None
         self.output_details: Optional[List[Dict[str, Any]]] = None
+        self.approval_threshold: float = 0.8 # Default
 
         logger.info("OptimizedPredictor initializing...", model_path=self.model_path, tflite_available=TFLITE_AVAILABLE)
 
         if not TFLITE_AVAILABLE:
-            logger.error("TensorFlow Lite runtime is not available. Cannot load model or make predictions.")
+            logger.error("TensorFlow Lite runtime is not available. Model loading skipped.")
             return
 
-        if not self.model_path: # Check if model_path is empty or None
+        if not self.model_path:
             logger.error("Model path is not configured. Predictor will not work.")
             return
 
@@ -57,8 +54,12 @@ class OptimizedPredictor:
             logger.info(f"Loading TFLite model from: {self.model_path}")
             self.interpreter = Interpreter(model_path=self.model_path)
             self.interpreter.allocate_tensors()
-            self.input_details = self.interpreter.get_input_details() # Returns a list of dicts
-            self.output_details = self.interpreter.get_output_details() # Returns a list of dicts
+            self.input_details = self.interpreter.get_input_details()
+            self.output_details = self.interpreter.get_output_details()
+
+            app_settings = get_settings() # Fetch settings to get threshold
+            self.approval_threshold = app_settings.ML_APPROVAL_THRESHOLD
+            logger.info(f"Approval threshold set to: {self.approval_threshold}")
 
             if self.input_details:
                 expected_shape = list(self.input_details[0]['shape'])
@@ -79,71 +80,93 @@ class OptimizedPredictor:
 
 
     async def predict_batch(self, features_batch: List[np.ndarray]) -> List[Dict[str, Any]]:
-        """
-        Performs batch prediction on a list of feature sets.
-        Each feature set in the list is a 1D NumPy array of shape (feature_count,).
-        """
-        if not self.interpreter or not TFLITE_AVAILABLE: # Check interpreter instance specifically
+        if not self.interpreter or not TFLITE_AVAILABLE:
             logger.error("Predictor not initialized correctly or TFLite not available. Cannot predict.")
-            return [{"error": "Predictor not available or TFLite runtime missing"}] * len(features_batch) if features_batch else []
+            return [{"error": "Predictor not available", "ml_score": None, "ml_derived_decision": "ML_ERROR"}] * len(features_batch) if features_batch else []
 
         if not features_batch:
             return []
 
-        logger.debug(f"Predicting batch of size {len(features_batch)}")
+        logger.info(f"Performing TFLite inference for batch of size {len(features_batch)}")
         predictions: List[Dict[str, Any]] = []
 
-        # MOCK IMPLEMENTATION:
-        # This part should be replaced by actual TFLite inference loop if a model is used.
-        # For now, it provides mock predictions as per the prompt's structure.
-        from claims_processor.src.core.config.settings import get_settings # For ML_APPROVAL_THRESHOLD
-        settings = get_settings()
-        approval_threshold = settings.ML_APPROVAL_THRESHOLD
+        for i, features_sample_2d in enumerate(features_batch): # features_sample_2d is (1, feature_count)
+            try:
+                if not isinstance(features_sample_2d, np.ndarray):
+                    logger.warn(f"Sample {i} is not a NumPy array. Skipping.")
+                    predictions.append({"error": "Invalid feature format", "ml_score": None, "ml_derived_decision": "ML_ERROR"})
+                    continue
 
-        for i, features_sample_1d in enumerate(features_batch):
-            # Ensure features_sample_1d is float32 and has the correct number of features.
-            # The FeatureExtractor now returns (1, feature_count) for single,
-            # so this might need adjustment if the input is a list of these 2D arrays.
-            # Assuming features_sample_1d is already 1D of shape (feature_count,).
-            if features_sample_1d.ndim == 2 and features_sample_1d.shape[0] == 1: # If (1,N) passed
-                features_sample_1d = features_sample_1d.reshape(-1) # Convert to (N,)
+                # FeatureExtractor returns (1, N). Model input_details[0]['shape'] is often also [1, N].
+                if features_sample_2d.shape != tuple(self.input_details[0]['shape']):
+                     # If model expects different batch size (e.g. dynamic batching with None in shape)
+                     # or if feature count mismatches (already checked partly in FeatureExtractor)
+                     # This check assumes model input batch size is 1 if features_sample_2d is (1,N)
+                    if features_sample_2d.shape[1] != self.input_details[0]['shape'][-1]: # Check only last dim (features)
+                        logger.warn(
+                            f"Sample {i} feature count {features_sample_2d.shape[1]} "
+                            f"does not match model expected {self.input_details[0]['shape'][-1]}. Skipping."
+                        )
+                        predictions.append({"error": "Feature count mismatch", "ml_score": None, "ml_derived_decision": "ML_ERROR"})
+                        continue
+                    # If only batch size differs, and model supports dynamic batch (e.g. shape [None, N]), it might be fine.
+                    # For now, strict shape check for (1,N) vs model's (1,N)
+                    if self.input_details[0]['shape'][0] == 1 and features_sample_2d.shape[0] != 1:
+                         logger.warn(
+                            f"Sample {i} feature batch dim {features_sample_2d.shape[0]} "
+                            f"does not match model expected batch dim {self.input_details[0]['shape'][0]}. Skipping."
+                        )
+                         predictions.append({"error": "Feature batch dim mismatch", "ml_score": None, "ml_derived_decision": "ML_ERROR"})
+                         continue
 
-            if features_sample_1d.shape[0] != self.feature_count:
-                logger.warn(f"Sample {i} feature length {features_sample_1d.shape[0]} != model expected {self.feature_count}")
-                predictions.append({"error": "Feature length mismatch", "ml_score": 0.0, "ml_derived_decision": "ERROR"})
-                continue
 
-            # Actual TFLite inference would look like:
-            # input_data = np.expand_dims(features_sample_1d.astype(np.float32), axis=0)
-            # self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
-            # self.interpreter.invoke()
-            # output_data = self.interpreter.get_tensor(self.output_details[0]['index'])
-            # score = float(output_data[0][1]) # Assuming index 1 is 'approve' probability
-            # decision = "ML_APPROVED" if score >= approval_threshold else "ML_REJECTED"
-            # predictions.append({'ml_score': round(score, 4), 'ml_derived_decision': decision})
+                if features_sample_2d.dtype != np.float32:
+                    logger.warn(f"Sample {i} feature dtype {features_sample_2d.dtype} is not np.float32. Attempting conversion.")
+                    try:
+                        features_sample_2d = features_sample_2d.astype(np.float32)
+                    except Exception as cast_e:
+                        logger.error(f"Could not cast sample {i} features to np.float32: {cast_e}", exc_info=True)
+                        predictions.append({"error": "Feature type conversion failed", "ml_score": None, "ml_derived_decision": "ML_ERROR"})
+                        continue
 
-            # Mock prediction logic:
-            mock_score_sum = np.sum(features_sample_1d)
-            mock_score = (mock_score_sum / self.feature_count) * 0.1 # Scale sum to be roughly in 0-1
-            mock_score = float(min(max(0.0, mock_score + (0.05 * (i % 3))), 1.0)) # Vary it a bit, ensure float
+                self.interpreter.set_tensor(self.input_details[0]['index'], features_sample_2d)
+                self.interpreter.invoke()
+                output_data = self.interpreter.get_tensor(self.output_details[0]['index'])
 
-            decision = "ML_APPROVED" if mock_score >= approval_threshold else "ML_REJECTED"
-            predictions.append({'ml_score': round(mock_score, 4), 'ml_derived_decision': decision})
-            logger.debug(f"Mock prediction for sample {i}: score={mock_score:.4f}, decision='{decision}'")
+                score = 0.0
+                # Assuming output_data for a single sample is e.g., [[probability_class_0, probability_class_1]]
+                # Or, if it's a regression model, it might be a single value.
+                if output_data.shape == (1,1): # Single score output (e.g. sigmoid for approval)
+                    score = float(output_data[0][0])
+                elif output_data.shape == (1,2): # [prob_reject, prob_approve]
+                    score = float(output_data[0][1]) # Probability of 'approve' is index 1
+                else:
+                    logger.warn(f"Unexpected TFLite model output shape: {output_data.shape}. Attempting to use first item.")
+                    try:
+                        score = float(output_data.item(0))
+                    except Exception:
+                        logger.error(f"Could not interpret TFLite model output shape: {output_data.shape}", exc_info=True)
+                        predictions.append({"error": "Model output interpretation error", "ml_score": None, "ml_derived_decision": "ML_ERROR"})
+                        continue
+
+                decision = "ML_APPROVED" if score >= self.approval_threshold else "ML_REJECTED"
+                predictions.append({'ml_score': round(score, 4), 'ml_derived_decision': decision})
+                logger.debug(f"TFLite prediction for sample {i}: score={score:.4f}, decision='{decision}'")
+
+            except Exception as e:
+                logger.error(f"Error during TFLite inference for sample {i}: {e}", exc_info=True)
+                predictions.append({"error": "TFLite inference exception", "ml_score": None, "ml_derived_decision": "ML_ERROR"})
 
         return predictions
 
     async def health_check(self) -> Dict[str, Any]:
-        """Performs a health check on the ML predictor."""
         if not TFLITE_AVAILABLE:
             return {"status": "unhealthy", "reason": "TensorFlow Lite runtime not available."}
-        if not self.model_path or not Path(self.model_path).is_file(): # Check model_path attr
+        if not self.model_path or not Path(self.model_path).is_file():
             return {"status": "unhealthy", "reason": f"Model file not found at {self.model_path or '[not configured]'}"}
         if self.interpreter is None:
             return {"status": "unhealthy", "reason": "TFLite interpreter not loaded (e.g., model load failed during init)."}
 
-        # Basic check: interpreter object exists.
-        # A more thorough check might try a dummy inference if it's fast enough.
         return {"status": "healthy", "model_path": self.model_path,
-                "input_details": str(self.input_details), # Convert to str for JSON serializability
+                "input_details": str(self.input_details),
                 "output_details": str(self.output_details)}
