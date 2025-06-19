@@ -1,82 +1,157 @@
-import numpy as np
+from datetime import date, datetime # Keep datetime if ProcessableClaim has datetime fields
+from typing import List, Optional, Any
+from claims_processor.src.api.models.claim_models import ProcessableClaim, ProcessableClaimLineItem
 import structlog
-from typing import Dict, List, Optional # Added List, Optional for conceptual methods
-from datetime import date # Added for conceptual methods
-
-# Assuming ProcessableClaim is in:
-from ....api.models.claim_models import ProcessableClaim, ProcessableClaimLineItem # Added ProcessableClaimLineItem for conceptual
-from ....core.config.settings import get_settings # To get ML_FEATURE_COUNT
+import numpy as np
+from decimal import Decimal # Import Decimal for type consistency if needed, though helpers return float
 
 logger = structlog.get_logger(__name__)
 
+# Define constants for feature encoding at module or class level
+INSURANCE_TYPE_MAPPING = {
+    "medicare": 1.0,
+    "medicaid": 2.0,
+    "commercial": 3.0,
+    "self-pay": 4.0,
+    # Add more as needed
+}
+DEFAULT_INSURANCE_ENCODING = 0.0 # For 'other' or None
+
+SURGERY_CODE_PREFIXES = {"S", "SURG", "10", "11"} # Example prefixes. Actual CPT ranges for surgery are 10000-69999.
+
 class FeatureExtractor:
+    """
+    Extracts ML features from claims data.
+    """
+
     def __init__(self):
-        settings = get_settings()
-        self.feature_count = settings.ML_FEATURE_COUNT
-        logger.info("FeatureExtractor initialized.", feature_count=self.feature_count)
+        # In a real scenario, settings might provide feature_count, normalization params, etc.
+        # For this implementation, it produces a fixed set of 7 features.
+        # self.feature_count = 7 # Or get from settings if padding/truncation logic is re-added.
+        logger.info("FeatureExtractor initialized.")
 
-    def extract_features(self, claim: ProcessableClaim) -> np.ndarray:
-        logger.debug("Extracting features for claim", claim_id=claim.claim_id, db_id=claim.id)
+    def _calculate_patient_age(self, patient_date_of_birth: Optional[date], reference_date: Optional[date] = None) -> Optional[float]:
+        if not patient_date_of_birth:
+            return None
 
-        feature_list = []
+        effective_reference_date = reference_date if reference_date else date.today()
 
-        # 1. Total Charges
-        feature_list.append(float(claim.total_charges))
+        try:
+            if not isinstance(patient_date_of_birth, date): # Should be handled by Pydantic, but good check
+                logger.warn("patient_date_of_birth is not a valid date object", dob_type=type(patient_date_of_birth))
+                return None
 
-        # 2. Number of Line Items
-        feature_list.append(float(len(claim.line_items)))
+            age = effective_reference_date.year - patient_date_of_birth.year - \
+                  ((effective_reference_date.month, effective_reference_date.day) <
+                   (patient_date_of_birth.month, patient_date_of_birth.day))
+            return float(age)
+        except Exception as e:
+            logger.warn("Could not calculate patient age", dob=patient_date_of_birth, ref_date=effective_reference_date, error=str(e))
+            return None
 
-        # 3. Patient Age (Years) at time of service
-        age_in_years: float = 0.0
-        if claim.patient_date_of_birth:
-            reference_date = claim.service_from_date if claim.service_from_date else date.today()
-            age_in_years = (reference_date - claim.patient_date_of_birth).days / 365.25
-        feature_list.append(age_in_years)
+    def _calculate_service_duration(self, claim: ProcessableClaim) -> float:
+        if not claim.service_from_date or not claim.service_to_date or claim.service_to_date < claim.service_from_date:
+            return 0.0
+        duration = (claim.service_to_date - claim.service_from_date).days
+        return float(duration + 1)
 
-        # 4. Service Duration (Days)
-        service_duration_days: float = 0.0
-        if claim.service_from_date and claim.service_to_date and claim.service_to_date >= claim.service_from_date:
-            duration = claim.service_to_date - claim.service_from_date
-            service_duration_days = float(duration.days)
-        feature_list.append(service_duration_days)
+    def _normalize_total_charges(self, total_charges: Decimal) -> float: # Takes Decimal from Pydantic
+        # Using log1p for normalization, handles 0, avoids log(0)
+        # Ensure total_charges is float for np.log1p
+        charge_float = float(total_charges)
+        return np.log1p(charge_float if charge_float > 0 else 0.0)
 
-        # 5. Average charge per line item
-        avg_charge_per_line: float = 0.0
-        if claim.line_items: # Check if list is not empty
-            total_line_charges = sum(float(li.charge_amount) for li in claim.line_items)
-            avg_charge_per_line = total_line_charges / len(claim.line_items) if len(claim.line_items) > 0 else 0.0
-        feature_list.append(avg_charge_per_line)
+    def _encode_insurance_type(self, insurance_type: Optional[str]) -> float:
+        if insurance_type:
+            return INSURANCE_TYPE_MAPPING.get(insurance_type.lower().strip(), DEFAULT_INSURANCE_ENCODING)
+        return DEFAULT_INSURANCE_ENCODING
 
-        # Pad with zeros if fewer features are implemented than self.feature_count
-        num_implemented_features = len(feature_list)
-        if num_implemented_features < self.feature_count:
-            padding = [0.0] * (self.feature_count - num_implemented_features)
-            feature_list.extend(padding)
-        elif num_implemented_features > self.feature_count:
-            feature_list = feature_list[:self.feature_count] # Truncate
+    def _detect_surgery_codes(self, line_items: List[ProcessableClaimLineItem]) -> float:
+        if not line_items: return 0.0
+        for item in line_items:
+            if item.procedure_code:
+                # More realistic check against CPT surgery ranges (10000-69999)
+                # This requires procedure_code to be clean numeric strings for range checks.
+                # The current prefixes are just illustrative.
+                try:
+                    # Attempt to check if it's a number first
+                    proc_code_num = int(item.procedure_code)
+                    if 10000 <= proc_code_num <= 69999:
+                        return 1.0
+                except ValueError:
+                    # If not a number, check against string prefixes (as in original placeholder)
+                    if any(item.procedure_code.upper().startswith(prefix) for prefix in SURGERY_CODE_PREFIXES):
+                        return 1.0
+        return 0.0
 
-        features_array = np.array([feature_list], dtype=np.float32)
+    def _calculate_complexity_score(self, line_items: List[ProcessableClaimLineItem]) -> float:
+        if not line_items: return 0.0
+        score = 0.0
+        num_lines = len(line_items)
+        total_units = sum(item.units for item in line_items if item.units is not None) # item.units is int, not Optional
 
-        logger.info(
-            "Features extracted for claim",
-            claim_id=claim.claim_id,
-            shape=features_array.shape,
-            num_features_implemented=num_implemented_features,
-            features_preview=features_array[:, :min(num_implemented_features, 5)]
-        )
-        return features_array
+        score += min(num_lines / 10.0, 0.5)
+        score += min(total_units / 20.0, 0.5)
+        return min(score, 1.0)
 
-    # Example helper methods (conceptual) - can be removed or kept commented
-    # def _encode_insurance_type(self, insurance_type: Optional[str]) -> int:
-    #     # Simple encoding logic
-    #     if not insurance_type: return 0
-    #     if "PPO" in insurance_type.upper(): return 1
-    #     if "HMO" in insurance_type.upper(): return 2
-    #     return 3 # Other
+    def extract_features(self, claim: ProcessableClaim) -> Optional[np.ndarray]:
+        logger.debug("Extracting features for claim", claim_id=claim.claim_id)
+        try:
+            patient_age_val = self._calculate_patient_age(claim.patient_date_of_birth, reference_date=claim.service_from_date)
 
-    # def _calculate_complexity_score(self, line_items: List[ProcessableClaimLineItem]) -> float:
-    #     # Example: sum of (units * charge_amount / 1000) for each line
-    #     score = 0.0
-    #     for item in line_items:
-    #         score += (item.units * float(item.charge_amount)) / 1000.0 # Ensure float arithmetic
-    #     return score
+            # Use the new insurance_type field from ProcessableClaim
+            insurance_type_encoded_val = self._encode_insurance_type(claim.insurance_type)
+
+            features = [
+                self._normalize_total_charges(claim.total_charges),
+                float(len(claim.line_items)) if claim.line_items else 0.0,
+                patient_age_val if patient_age_val is not None else -1.0,
+                self._calculate_service_duration(claim),
+                insurance_type_encoded_val,
+                self._detect_surgery_codes(claim.line_items),
+                self._calculate_complexity_score(claim.line_items)
+            ]
+
+            # Ensure 7 features are always produced. If fewer, this indicates an issue or need for padding.
+            # The current implementation generates exactly 7 features.
+            # If settings.ML_FEATURE_COUNT was different, padding/truncation logic would be needed here.
+            if len(features) != 7: # Fixed number of features
+                 logger.error(f"Feature extraction resulted in {len(features)} features, expected 7.", claim_id=claim.claim_id)
+                 # Decide error handling: return None, or pad/truncate. For now, log and return as is.
+                 # This would ideally align with a self.feature_count from settings if used.
+
+            features_array = np.array(features, dtype=np.float32) # This creates a 1D array (7,)
+
+            # The OptimizedPredictor.predict_batch expects a list of features, where each feature set
+            # is a 1D np.ndarray. The old FeatureExtractor returned (1,N).
+            # The current OptimizedPredictor's predict_batch has logic to reshape (1,N) to (N,).
+            # To be safe and explicit, let's ensure this returns (1,N) as previously,
+            # as OptimizedPredictor.predict_batch expects a list of these.
+            # The _apply_ml_predictions method in ParallelClaimsProcessor collects these (1,N) arrays
+            # into a list features_batch_for_predictor: List[np.ndarray].
+            # Then OptimizedPredictor.predict_batch receives this list. Its internal loop processes
+            # each item. If item is (1,N), it reshapes.
+            # So, (1,N) output from here is consistent with current OptimizedPredictor.
+            if features_array.ndim == 1:
+                 features_array = features_array.reshape(1, -1)
+
+
+            logger.info(
+                "Features extracted for claim",
+                claim_id=claim.claim_id,
+                shape=features_array.shape,
+                features_preview=features_array[0, :min(features_array.shape[1], 7)]
+            )
+            return features_array
+
+        except Exception as e:
+            logger.error("Failed to extract features for claim", claim_id=claim.claim_id, error=str(e), exc_info=True)
+            # Return a default array of zeros matching the expected shape (1, num_features)
+            # This requires knowing num_features. If FeatureExtractor had self.feature_count from settings:
+            # from claims_processor.src.core.config.settings import get_settings # Temporary if not in __init__
+            # settings = get_settings()
+            # default_features = np.zeros((1, settings.ML_FEATURE_COUNT), dtype=np.float32)
+            # logger.warn("Returning default features due to error", claim_id=claim.claim_id, shape=default_features.shape)
+            # return default_features
+            # For now, returning None as per previous design, and caller handles None.
+            return None
