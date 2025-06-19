@@ -4,11 +4,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from sqlalchemy.orm import joinedload, selectinload
 
-from ....core.cache.cache_manager import CacheManager # Retain for type hint if needed by services passed in
+from ....core.cache.cache_manager import CacheManager
 from ....api.models.claim_models import ProcessableClaim
 from ....core.database.models.claims_db import ClaimModel
 from ..validation.claim_validator import ClaimValidator
-from ..rvu_service import RVUService # New import
+from ..rvu_service import RVUService
+from ..ml_pipeline.feature_extractor import FeatureExtractor
+from ..ml_pipeline.optimized_predictor import OptimizedPredictor
+import numpy as np
 
 logger = structlog.get_logger(__name__)
 
@@ -21,19 +24,15 @@ class ParallelClaimsProcessor:
     def __init__(self,
                  db_session_factory: Any,
                  claim_validator: ClaimValidator,
-                 rvu_service: RVUService):
-        """
-        Initializes the ParallelClaimsProcessor.
-
-        Args:
-            db_session_factory: An asynchronous factory function that provides an AsyncSession.
-            claim_validator: An instance of ClaimValidator.
-            rvu_service: An instance of RVUService (pre-configured with CacheManager).
-        """
+                 rvu_service: RVUService,
+                 feature_extractor: FeatureExtractor,
+                 optimized_predictor: OptimizedPredictor):
         self.db_session_factory = db_session_factory
         self.validator = claim_validator
         self.rvu_service = rvu_service
-        logger.info("ParallelClaimsProcessor initialized with validator and RVU service.")
+        self.feature_extractor = feature_extractor
+        self.predictor = optimized_predictor
+        logger.info("ParallelClaimsProcessor initialized with validator, RVU service, FeatureExtractor, and OptimizedPredictor.")
 
     async def _fetch_claims_parallel(self, session: AsyncSession, batch_id: Optional[str] = None, limit: int = 1000) -> List[ProcessableClaim]:
         logger.info("Fetching pending claims for processing", batch_id=batch_id, limit=limit)
@@ -113,40 +112,108 @@ class ParallelClaimsProcessor:
         return valid_claims_list, invalid_claims_list
 
     async def _calculate_rvus_for_claims(self, session: AsyncSession, claims: List[ProcessableClaim]) -> None:
-        """
-        Calculates RVUs for a list of claims using RVUService.
-        Modifies claims in-place.
-        """
         if not claims:
             logger.info("No claims provided for RVU calculation.")
             return
-
         logger.info(f"Calculating RVUs for {len(claims)} claims.")
         processed_count = 0
         for claim_idx, claim in enumerate(claims):
             if (claim_idx + 1) % 100 == 0:
                 logger.debug(f"RVU calculation progress for batch '{claim.batch_id}': {claim_idx + 1}/{len(claims)} claims processed.")
             try:
-                await self.rvu_service.calculate_rvu_for_claim(claim, session) # Pass session
+                await self.rvu_service.calculate_rvu_for_claim(claim, session)
                 processed_count += 1
             except Exception as e:
                 logger.error(
                     "Error during RVU calculation for claim",
-                    claim_id=claim.claim_id,
-                    db_claim_id=claim.id,
-                    batch_id=claim.batch_id,
-                    error=str(e),
-                    exc_info=True
+                    claim_id=claim.claim_id, db_claim_id=claim.id,
+                    batch_id=claim.batch_id, error=str(e), exc_info=True
                 )
         logger.info(f"RVU calculation attempted for {len(claims)} claims. Successfully processed (or attempted with errors): {processed_count}.")
 
+    async def _apply_ml_predictions(self, claims: List[ProcessableClaim]) -> None:
+        """
+        Applies ML predictions to a list of claims using FeatureExtractor and OptimizedPredictor.
+        Modifies claims in-place with ml_score and ml_derived_decision.
+        """
+        if not claims:
+            logger.info("No claims provided for ML prediction.")
+            return
+
+        logger.info(f"Applying ML predictions for {len(claims)} claims.")
+
+        features_batch_for_predictor: List[np.ndarray] = []
+        claims_with_features: List[ProcessableClaim] = []
+
+        for claim_idx, claim in enumerate(claims):
+            if (claim_idx + 1) % 50 == 0:
+                logger.info(f"ML Feature Extraction progress: {claim_idx + 1}/{len(claims)} claims processed.")
+
+            try:
+                features_array_2d = self.feature_extractor.extract_features(claim)
+
+                if features_array_2d is not None:
+                    # OptimizedPredictor.predict_batch expects a list of 1D arrays if it processes them one by one,
+                    # or a single 2D array if it can batch predict.
+                    # The current OptimizedPredictor.predict_batch iterates a list of 1D arrays.
+                    # FeatureExtractor returns (1, N). We need to ensure this matches.
+                    # The implemented OptimizedPredictor.predict_batch handles reshaping (1,N) to (N,) internally.
+                    # So we can append the (1,N) array.
+                    features_batch_for_predictor.append(features_array_2d)
+                    claims_with_features.append(claim)
+                else:
+                    logger.warn("Feature extraction failed or returned None for claim", claim_id=claim.claim_id, db_claim_id=claim.id)
+                    claim.ml_derived_decision = "ML_SKIPPED_NO_FEATURES"
+                    claim.ml_score = None
+
+            except Exception as e:
+                logger.error("Error during feature extraction for claim", claim_id=claim.claim_id, error=str(e), exc_info=True)
+                claim.ml_derived_decision = "ML_SKIPPED_EXTRACTION_ERROR"
+                claim.ml_score = None
+
+        if not features_batch_for_predictor:
+            logger.info("No claims had features successfully extracted for ML prediction.")
+            return
+
+        logger.info(f"Sending batch of {len(features_batch_for_predictor)} feature sets to OptimizedPredictor.")
+        try:
+            prediction_results = await self.predictor.predict_batch(features_batch_for_predictor)
+
+            if len(prediction_results) == len(claims_with_features):
+                for claim_obj, prediction_dict in zip(claims_with_features, prediction_results):
+                    if "error" in prediction_dict:
+                        logger.warn("ML prediction failed for claim", claim_id=claim_obj.claim_id, error=prediction_dict["error"])
+                        claim_obj.ml_derived_decision = "ML_PREDICTION_ERROR"
+                        claim_obj.ml_score = None
+                    else:
+                        claim_obj.ml_score = prediction_dict.get('ml_score')
+                        claim_obj.ml_derived_decision = prediction_dict.get('ml_derived_decision')
+                        logger.debug("ML prediction applied to claim", claim_id=claim_obj.claim_id, score=claim_obj.ml_score, decision=claim_obj.ml_derived_decision)
+            else:
+                logger.error(
+                    f"Mismatch between number of claims sent for prediction ({len(claims_with_features)}) "
+                    f"and number of results received ({len(prediction_results)}). Cannot map results."
+                )
+                for claim_obj in claims_with_features:
+                    claim_obj.ml_derived_decision = "ML_PREDICTION_BATCH_ERROR"
+                    claim_obj.ml_score = None
+
+        except Exception as e:
+            logger.error("Error during ML batch prediction", error=str(e), exc_info=True)
+            for claim_obj in claims_with_features:
+                claim_obj.ml_derived_decision = "ML_PREDICTION_BATCH_ERROR"
+                claim_obj.ml_score = None
+
+        logger.info(f"ML prediction application completed for {len(claims_with_features)} claims.")
 
     async def process_claims_parallel(self, batch_id: Optional[str] = None, limit: int = 1000) -> Dict[str, Any]:
         logger.info("Starting parallel claims processing pipeline", batch_id=batch_id, limit=limit)
         summary = {
             "batch_id": batch_id, "attempted_fetch_limit": limit,
             "fetched_count": 0, "validation_passed_count": 0,
-            "validation_failed_count": 0, "rvu_calculation_completed_count": 0, # New counter
+            "validation_failed_count": 0,
+            "ml_prediction_attempted_count": 0, # New summary key
+            "rvu_calculation_completed_count": 0,
         }
         if not callable(self.db_session_factory):
             logger.error("db_session_factory is not callable. Cannot proceed.")
@@ -170,10 +237,16 @@ class ParallelClaimsProcessor:
                                 first_few_invalid_ids=[c.claim_id for c in invalid_claims[:3]])
 
                 if valid_claims:
-                    await self._calculate_rvus_for_claims(session, valid_claims)
-                    summary["rvu_calculation_completed_count"] = len(valid_claims) # Assumes all valid claims had RVU calc attempted
+                    await self._apply_ml_predictions(valid_claims) # Call ML prediction stage
+                    summary["ml_prediction_attempted_count"] = len(valid_claims)
 
-                logger.info(f"Main processing stages (fetch, validate, RVU calc) complete for batch.", **summary)
+                    # TODO: Add logic to filter claims based on ML decision if needed before RVU calc
+                    # For now, all valid_claims (post-validation) proceed to RVU regardless of ML outcome.
+
+                    await self._calculate_rvus_for_claims(session, valid_claims)
+                    summary["rvu_calculation_completed_count"] = len(valid_claims)
+
+                logger.info(f"Main processing stages (fetch, validate, ML, RVU calc) complete for batch.", **summary)
 
         except Exception as e:
             logger.error("Error during parallel claims processing pipeline",
