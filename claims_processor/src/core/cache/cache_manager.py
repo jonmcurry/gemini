@@ -271,3 +271,5 @@ _global_cache_manager_instance_for_factory: Optional[CacheManager] = None
 #        self.client = aiomcache.Client(host, port, pool_size=2)
 # And then the factory functions from the prompt for get_cache_manager and close_global_cache_manager.
 # This is the cleanest.Okay, I see there was a lot of internal monologue there! I'll proceed with the plan of creating an instance-based `CacheManager` class (where each instance holds its own client, making it testable in isolation if needed), and then using the provided factory functions (`get_cache_manager`, `close_global_cache_manager`) to manage a singleton instance of this `CacheManager` for the application. This is a common and clean pattern.
+
+**Create `claims_processor/src/core/cache/cache_manager.py`** (using the refined instance-based client approach for `CacheManager` class, with singleton factory functions from prompt)

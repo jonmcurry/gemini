@@ -66,11 +66,11 @@ class ClaimProcessingService:
 
         if not fetched_db_claims:
             logger.info("No pending claims to process.")
-            # Updated return structure for consistency
             return {
                 "message": "No pending claims to process.", "attempted_claims": 0,
                 "conversion_errors":0, "validation_failures": 0,
-                "ml_approved_count": 0, "ml_rejected_count": 0, "ml_error_count": 0,
+                "ml_approved_raw": 0, "ml_rejected_raw": 0, "ml_errors_raw": 0, # Raw ML decisions
+                "stopped_by_ml_rejection": 0,
                 "rvu_calculation_failures":0, "successfully_processed_count": 0,
                 "other_exceptions":0
             }
@@ -83,11 +83,15 @@ class ClaimProcessingService:
         attempted_claims = len(fetched_db_claims)
         conversion_errors_count = 0
         failed_validation_count = 0
-        processed_for_rvu_count = 0 # Successfully completed all steps including RVU
+        successfully_processed_count = 0
         failed_rvu_count = 0
-        ml_approved_count = 0
-        ml_rejected_count = 0
-        ml_error_count = 0 # For ML processing errors or unexpected formats
+
+        # Counters for ML decision outcomes, regardless of whether they halted processing
+        ml_approved_raw_count = 0
+        ml_rejected_raw_count = 0
+        ml_errors_raw_count = 0 # Errors during ML step or unparseable output
+
+        stopped_by_ml_rejection_count = 0 # Specifically those that had status 'ml_rejected'
         other_exceptions_count = 0
 
         for result in processing_results:
@@ -96,31 +100,38 @@ class ClaimProcessingService:
                 other_exceptions_count +=1
             elif isinstance(result, dict):
                 status = result.get("status")
-                ml_decision = result.get("ml_decision", "N/A")
+                ml_decision_from_result = result.get("ml_decision", "N/A")
 
-                if ml_decision == "ML_APPROVED": ml_approved_count += 1
-                elif ml_decision == "ML_REJECTED": ml_rejected_count += 1
-                elif ml_decision.startswith("ML_ERROR") or ml_decision == "ML_PROCESSING_ERROR": ml_error_count +=1
+                # Tally raw ML decisions
+                if ml_decision_from_result == "ML_APPROVED": ml_approved_raw_count += 1
+                elif ml_decision_from_result == "ML_REJECTED": ml_rejected_raw_count += 1
+                elif ml_decision_from_result.startswith("ML_ERROR") or ml_decision_from_result == "ML_PROCESSING_ERROR": ml_errors_raw_count +=1
 
+                # Tally based on final status
                 if status == "conversion_error":
                     conversion_errors_count +=1
                 elif status == "validation_failed":
                     failed_validation_count += 1
+                elif status == "ml_rejected": # This is a terminal status for this claim in the flow
+                    stopped_by_ml_rejection_count += 1
                 elif status == "rvu_calculation_failed":
+                    # This claim passed validation and ML (or ML error allowed it to proceed)
                     failed_rvu_count +=1
                 elif status == "processing_complete":
-                    processed_for_rvu_count += 1
+                    # This claim passed validation, ML (or ML error allowed it to proceed), and RVU
+                    successfully_processed_count += 1
 
         final_summary = {
             "message": "Concurrent batch processing finished.",
             "attempted_claims": attempted_claims,
             "conversion_errors": conversion_errors_count,
             "validation_failures": failed_validation_count,
-            "ml_approved_count": ml_approved_count,
-            "ml_rejected_count": ml_rejected_count,
-            "ml_error_count": ml_error_count,
+            "ml_approved_raw": ml_approved_raw_count, # How many ML thought were good
+            "ml_rejected_raw": ml_rejected_raw_count, # How many ML thought were bad
+            "ml_errors_raw": ml_errors_raw_count,     # How many had issues in ML step
+            "stopped_by_ml_rejection": stopped_by_ml_rejection_count, # Actual stops due to ML
             "rvu_calculation_failures": failed_rvu_count,
-            "successfully_processed_count": processed_for_rvu_count,
+            "successfully_processed_count": successfully_processed_count,
             "other_exceptions" : other_exceptions_count
         }
         logger.info("Concurrent batch processing summary.", **final_summary)
