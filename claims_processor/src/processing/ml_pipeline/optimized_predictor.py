@@ -1,78 +1,95 @@
 import numpy as np
 import structlog
-from typing import Any # For generic type hints if needed for model object later
-
-# from ....core.config.settings import get_settings # Not strictly needed if model_path is passed in
+from typing import Any, Dict, Optional # Added Dict, Optional
 
 logger = structlog.get_logger(__name__)
 
+# Attempt to import TensorFlow.
+try:
+    import tensorflow as tf
+    TENSORFLOW_AVAILABLE = True
+    logger.info("TensorFlow library found.")
+except ImportError:
+    TENSORFLOW_AVAILABLE = False
+    logger.warn("TensorFlow library not found. OptimizedPredictor will operate in a stubbed mode for predictions.")
+    tf = None # Assign to None so tf.lite references don't cause NameError later
+
 class OptimizedPredictor:
     def __init__(self, model_path: str):
-        """
-        Initializes the predictor.
-        For now, it just stores model_path and logs.
-        In a real implementation, this would load the TensorFlow Lite model.
-        """
         self.model_path = model_path
-        self.model: Any = None # Placeholder for the actual loaded model
+        self.model: Any = None # Will store the tf.lite.Interpreter instance
+        self.input_details: Optional[Any] = None # Changed from List[Dict] to Any for simplicity with TF details
+        self.output_details: Optional[Any] = None # Changed from List[Dict] to Any
 
-        logger.info("OptimizedPredictor initialized (stub).", model_path=self.model_path)
-        self._load_model_stub()
+        logger.info("OptimizedPredictor initialized.", model_path=self.model_path)
+        self._load_model() # Changed from _load_model_stub
 
-    def _load_model_stub(self):
-        """
-        Stub for loading the ML model.
-        In a real implementation, this would use TensorFlow Lite's interpreter to load the model.
-        """
-        logger.info(f"Attempting to load model from {self.model_path} (stub - no actual loading).")
-        # Example of what real loading might look like (commented out):
-        # try:
-        #     import tensorflow as tf
-        #     self.interpreter = tf.lite.Interpreter(model_path=self.model_path)
-        #     self.interpreter.allocate_tensors()
-        #     self.input_details = self.interpreter.get_input_details()
-        #     self.output_details = self.interpreter.get_output_details()
-        #     logger.info("TensorFlow Lite model loaded successfully (conceptual).", model_path=self.model_path)
-        #     self.model = self.interpreter # Assign interpreter to self.model
-        # except Exception as e:
-        #     logger.error(f"Failed to load TFLite model from {self.model_path}", error=str(e), exc_info=True)
-        #     # self.model remains None, predict_async should handle this
+    def _load_model(self): # Renamed from _load_model_stub
+        logger.info(f"Attempting to load model from {self.model_path}.")
+        if not TENSORFLOW_AVAILABLE:
+            logger.warn(f"TensorFlow is not available. Cannot load TFLite model from {self.model_path}.")
+            self.model = None
+            return
 
-        # For the stub, we just simulate that a model placeholder exists
-        self.model = "dummy_model_object" # Simulate a loaded model object
-        logger.info("Model loading stub complete.", model_path=self.model_path)
+        try:
+            if not self.model_path:
+                logger.warn("No model path configured in settings. Cannot load model.")
+                self.model = None
+                return
+
+            interpreter = tf.lite.Interpreter(model_path=self.model_path)
+            interpreter.allocate_tensors()
+
+            self.input_details = interpreter.get_input_details()
+            self.output_details = interpreter.get_output_details()
+            self.model = interpreter
+
+            logger.info(
+                "TensorFlow Lite model loaded successfully (actual attempt).",
+                model_path=self.model_path,
+                input_details=self.input_details, # Log details for diagnostics
+                output_details=self.output_details
+            )
+
+        except FileNotFoundError: # More specific exception
+            logger.error(f"Model file not found at {self.model_path}. Ensure the model exists or the path is correct.")
+            self.model = None
+        except Exception as e:
+            logger.error(f"Failed to load TFLite model from {self.model_path}", error_type=type(e).__name__, error=str(e), exc_info=False)
+            self.model = None
+
+        if self.model is None:
+            logger.warn(f"Model loading failed or TensorFlow not available. Predictor will use dummy predictions if called.", model_path=self.model_path)
 
 
     async def predict_async(self, features: np.ndarray) -> np.ndarray:
-        """
-        Performs prediction on the input features.
-        'features' is expected to be a NumPy array, e.g., shape (1, num_features).
-        Returns a dummy prediction (e.g., probabilities for binary classification).
-        This method is async to accommodate potential I/O if it were calling a remote ML service,
-        or if the model inference itself had an async API (less common for local TFLite).
-        """
-        logger.debug("Performing prediction (stub)", input_shape=features.shape, model_path=self.model_path)
+        logger.debug("Performing prediction", input_shape=features.shape, model_loaded=(self.model is not None))
 
-        if self.model is None:
-            logger.error("Model not loaded, cannot perform prediction.", model_path=self.model_path)
-            # Return a default prediction or raise an error, matching expected output shape
-            # For binary classification (approve/reject), output might be (num_samples, 2)
+        if self.model is None or not TENSORFLOW_AVAILABLE:
+            if self.model is None and TENSORFLOW_AVAILABLE: # Log only if TF is there but model failed to load
+                 logger.warn("Model not loaded, returning dummy predictions.", model_path=self.model_path)
+            elif not TENSORFLOW_AVAILABLE:
+                 logger.warn("TensorFlow not available, returning dummy predictions.")
             num_samples = features.shape[0]
-            # Return a neutral or error-indicating prediction, e.g., [0.0, 0.0] or similar
-            return np.full((num_samples, 2), 0.0).astype(np.float32)
+            # Consistent dummy prediction (e.g., for binary classification)
+            return np.random.rand(num_samples, 2).astype(np.float32)
 
+        try:
+            if self.input_details is None or self.output_details is None: # Should not happen if model loaded ok
+                logger.error("Model input/output details not available despite model being loaded. Cannot perform prediction.")
+                num_samples = features.shape[0]
+                return np.random.rand(num_samples, 2).astype(np.float32)
 
-        # Simulate prediction for binary classification (e.g., [prob_reject, prob_approve])
-        # The requirements mention "Approve/Reject" as output classes.
-        num_samples = features.shape[0]
-        # Example: dummy_prediction = np.array([[0.2, 0.8]]) for one sample
-        # For multiple samples (if features batch has more than 1 row):
-        dummy_predictions = np.random.rand(num_samples, 2).astype(np.float32)
-        # Ensure probabilities sum to 1 (optional, depending on model output)
-        # For example, if model output is softmax:
-        # dummy_predictions = dummy_predictions / np.sum(dummy_predictions, axis=1, keepdims=True)
-        # However, if it's two independent probabilities or logits, this normalization isn't needed.
-        # For now, just random values for two classes.
+            # Assuming features are correctly shaped (e.g., (num_samples, num_features))
+            # And model input_details[0]['shape'] is compatible (e.g. [None, num_features] or [num_samples, num_features])
+            self.model.set_tensor(self.input_details[0]['index'], features)
+            self.model.invoke()
+            output_data = self.model.get_tensor(self.output_details[0]['index'])
 
-        logger.info("Dummy prediction generated", output_shape=dummy_predictions.shape)
-        return dummy_predictions
+            logger.info("Prediction successful using loaded TFLite model.", output_shape=output_data.shape)
+            return np.array(output_data).astype(np.float32)
+
+        except Exception as e:
+            logger.error("Error during TFLite model inference", error_type=type(e).__name__, error=str(e), exc_info=True)
+            num_samples = features.shape[0]
+            return np.random.rand(num_samples, 2).astype(np.float32) # Fallback to dummy

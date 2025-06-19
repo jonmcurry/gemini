@@ -44,7 +44,43 @@ def test_extract_features_returns_correct_shape_and_type(
         f"Expected shape (1, {expected_feature_count}), but got {features.shape}"
     assert features.dtype == np.float32, "Features should be float32 type"
 
-def test_feature_extractor_initialization(feature_extractor: FeatureExtractor):
+    # Verify actual feature values based on sample_processable_claim
+    # Expected features: total_charges, num_line_items, patient_age, service_duration_days, avg_charge_per_line, ...padding...
+
+    # 1. Total Charges
+    assert features[0, 0] == float(sample_processable_claim.total_charges)
+
+    # 2. Number of Line Items
+    assert features[0, 1] == float(len(sample_processable_claim.line_items))
+
+    # 3. Patient Age
+    expected_age = 0.0
+    if sample_processable_claim.patient_date_of_birth:
+        ref_date = sample_processable_claim.service_from_date if sample_processable_claim.service_from_date else date.today()
+        expected_age = (ref_date - sample_processable_claim.patient_date_of_birth).days / 365.25
+    assert np.isclose(features[0, 2], expected_age), f"Expected age {expected_age}, got {features[0, 2]}"
+
+    # 4. Service Duration
+    expected_duration = 0.0
+    if sample_processable_claim.service_from_date and sample_processable_claim.service_to_date and \
+       sample_processable_claim.service_to_date >= sample_processable_claim.service_from_date:
+        expected_duration = float((sample_processable_claim.service_to_date - sample_processable_claim.service_from_date).days)
+    assert np.isclose(features[0, 3], expected_duration), f"Expected duration {expected_duration}, got {features[0, 3]}"
+
+    # 5. Average charge per line item
+    expected_avg_charge = 0.0
+    if sample_processable_claim.line_items: # Check if list is not empty
+        total_line_charges = sum(float(li.charge_amount) for li in sample_processable_claim.line_items)
+        if len(sample_processable_claim.line_items) > 0:
+            expected_avg_charge = total_line_charges / len(sample_processable_claim.line_items)
+    assert np.isclose(features[0, 4], expected_avg_charge), f"Expected avg charge {expected_avg_charge}, got {features[0, 4]}"
+
+    # Check padding if feature_count > 5
+    if expected_feature_count > 5:
+        for i in range(5, expected_feature_count):
+            assert features[0, i] == 0.0, f"Expected padding with 0.0 at feature index {i}, got {features[0,i]}"
+
+def test_feature_extractor_initialization(feature_extractor: FeatureExtractor): # Renamed old test
     settings = get_settings()
     assert feature_extractor.feature_count == settings.ML_FEATURE_COUNT
     # Test that it logs, if caplog fixture is used (optional for now)
