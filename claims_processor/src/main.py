@@ -27,3 +27,16 @@ async def health_check():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": "1.0.0"
     }
+
+# Prometheus metrics endpoint
+from prometheus_client import generate_latest, REGISTRY
+from prometheus_client.exposition import CONTENT_TYPE_LATEST
+from fastapi import Response
+
+@app.get("/metrics", tags=["Monitoring"])
+async def get_metrics():
+    """
+    Exposes Prometheus metrics.
+    """
+    logger.debug("Metrics endpoint called.")
+    return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)

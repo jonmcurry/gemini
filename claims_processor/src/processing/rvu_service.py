@@ -7,7 +7,8 @@ from typing import Optional, Dict # Added Dict
 
 from ..api.models.claim_models import ProcessableClaim, ProcessableClaimLineItem
 from ..core.cache.cache_manager import CacheManager
-from ..core.config.settings import get_settings # For RVU_DATA_FILE_PATH
+from ..core.config.settings import get_settings
+from ..core.monitoring.metrics import CACHE_OPERATIONS_TOTAL # Import the metric
 
 logger = structlog.get_logger(__name__)
 
@@ -86,16 +87,21 @@ class RVUService:
             rvu_per_unit: Optional[Decimal] = None
 
             if rvu_per_unit_str is not None:
+                CACHE_OPERATIONS_TOTAL.labels(cache_type='rvu_cache', operation_type='hit').inc() # HIT
                 try:
                     rvu_per_unit = Decimal(rvu_per_unit_str)
                     logger.debug("RVU cache hit", procedure_code=procedure_code, rvu_value=rvu_per_unit)
                 except Exception as e:
                     logger.warn("Failed to parse cached RVU value, falling back to CSV/default.",
                                 procedure_code=procedure_code, cached_value=rvu_per_unit_str, error=str(e))
+                    rvu_per_unit = None # Treat parse error as miss, force re-fetch from source
 
-            if rvu_per_unit is None: # Cache miss or parsing failed
+            if rvu_per_unit is None: # Cache miss OR cache hit but failed to parse
+                CACHE_OPERATIONS_TOTAL.labels(cache_type='rvu_cache', operation_type='miss').inc() # MISS
                 logger.debug("RVU cache miss or parse error, using data from CSV/default.", procedure_code=procedure_code)
+
                 rvu_per_unit = self.rvu_data_map.get(procedure_code, default_rvu_value) # Use loaded map
+                # Set in cache (CacheManager.set now internally handles set_error metric)
                 await self.cache_manager.set(cache_key, str(rvu_per_unit), ttl=3600)
 
             line_item.rvu_total = rvu_per_unit * Decimal(units)
