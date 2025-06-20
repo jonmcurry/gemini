@@ -120,7 +120,7 @@ Regular monitoring is essential to ensure the partitioning strategy remains effe
 ### 5. Automation
 
 *   **Partition Creation:** The creation of new partitions **must be automated**. Manual creation is prone to human error and can be easily forgotten, leading to data ingestion failures.
-    *   Use cron jobs (for Linux/macOS) or Task Scheduler (for Windows) to execute SQL scripts that create the necessary partitions based on the schedules defined above.
+    *   Use cron jobs (for Linux/macOS) or Task Scheduler (for Windows) to execute the Python scripts detailed in Section 7 (`manage_claim_line_item_partitions.py` and `manage_claims_production_partitions.py`) to create the necessary partitions based on the schedules defined above.
     *   Database-native schedulers (like `pg_cron` for PostgreSQL, or similar features in other databases) can also be used.
 *   **Archival/Dropping (Optional Automation):** While archival and dropping can also be automated, it often involves more complex decision-making and verification steps. Initial implementations might involve semi-automated scripts with manual checks before final execution.
 
@@ -129,4 +129,53 @@ Regular monitoring is essential to ensure the partitioning strategy remains effe
 *   If data is attempted to be inserted into a partitioned table for which no suitable partition exists (i.e., the value of the partitioning key falls outside the range of any existing partition), the insert operation will fail with an error (e.g., "no partition of relation found for row").
 *   The proactive creation of partitions as outlined in Section 2 is the primary defense against this.
 *   While PostgreSQL (version 11 and later) supports a `DEFAULT` partition to catch data that doesn't fit into any other defined partition, relying on this for routine operations is generally not recommended as it can become a performance bottleneck and a data management challenge. It's better to ensure specific range partitions are always available.
+
+## 7. Automated Partition Management Scripts
+
+To facilitate the automated creation of partitions as recommended, two Python scripts are provided. These scripts handle DDL generation, check for existing partitions, and can execute the DDL against the database.
+
+### 7.1. Script Locations
+
+The scripts are located in the `claims_processor/scripts/database/` directory within the project.
+
+### 7.2. Running the Scripts
+
+Ensure your Python environment is active with all necessary project dependencies installed (especially SQLAlchemy, asyncpg, structlog, python-dateutil). The scripts are designed to be run from the project's root directory.
+
+Example invocation pattern:
+`python path/to/script.py --year YYYY --month MM --execute`
+
+The `--setup-logging` flag can be added to get structured log output to the console during script execution.
+
+### 7.3. `manage_claim_line_item_partitions.py`
+
+*   **Purpose:** Manages monthly partitions for the `claim_line_items` table.
+*   **Usage Example (Dry Run):**
+    ```bash
+    python claims_processor/scripts/database/manage_claim_line_item_partitions.py --year 2024 --month 12
+    ```
+*   **Usage Example (Execute DDL):**
+    ```bash
+    python claims_processor/scripts/database/manage_claim_line_item_partitions.py --year 2024 --month 12 --execute --setup-logging
+    ```
+*   **Automation:** This script should be automated according to the schedule outlined in Section 2.1 (e.g., run monthly to create partitions two months ahead).
+
+### 7.4. `manage_claims_production_partitions.py`
+
+*   **Purpose:** Manages yearly partitions for the `claims_production` table.
+*   **Usage Example (Dry Run):**
+    ```bash
+    python claims_processor/scripts/database/manage_claims_production_partitions.py --year 2026
+    ```
+*   **Usage Example (Execute DDL):**
+    ```bash
+    python claims_processor/scripts/database/manage_claims_production_partitions.py --year 2026 --execute --setup-logging
+    ```
+*   **Automation:** This script should be automated according to the schedule outlined in Section 2.2 (e.g., run yearly in Sep/Oct to create the partition for the next calendar year).
+
+### 7.5. Script Dependencies and Setup
+
+*   **Python Environment:** Requires a Python environment with access to the project's source code and installed dependencies from `requirements.txt`.
+*   **Database Connectivity:** The scripts use the `DATABASE_URL` from the application's settings (`.env` file or environment variables) to connect to the PostgreSQL database. Ensure the environment where the script runs has the correct database credentials and network access.
+*   **Permissions:** The database user configured for the application must have permissions to create tables (i.e., create partitions).
 ```
