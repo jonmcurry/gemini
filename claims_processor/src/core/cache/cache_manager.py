@@ -2,7 +2,8 @@ import aiomcache
 import structlog
 from typing import Optional, Any
 from ..config.settings import get_settings
-from ..monitoring.metrics import CACHE_OPERATIONS_TOTAL # Import the metric
+# Ensure CACHE_OPERATIONS_TOTAL is from the central app_metrics.py
+from ..monitoring.app_metrics import CACHE_OPERATIONS_TOTAL
 
 logger = structlog.get_logger(__name__)
 
@@ -31,24 +32,24 @@ class CacheManager:
             raw_value = await self.client.get(key.encode('utf-8'))
             if raw_value:
                 logger.debug("Cache hit", key=key)
-                # Metric for hit is handled by the caller (RVUService) based on return value
                 return raw_value.decode('utf-8')
-            # Metric for miss is handled by the caller (RVUService)
             logger.debug("Cache miss", key=key)
             return None
         except Exception as e:
             logger.error("Cache get error", key=key, error=str(e), exc_info=True)
-            CACHE_OPERATIONS_TOTAL.labels(cache_type='memcached', operation_type='get_error').inc() # Metric for get error
+            # Use all three labels: cache_type, operation_type, outcome
+            CACHE_OPERATIONS_TOTAL.labels(cache_type='memcached', operation_type='get', outcome='error').inc()
             return None
 
     async def set(self, key: str, value: Any, ttl: int = 3600):
         try:
             await self.client.set(key.encode('utf-8'), str(value).encode('utf-8'), exptime=ttl)
             logger.debug("Cache set", key=key, ttl=ttl)
-            # Optional: CACHE_OPERATIONS_TOTAL.labels(cache_type='memcached', operation_type='set_success').inc()
+            # Optional: To record successful sets:
+            # CACHE_OPERATIONS_TOTAL.labels(cache_type='memcached', operation_type='set', outcome='success').inc()
         except Exception as e:
             logger.error("Cache set error", key=key, error=str(e), exc_info=True)
-            CACHE_OPERATIONS_TOTAL.labels(cache_type='memcached', operation_type='set_error').inc() # Metric for set error
+            CACHE_OPERATIONS_TOTAL.labels(cache_type='memcached', operation_type='set', outcome='error').inc()
 
     async def close(self):
         if self.client:
