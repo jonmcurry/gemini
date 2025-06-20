@@ -56,6 +56,7 @@ class ProcessableClaim(BaseModel):
     claim_id: str # Business claim ID
     facility_id: str
     patient_account_number: str
+    medical_record_number: Optional[str] = None # Added MRN
 
     patient_first_name: Optional[str] = None
     patient_last_name: Optional[str] = None

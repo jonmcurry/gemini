@@ -21,10 +21,13 @@ from ..ml_pipeline.feature_extractor import FeatureExtractor
 from ..ml_pipeline.optimized_predictor import OptimizedPredictor
 from ....core.monitoring.app_metrics import MetricsCollector
 from ....core.security.audit_logger_service import AuditLoggerService
+from ....core.security.encryption_service import EncryptionService # Added
+from ....api.models.claim_models import ProcessableClaimLineItem # Ensure this is available for manual mapping
 
 # Added for retry logic
 import asyncio
 from sqlalchemy.exc import OperationalError
+from datetime import date # For date.fromisoformat
 
 logger = structlog.get_logger(__name__)
 
@@ -40,18 +43,19 @@ class ParallelClaimsProcessor:
                  feature_extractor: FeatureExtractor,
                  optimized_predictor: OptimizedPredictor,
                  metrics_collector: MetricsCollector,
-                 audit_logger_service: AuditLoggerService): # Added
+                 audit_logger_service: AuditLoggerService,
+                 encryption_service: EncryptionService): # Added
         self.db_session_factory = db_session_factory
         self.validator = claim_validator
         self.rvu_service = rvu_service
         self.feature_extractor = feature_extractor
         self.predictor = optimized_predictor
         self.metrics_collector = metrics_collector
-        self.audit_logger_service = audit_logger_service # Added
-        logger.info("ParallelClaimsProcessor initialized with all services including MetricsCollector and AuditLoggerService.")
+        self.audit_logger_service = audit_logger_service
+        self.encryption_service = encryption_service # Added
+        logger.info("ParallelClaimsProcessor initialized with all services including EncryptionService.")
 
     async def _fetch_claims_parallel(self, session: AsyncSession, batch_id: Optional[str] = None, limit: int = 1000) -> List[ProcessableClaim]:
-        # This method's logging is fine, audit logging is for the main process_claims_parallel method.
         logger.info("Fetching pending claims for processing", batch_id=batch_id, limit=limit)
         try:
             # It's important that time_db_query is used as a context manager
@@ -95,15 +99,54 @@ class ParallelClaimsProcessor:
             processable_claims: List[ProcessableClaim] = []
             for claim_db in claim_db_models:
                 try:
-                    p_claim = ProcessableClaim.model_validate(claim_db)
+                    # Decrypt fields before Pydantic validation/conversion
+                    decrypted_dob_obj: Optional[date] = None
+                    if claim_db.patient_date_of_birth: # This is now a string column
+                        decrypted_dob_str = self.encryption_service.decrypt(claim_db.patient_date_of_birth)
+                        if decrypted_dob_str:
+                            try:
+                                decrypted_dob_obj = date.fromisoformat(decrypted_dob_str)
+                            except ValueError:
+                                logger.warn("Failed to parse decrypted date string for patient_date_of_birth",
+                                            claim_id=claim_db.claim_id, db_id=claim_db.id, decrypted_str=decrypted_dob_str)
+                        elif decrypted_dob_str is None: # Decryption failed explicitly
+                             logger.warn("Failed to decrypt patient_date_of_birth", claim_id=claim_db.claim_id, db_id=claim_db.id)
+
+                    decrypted_mrn: Optional[str] = None
+                    if claim_db.medical_record_number: # This is a string column
+                        decrypted_mrn = self.encryption_service.decrypt(claim_db.medical_record_number)
+                        if decrypted_mrn is None:
+                             logger.warn("Failed to decrypt medical_record_number", claim_id=claim_db.claim_id, db_id=claim_db.id)
+
+                    # Prepare data for ProcessableClaim, converting SQLAlchemy model to dict first
+                    claim_data_for_pydantic = {c.name: getattr(claim_db, c.name) for c in claim_db.__table__.columns}
+
+                    # Update with decrypted (and parsed) values
+                    claim_data_for_pydantic['patient_date_of_birth'] = decrypted_dob_obj
+                    claim_data_for_pydantic['medical_record_number'] = decrypted_mrn
+
+                    # Handle line items: convert each line item to ProcessableClaimLineItem
+                    # ProcessableClaim expects List[ProcessableClaimLineItem]
+                    line_items_pydantic = []
+                    if claim_db.line_items:
+                        for li_db in claim_db.line_items:
+                            # Assuming ProcessableClaimLineItem.model_validate can handle the ORM object directly
+                            # or convert li_db to dict similarly if needed.
+                            line_items_pydantic.append(ProcessableClaimLineItem.model_validate(li_db))
+                    claim_data_for_pydantic['line_items'] = line_items_pydantic
+
+                    # Create ProcessableClaim instance
+                    p_claim = ProcessableClaim(**claim_data_for_pydantic)
                     processable_claims.append(p_claim)
+
                 except Exception as e:
-                    logger.error(f"Error converting ClaimModel to ProcessableClaim for claim_id {claim_db.claim_id}",
+                    logger.error(f"Error converting/decrypting ClaimModel to ProcessableClaim for claim_id {claim_db.claim_id}",
                                  db_id=claim_db.id, error=str(e), exc_info=True)
-            logger.info(f"Fetched and prepared {len(processable_claims)} claims for processing.", batch_id=batch_id)
+
+            logger.info(f"Fetched, decrypted, and prepared {len(processable_claims)} claims for processing.", batch_id=batch_id)
             return processable_claims
         except Exception as e:
-            logger.error("Database error during claim fetching and preparation", error=str(e), exc_info=True, batch_id=batch_id)
+            logger.error("Database error during claim fetching, decryption, and preparation", error=str(e), exc_info=True, batch_id=batch_id)
             raise
 
     async def _validate_claims_parallel(self, claims_data: List[ProcessableClaim]) -> Tuple[List[ProcessableClaim], List[ProcessableClaim]]:

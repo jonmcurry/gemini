@@ -18,6 +18,7 @@ from claims_processor.src.core.database.models.claims_production_db import Claim
 from claims_processor.src.core.database.models.failed_claims_db import FailedClaimModel
 from claims_processor.src.core.monitoring.app_metrics import MetricsCollector
 from claims_processor.src.core.security.audit_logger_service import AuditLoggerService
+from claims_processor.src.core.security.encryption_service import EncryptionService # Added
 from sqlalchemy.sql import insert, update # For checking statements in mocks
 from sqlalchemy.exc import OperationalError # Added for retry tests
 import asyncio # Added for patching asyncio.sleep
@@ -93,6 +94,24 @@ def processor(
     mock_metrics_collector: MagicMock,
     mock_audit_logger_service: MagicMock # Added
 ) -> ParallelClaimsProcessor:
+@pytest.fixture
+def mock_encryption_service() -> MagicMock: # Added
+    service = MagicMock(spec=EncryptionService)
+    # Default behavior: pass through, or specific mock values if needed per test
+    service.decrypt.side_effect = lambda value: f"decrypted_{value}" if value else None
+    return service
+
+@pytest.fixture
+def processor(
+    mock_db_session_factory_and_session,
+    mock_claim_validator: MagicMock,
+    mock_rvu_service: MagicMock,
+    mock_feature_extractor: MagicMock,
+    mock_optimized_predictor: MagicMock,
+    mock_metrics_collector: MagicMock,
+    mock_audit_logger_service: MagicMock,
+    mock_encryption_service: MagicMock # Added
+) -> ParallelClaimsProcessor:
     mock_session_factory, _ = mock_db_session_factory_and_session
     service = ParallelClaimsProcessor(
         db_session_factory=mock_session_factory,
@@ -101,7 +120,8 @@ def processor(
         feature_extractor=mock_feature_extractor,
         optimized_predictor=mock_optimized_predictor,
         metrics_collector=mock_metrics_collector,
-        audit_logger_service=mock_audit_logger_service # Added
+        audit_logger_service=mock_audit_logger_service,
+        encryption_service=mock_encryption_service # Added
     )
     return service
 
@@ -651,6 +671,105 @@ async def test_process_claims_parallel_failure_non_retryable_error(
     # The current code updates summary['error'] and then goes to finally.
     # So other counts in summary (like validation_passed_count) would be 0.
     assert processed_args['claims_by_final_status'] == {} # Or based on summary state
+
+
+@pytest.mark.asyncio
+async def test_fetch_claims_parallel_with_decryption(
+    processor: ParallelClaimsProcessor,
+    mock_db_session_factory_and_session,
+    mock_metrics_collector: MagicMock, # Already part of processor fixture
+    mock_encryption_service: MagicMock # Injected into processor
+):
+    mock_session_factory, mock_session = mock_db_session_factory_and_session
+
+    # Setup mock ClaimModel instances that would be returned by the DB query
+    mock_claim_db_1 = MagicMock(spec=ClaimModel)
+    mock_claim_db_1.id = 101
+    mock_claim_db_1.claim_id = "claim_enc_1"
+    mock_claim_db_1.patient_date_of_birth = "enc_dob_1990-05-15" # Encrypted string
+    mock_claim_db_1.medical_record_number = "enc_mrn_12345"   # Encrypted string
+    # Populate other necessary fields for ProcessableClaim.model_validate or dict conversion
+    mock_claim_db_1.facility_id = "F001"
+    mock_claim_db_1.patient_account_number = "PACC001"
+    mock_claim_db_1.service_from_date = date(2023,1,1)
+    mock_claim_db_1.service_to_date = date(2023,1,2)
+    mock_claim_db_1.total_charges = Decimal("1000.00")
+    mock_claim_db_1.processing_status = "processing" # Set by _fetch before full load
+    mock_claim_db_1.batch_id = "test_batch_enc"
+    mock_claim_db_1.created_at = datetime.now(timezone.utc)
+    mock_claim_db_1.updated_at = datetime.now(timezone.utc)
+    mock_claim_db_1.patient_first_name = "Test"
+    mock_claim_db_1.patient_last_name = "User"
+    mock_claim_db_1.insurance_type = "Medicare" # Assuming these fields exist on ClaimModel
+    mock_claim_db_1.financial_class = "Inpatient"
+    mock_claim_db_1.processed_at = None
+    mock_claim_db_1.transferred_to_prod_at = None
+    mock_claim_db_1.ml_score = None
+    mock_claim_db_1.ml_derived_decision = None
+    mock_claim_db_1.processing_duration_ms = None
+    mock_claim_db_1.line_items = [] # Empty for simplicity in this test
+
+    # Re-create __table__.columns for the mock if needed by dict comprehension logic
+    # This is a bit of a deep mock, might be simpler if model_validate handles objects.
+    # The current _fetch_claims_parallel uses dict comprehension.
+    mock_columns = {c.name: c for c in ClaimModel.__table__.columns}
+    mock_claim_db_1.__table__ = MagicMock()
+    mock_claim_db_1.__table__.columns = mock_columns
+
+
+    # Mock the return value of session.execute for fetching full claim data
+    mock_full_data_result = AsyncMock()
+    mock_full_data_result.scalars.return_value.unique.return_value.all.return_value = [mock_claim_db_1]
+
+    # First call to execute (fetch IDs), second (update status), third (fetch full data)
+    mock_session.execute.side_effect = [
+        AsyncMock(fetchall=AsyncMock(return_value=[(101,)])), # Claim ID for update
+        AsyncMock(rowcount=1), # Result of update
+        mock_full_data_result # Result of select full claims
+    ]
+
+    # Configure mock_encryption_service.decrypt side effects
+    def decrypt_side_effect(encrypted_value: str):
+        if encrypted_value == "enc_dob_1990-05-15":
+            return "1990-05-15" # Decrypted ISO date string
+        if encrypted_value == "enc_mrn_12345":
+            return "mrn_clear_12345"
+        return None
+    mock_encryption_service.decrypt.side_effect = decrypt_side_effect
+
+    fetched_processable_claims = await processor._fetch_claims_parallel(mock_session, batch_id="test_batch_enc", limit=1)
+
+    assert len(fetched_processable_claims) == 1
+    p_claim = fetched_processable_claims[0]
+
+    # Verify decrypt was called for DOB and MRN
+    mock_encryption_service.decrypt.assert_any_call("enc_dob_1990-05-15")
+    mock_encryption_service.decrypt.assert_any_call("enc_mrn_12345")
+
+    # Verify the ProcessableClaim has the decrypted and parsed values
+    assert p_claim.patient_date_of_birth == date(1990, 5, 15)
+    assert p_claim.medical_record_number == "mrn_clear_12345"
+    assert p_claim.claim_id == "claim_enc_1" # Other fields should still be there
+
+    # Test case: Decryption fails for DOB (returns None)
+    mock_encryption_service.decrypt.side_effect = lambda val: None if val == "enc_dob_1990-05-15" else f"decrypted_{val}"
+    mock_session.execute.side_effect = [ # Reset side effect for execute
+        AsyncMock(fetchall=AsyncMock(return_value=[(101,)])),
+        AsyncMock(rowcount=1),
+        mock_full_data_result
+    ]
+    fetched_processable_claims_fail_dob = await processor._fetch_claims_parallel(mock_session, batch_id="test_batch_enc", limit=1)
+    assert fetched_processable_claims_fail_dob[0].patient_date_of_birth is None
+
+    # Test case: Decrypted DOB string is invalid format
+    mock_encryption_service.decrypt.side_effect = lambda val: "invalid-date-format" if val == "enc_dob_1990-05-15" else f"decrypted_{val}"
+    mock_session.execute.side_effect = [
+        AsyncMock(fetchall=AsyncMock(return_value=[(101,)])),
+        AsyncMock(rowcount=1),
+        mock_full_data_result
+    ]
+    fetched_processable_claims_bad_date = await processor._fetch_claims_parallel(mock_session, batch_id="test_batch_enc", limit=1)
+    assert fetched_processable_claims_bad_date[0].patient_date_of_birth is None
 
 
 @patch('asyncio.sleep', new_callable=AsyncMock) # Keep sleep mocked if not used, for consistency
