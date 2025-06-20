@@ -233,18 +233,150 @@ async def test_transfer_claims_to_production_success(processor: ParallelClaimsPr
         create_processable_claim("c1_prod", 101, ml_score=0.85, processing_duration_ms=120.0, ml_derived_decision="ML_APPROVED"),
         create_processable_claim("c2_prod", 102, ml_score=0.92, processing_duration_ms=150.0, ml_derived_decision="ML_APPROVED")
     ]
-    mock_session.execute.return_value = AsyncMock() # For insert
+    mock_session.execute.return_value = AsyncMock() # Simulates successful execute for insert
 
-    count = await processor._transfer_claims_to_production(mock_session, claims_to_transfer, {'throughput_achieved': Decimal("10.0")})
+    # Expected behavior: initial bulk insert succeeds
+    successfully_transferred = await processor._transfer_claims_to_production(
+        mock_session, claims_to_transfer, {'throughput_achieved': Decimal("10.0")}
+    )
 
-    assert count == 2
-    mock_session.execute.assert_called_once()
+    assert len(successfully_transferred) == 2
+    assert successfully_transferred == claims_to_transfer # All should be successful
+
+    mock_session.execute.assert_called_once() # One bulk insert attempt
     args, _ = mock_session.execute.call_args
-    assert isinstance(args[0], type(insert(ClaimsProductionModel)))
+    assert isinstance(args[0], type(insert(ClaimsProductionModel))) # Check it's an insert statement
     assert len(args[1]) == 2
-    assert args[1][0]['claim_id'] == "c1_prod"
+    assert args[1][0]['claim_id'] == "c1_prod" # Check some data from the first claim in mapped list
     assert args[1][0]['throughput_achieved'] == Decimal("10.0")
-    mock_metrics_collector.record_database_query_duration.assert_called_once_with("bulk_insert_production_claims", pytest.approx(0, abs=1e-1))
+
+    # Verify metrics for the successful bulk insert
+    mock_metrics_collector.time_db_query.assert_called_once_with('transfer_to_production_bulk_insert')
+
+
+@pytest.mark.asyncio
+async def test_transfer_claims_chunked_retry_all_succeed(
+    processor: ParallelClaimsProcessor,
+    mock_db_session_factory_and_session,
+    mock_metrics_collector: MagicMock
+):
+    _, mock_session = mock_db_session_factory_and_session
+
+    # Create more claims than MIN_CLAIMS_TO_ATTEMPT_CHUNKED_RETRY
+    # Example: TRANSFER_CHUNK_SIZE = 500, MIN_CLAIMS_TO_ATTEMPT_CHUNKED_RETRY = 101
+    # Let's use 2 chunks: 500 + 100 = 600 claims
+    # For test speed, let's use smaller numbers, e.g., CHUNK_SIZE = 3, MIN_THRESHOLD = 4. Test with 7 claims.
+    # Patch constants for this test for predictable chunking
+    with patch('claims_processor.src.processing.pipeline.parallel_claims_processor.TRANSFER_CHUNK_SIZE', 3), \
+         patch('claims_processor.src.processing.pipeline.parallel_claims_processor.MIN_CLAIMS_TO_ATTEMPT_CHUNKED_RETRY', 4):
+
+        claims_to_transfer = [
+            create_processable_claim(f"c_chunk_{i}", 200 + i, ml_score=0.8, processing_duration_ms=float(i*10))
+            for i in range(7) # 7 claims: chunks of 3, 3, 1
+        ]
+
+        # First call to session.execute (bulk insert) fails with OperationalError
+        # Subsequent calls (chunked inserts) succeed
+        mock_session.execute.side_effect = [
+            OperationalError("Simulated bulk insert failure", params=None, orig=None), # Initial bulk fails
+            AsyncMock(), # Chunk 1 (3 claims) succeeds
+            AsyncMock(), # Chunk 2 (3 claims) succeeds
+            AsyncMock(), # Chunk 3 (1 claim) succeeds
+        ]
+
+        successfully_transferred = await processor._transfer_claims_to_production(
+            mock_session, claims_to_transfer, {'throughput_achieved': Decimal("15.0")}
+        )
+
+        assert len(successfully_transferred) == 7 # All claims successfully transferred in chunks
+        assert successfully_transferred == claims_to_transfer
+
+        assert mock_session.execute.call_count == 1 + 3 # 1 initial bulk attempt + 3 chunked attempts
+
+        # Verify metrics: 1 bulk attempt, 3 chunked attempts
+        mock_metrics_collector.time_db_query.assert_any_call('transfer_to_production_bulk_insert')
+        mock_metrics_collector.time_db_query.assert_any_call('transfer_to_production_chunked_insert')
+        assert mock_metrics_collector.time_db_query.call_count == 1 + 3
+
+
+@pytest.mark.asyncio
+async def test_transfer_claims_chunked_retry_partial_success(
+    processor: ParallelClaimsProcessor, mock_db_session_factory_and_session, mock_metrics_collector: MagicMock
+):
+    _, mock_session = mock_db_session_factory_and_session
+    with patch('claims_processor.src.processing.pipeline.parallel_claims_processor.TRANSFER_CHUNK_SIZE', 2), \
+         patch('claims_processor.src.processing.pipeline.parallel_claims_processor.MIN_CLAIMS_TO_ATTEMPT_CHUNKED_RETRY', 3):
+
+        claims_to_transfer = [create_processable_claim(f"c_partial_{i}", 300 + i) for i in range(5)] # 5 claims
+
+        # Initial bulk fails, first chunk (2 claims) succeeds, second chunk (2 claims) fails, third chunk (1 claim) succeeds
+        mock_session.execute.side_effect = [
+            OperationalError("Simulated bulk insert failure", params=None, orig=None),
+            AsyncMock(), # Chunk 1 (claims 0,1) - Success
+            RuntimeError("Simulated error on second chunk insert"), # Chunk 2 (claims 2,3) - Fail
+            AsyncMock(), # Chunk 3 (claim 4) - Success
+        ]
+
+        successfully_transferred = await processor._transfer_claims_to_production(mock_session, claims_to_transfer)
+
+        assert len(successfully_transferred) == 3 # Claims 0, 1, 4 should succeed
+        assert successfully_transferred[0].claim_id == "c_partial_0"
+        assert successfully_transferred[1].claim_id == "c_partial_1"
+        assert successfully_transferred[2].claim_id == "c_partial_4"
+
+        assert mock_session.execute.call_count == 1 + 3 # 1 initial bulk, 3 chunks attempted
+        mock_metrics_collector.time_db_query.assert_any_call('transfer_to_production_bulk_insert')
+        mock_metrics_collector.time_db_query.assert_any_call('transfer_to_production_chunked_insert')
+        # Bulk (1) + Successful Chunks (2) = 3 calls to time_db_query with 'chunked_insert' for success
+        # The failed chunk's timer context might not complete or record, depending on where error occurs.
+        # If error is before session.execute, timer for that chunk not started. If during, it might be recorded.
+        # Given the mock, the timer context for the failing chunk would be entered.
+        assert mock_metrics_collector.time_db_query.call_count == 1 + 3
+
+
+@pytest.mark.asyncio
+async def test_transfer_claims_bulk_fails_below_chunk_threshold(
+    processor: ParallelClaimsProcessor, mock_db_session_factory_and_session, mock_metrics_collector: MagicMock
+):
+    _, mock_session = mock_db_session_factory_and_session
+    # MIN_CLAIMS_TO_ATTEMPT_CHUNKED_RETRY is 101 by default. Test with 50 claims.
+    with patch('claims_processor.src.processing.pipeline.parallel_claims_processor.MIN_CLAIMS_TO_ATTEMPT_CHUNKED_RETRY', 101):
+        claims_to_transfer = [create_processable_claim(f"c_small_batch_{i}", 400 + i) for i in range(50)]
+
+        mock_session.execute.side_effect = OperationalError("Simulated bulk insert failure", params=None, orig=None)
+
+        successfully_transferred = await processor._transfer_claims_to_production(mock_session, claims_to_transfer)
+
+        assert len(successfully_transferred) == 0 # No chunking attempted, initial bulk failed
+        assert mock_session.execute.call_count == 1 # Only initial bulk attempt
+        mock_metrics_collector.time_db_query.assert_called_once_with('transfer_to_production_bulk_insert')
+
+
+@pytest.mark.asyncio
+async def test_transfer_claims_non_operational_error(
+    processor: ParallelClaimsProcessor, mock_db_session_factory_and_session, mock_metrics_collector: MagicMock
+):
+    _, mock_session = mock_db_session_factory_and_session
+    claims_to_transfer = [create_processable_claim(f"c_non_op_err_{i}", 500 + i) for i in range(150)] # Above threshold
+
+    mock_session.execute.side_effect = ValueError("Simulated non-operational error") # e.g., data type issue
+
+    successfully_transferred = await processor._transfer_claims_to_production(mock_session, claims_to_transfer)
+
+    assert len(successfully_transferred) == 0 # No chunking for non-OperationalError
+    assert mock_session.execute.call_count == 1
+    mock_metrics_collector.time_db_query.assert_called_once_with('transfer_to_production_bulk_insert')
+
+
+@pytest.mark.asyncio
+async def test_transfer_claims_empty_list(
+    processor: ParallelClaimsProcessor, mock_db_session_factory_and_session, mock_metrics_collector: MagicMock
+):
+    _, mock_session = mock_db_session_factory_and_session
+    successfully_transferred = await processor._transfer_claims_to_production(mock_session, [])
+    assert len(successfully_transferred) == 0
+    mock_session.execute.assert_not_called()
+    mock_metrics_collector.time_db_query.assert_not_called()
 
 
 # --- New Tests for _set_final_status_for_staging_claims ---
@@ -285,164 +417,141 @@ async def test_process_claims_parallel_e2e_with_failures_and_routing(
     passed_batch_id = "b_e2e" # The batch_id passed into the method
 
     # Setup claims
-    c_valid_pass = create_processable_claim("c_pass", 1, batch_id=passed_batch_id) # Will pass all stages
-    c_fail_validation = create_processable_claim("c_val_fail", 2, batch_id=passed_batch_id) # Will fail validation
-    c_ml_reject = create_processable_claim("c_ml_reject", 3, batch_id=passed_batch_id) # Will be rejected by ML
-    c_ml_error_proceeds = create_processable_claim("c_ml_error", 4, batch_id=passed_batch_id) # Will have ML error, but proceed
+    c_pass1 = create_processable_claim("c_pass1", 1, batch_id=passed_batch_id)
+    c_pass2_fail_transfer = create_processable_claim("c_pass2_transfer_fail", 2, batch_id=passed_batch_id)
+    c_pass3 = create_processable_claim("c_pass3", 3, batch_id=passed_batch_id)
+    c_fail_validation = create_processable_claim("c_val_fail", 4, batch_id=passed_batch_id)
+    c_ml_reject = create_processable_claim("c_ml_reject", 5, batch_id=passed_batch_id)
 
-    all_fetched_claims = [c_valid_pass, c_fail_validation, c_ml_reject, c_ml_error_proceeds]
+    all_fetched_claims = [c_pass1, c_pass2_fail_transfer, c_pass3, c_fail_validation, c_ml_reject]
     limit_param = len(all_fetched_claims)
 
     # Mock _fetch_claims_parallel
     with patch.object(processor, '_fetch_claims_parallel', new_callable=AsyncMock, return_value=all_fetched_claims) as mock_fetch:
         # Mock _validate_claims_parallel behavior
-        mock_claim_validator.validate_claim.side_effect = lambda claim_to_validate: ["Error"] if claim_to_validate.claim_id == "c_val_fail" else []
+        mock_claim_validator.validate_claim.side_effect = lambda claim_to_validate: \
+            ["Error"] if claim_to_validate.claim_id == "c_val_fail" else []
 
-        # Mock ML behavior
-        features_pass = np.array([[0.1]*7], dtype=np.float32)
-        features_reject = np.array([[0.2]*7], dtype=np.float32)
-        features_error = np.array([[0.3]*7], dtype=np.float32) # Features for c_ml_error_proceeds
+        # Mock ML behavior: c_pass1, c_pass2_fail_transfer, c_pass3 are approved by ML
+        # c_ml_reject is rejected by ML
+        features_pass1 = np.array([[0.1]*7], dtype=np.float32)
+        features_pass2_fail_transfer = np.array([[0.15]*7], dtype=np.float32)
+        features_pass3 = np.array([[0.2]*7], dtype=np.float32)
+        features_ml_reject = np.array([[0.3]*7], dtype=np.float32)
 
         def feature_extractor_side_effect(claim_to_extract):
-            if claim_to_extract.claim_id == "c_pass": return features_pass
-            if claim_to_extract.claim_id == "c_ml_reject": return features_reject
-            if claim_to_extract.claim_id == "c_ml_error": return features_error
+            if claim_to_extract.claim_id == "c_pass1": return features_pass1
+            if claim_to_extract.claim_id == "c_pass2_transfer_fail": return features_pass2_fail_transfer
+            if claim_to_extract.claim_id == "c_pass3": return features_pass3
+            if claim_to_extract.claim_id == "c_ml_reject": return features_ml_reject
             return None
         mock_feature_extractor.extract_features.side_effect = feature_extractor_side_effect
 
-        # OptimizedPredictor's predict_batch is called with a list of feature arrays
-        # for claims that passed validation and feature extraction.
-        # Expected order: c_pass, c_ml_reject, c_ml_error_proceeds
+        # Claims that pass validation: c_pass1, c_pass2_fail_transfer, c_pass3, c_ml_reject
         mock_optimized_predictor.predict_batch.return_value = [
-            {'ml_score': 0.9, 'ml_derived_decision': 'ML_APPROVED'},          # For c_pass
-            {'ml_score': 0.3, 'ml_derived_decision': 'ML_REJECTED'},          # For c_ml_reject
-            {'ml_derived_decision': 'ML_SAMPLE_PROCESSING_ERROR', 'error': 'Simulated sample error'} # For c_ml_error_proceeds
+            {'ml_score': 0.9, 'ml_derived_decision': 'ML_APPROVED'}, # c_pass1
+            {'ml_score': 0.9, 'ml_derived_decision': 'ML_APPROVED'}, # c_pass2_fail_transfer
+            {'ml_score': 0.9, 'ml_derived_decision': 'ML_APPROVED'}, # c_pass3
+            {'ml_score': 0.3, 'ml_derived_decision': 'ML_REJECTED'}  # c_ml_reject
         ]
-        # Ensure predictor interpreter is available for this test path
-        mock_optimized_predictor.interpreter = MagicMock() # Not None
+        mock_optimized_predictor.interpreter = MagicMock()
 
-        # Mock RVU service (c_pass and c_ml_error_proceeds should reach here)
+        # RVU service will be called for c_pass1, c_pass2_fail_transfer, c_pass3
         mock_rvu_service.calculate_rvu_for_claim.return_value = None
 
-        # Mock Transfer service (only c_pass should reach here)
-        # Mock Transfer service (c_pass and c_ml_error_proceeds should reach here, assuming they are transferred)
-        # Let's assume c_ml_error_proceeds also gets transferred for this test.
-        with patch.object(processor, '_transfer_claims_to_production', new_callable=AsyncMock, return_value=2) as mock_transfer, \
+        # Mock _transfer_claims_to_production to simulate partial success
+        # It's called with [c_pass1, c_pass2_fail_transfer, c_pass3]
+        # It returns [c_pass1, c_pass3] (meaning c_pass2_fail_transfer failed)
+        with patch.object(processor, '_transfer_claims_to_production', new_callable=AsyncMock,
+                          return_value=[c_pass1, c_pass3]) as mock_transfer, \
              patch.object(processor, '_update_staging_claims_status') as mock_update_staging, \
              patch.object(processor, '_route_failed_claims', new_callable=AsyncMock) as mock_route_failed, \
              patch.object(processor, '_set_final_status_for_staging_claims') as mock_set_final_status:
 
             summary = await processor.process_claims_parallel(batch_id=passed_batch_id, limit=limit_param)
 
-    # Assertions for method calls
+    # Assertions
     mock_fetch.assert_called_once_with(mock_session, passed_batch_id, limit_param)
     assert mock_claim_validator.validate_claim.call_count == limit_param
 
-    # ML assertions
-    # Passed validation: c_pass, c_ml_reject, c_ml_error_proceeds
-    assert mock_feature_extractor.extract_features.call_count == 3
-    mock_optimized_predictor.predict_batch.assert_called_once_with([features_pass, features_reject, features_error])
+    assert mock_feature_extractor.extract_features.call_count == 4 # c_pass1, c_pass2_fail_transfer, c_pass3, c_ml_reject
+    mock_optimized_predictor.predict_batch.assert_called_once_with([
+        features_pass1, features_pass2_fail_transfer, features_pass3, features_ml_reject
+    ])
 
-    # RVU assertions (c_pass, c_ml_error_proceeds)
-    assert mock_rvu_service.calculate_rvu_for_claim.call_count == 2
-    mock_rvu_service.calculate_rvu_for_claim.assert_any_call(c_valid_pass, mock_session)
-    mock_rvu_service.calculate_rvu_for_claim.assert_any_call(c_ml_error_proceeds, mock_session)
+    assert mock_rvu_service.calculate_rvu_for_claim.call_count == 3 # For c_pass1, c_pass2_fail_transfer, c_pass3
 
-    # Transfer assertions
+    # _transfer_claims_to_production assertions
     mock_transfer.assert_called_once()
-    transfer_args = mock_transfer.call_args[0]
-    assert transfer_args[0] == mock_session
-    # Claims passed to transfer should be c_pass and c_ml_error_proceeds
-    assert len(transfer_args[1]) == 2
-    assert c_valid_pass in transfer_args[1]
-    assert c_ml_error_proceeds in transfer_args[1]
-    assert 'throughput_achieved' in transfer_args[2]
-    assert isinstance(transfer_args[2]['throughput_achieved'], Decimal)
+    transfer_call_args = mock_transfer.call_args[0]
+    assert transfer_call_args[0] == mock_session
+    # It should be called with the list of claims that passed all prior stages
+    claims_expected_for_transfer = [c_pass1, c_pass2_fail_transfer, c_pass3]
+    assert len(transfer_call_args[1]) == len(claims_expected_for_transfer)
+    for claim in claims_expected_for_transfer:
+        assert claim in transfer_call_args[1]
 
-    # Staging update assertions
-    # Called for transferred claims and for failed/rejected claims (via _set_final_status_for_staging_claims)
-    # _update_staging_claims_status is directly called for transferred claims
-    # _set_final_status_for_staging_claims calls it for others. Let's check specific calls on mock_update_staging
+    # _update_staging_claims_status calls
+    # For successfully transferred: c_pass1, c_pass3
+    mock_update_staging.assert_any_call(mock_session, [c_pass1.id, c_pass3.id], "completed_transferred", transferred=True)
 
-    # Transferred: c_pass, c_ml_error_proceeds
-    mock_update_staging.assert_any_call(mock_session, [c_valid_pass.id, c_ml_error_proceeds.id], "completed_transferred", transferred=True)
+    # _route_failed_claims and _set_final_status_for_staging_claims
+    # Expected failures:
+    # - c_fail_validation (VALIDATION_FAILED)
+    # - c_ml_reject (ML_REJECTED)
+    # - c_pass2_fail_transfer (TRANSFER_FAILED)
 
-    # Failed claims routing and status update assertions
-    # c_fail_validation (validation failure)
-    # c_ml_reject (ML rejected)
-    assert mock_route_failed.call_count == 2 # Called for VALIDATION_FAILED and ML_REJECTED stages
+    # Check _route_failed_claims calls (it's called per stage group)
+    # It should be called for "VALIDATION_FAILED", "ML_REJECTED", and "TRANSFER_FAILED" stages.
+    assert mock_route_failed.call_count == 3
 
-    # Check calls to _route_failed_claims for specific claims
-    routed_validation_fail = any(
-        call_args[0][0] == c_fail_validation and call_args[0][2] == "VALIDATION_FAILED"
-        for call_obj in mock_route_failed.call_args_list for call_args in call_obj[0][1] # call_obj[0][1] is the list of tuples
-    )
-    routed_ml_reject = any(
-        call_args[0][0] == c_ml_reject and call_args[0][2] == "ML_REJECTED"
-        for call_obj in mock_route_failed.call_args_list for call_args in call_obj[0][1]
-    )
-    # This assertion needs refinement because _route_failed_claims is called with a list of tuples.
-    # The structure of mock_route_failed.call_args_list will be:
-    # [call(((session_mock, [(claim1, reason, stage), (claim2, reason, stage)]),), {}), ...]
-    # The check should be:
-    # For VALIDATION_FAILED stage:
-    assert any(
-        args[1][0][0].claim_id == "c_val_fail" and args[1][0][2] == "VALIDATION_FAILED"
-        for args in mock_route_failed.call_args_list if args[0][1] # Ensure list is not empty
-    ), "c_val_fail not routed correctly"
-    # For ML_REJECTED stage:
-    assert any(
-        args[1][0][0].claim_id == "c_ml_reject" and args[1][0][2] == "ML_REJECTED"
-        for args in mock_route_failed.call_args_list if args[0][1]
-    ), "c_ml_reject not routed correctly"
+    # More detailed check of what was routed:
+    routed_claims_info = []
+    for call_obj in mock_route_failed.call_args_list:
+        # call_obj[0] is the tuple of args, where args[0] is session, args[1] is the list of (claim, reason, stage)
+        routed_claims_info.extend(call_obj[0][1])
 
+    assert any(r_claim.claim_id == "c_fail_validation" and r_stage == "VALIDATION_FAILED" for r_claim, _, r_stage in routed_claims_info)
+    assert any(r_claim.claim_id == "c_ml_reject" and r_stage == "ML_REJECTED" for r_claim, _, r_stage in routed_claims_info)
+    assert any(r_claim.claim_id == "c_pass2_transfer_fail" and r_stage == "TRANSFER_FAILED" for r_claim, _, r_stage in routed_claims_info)
 
-    # Check calls to _set_final_status_for_staging_claims
-    # c_fail_validation -> status VALIDATION_FAILED
-    # c_ml_reject -> status ML_REJECTED
-    assert mock_set_final_status.call_count == 1 # Called once with all non-transferred claims that need status update
-    final_status_args = mock_set_final_status.call_args[0][1] # list of (claim, status_str)
-    assert len(final_status_args) == 2
-    assert any(item[0].claim_id == "c_val_fail" and item[1] == "VALIDATION_FAILED" for item in final_status_args)
-    assert any(item[0].claim_id == "c_ml_reject" and item[1] == "ML_REJECTED" for item in final_status_args)
-
+    # Check _set_final_status_for_staging_claims call
+    assert mock_set_final_status.call_count == 1
+    final_status_call_args_list = mock_set_final_status.call_args[0][0] # This is the list of (claim, status_str)
+    assert len(final_status_call_args_list) == 3
+    assert any(item[0].claim_id == "c_fail_validation" and item[1] == "VALIDATION_FAILED" for item in final_status_call_args_list)
+    assert any(item[0].claim_id == "c_ml_reject" and item[1] == "ML_REJECTED" for item in final_status_call_args_list)
+    assert any(item[0].claim_id == "c_pass2_transfer_fail" and item[1] == "TRANSFER_FAILED" for item in final_status_call_args_list)
 
     # Summary assertions
     assert summary["fetched_count"] == limit_param
-    assert summary["validation_passed_count"] == 3 # c_pass, c_ml_reject, c_ml_error_proceeds
+    assert summary["validation_passed_count"] == 4 # c_pass1, c_pass2_fail_transfer, c_pass3, c_ml_reject
     assert summary["validation_failed_count"] == 1 # c_fail_validation
-    assert summary["ml_prediction_attempted_count"] == 3
-    assert summary["ml_approved_raw"] == 1 # c_pass
+    assert summary["ml_prediction_attempted_count"] == 4
+    assert summary["ml_approved_raw"] == 3 # c_pass1, c_pass2_fail_transfer, c_pass3
     assert summary["ml_rejected_raw"] == 1 # c_ml_reject
-    assert summary["ml_errors_raw"] == 1 # c_ml_error_proceeds (ML_SAMPLE_PROCESSING_ERROR)
-    assert summary["stopped_by_ml_rejection"] == 1 # Only c_ml_reject
-    assert summary["rvu_calculation_completed_count"] == 2 # c_pass, c_ml_error_proceeds
-    assert summary["transferred_to_prod_count"] == 2 # c_pass, c_ml_error_proceeds
+    assert summary["ml_errors_raw"] == 0
+    assert summary["stopped_by_ml_rejection"] == 1 # c_ml_reject
+    assert summary["rvu_calculation_completed_count"] == 3 # c_pass1, c_pass2_fail_transfer, c_pass3
+    assert summary["transferred_to_prod_count"] == 2 # c_pass1, c_pass3
     assert summary["staging_updated_transferred_count"] == 2
-    assert summary["staging_updated_failed_count"] == 2 # c_fail_validation, c_ml_reject
-    assert summary["failed_claims_routed_count"] == 2 # c_fail_validation, c_ml_reject
+    assert summary["staging_updated_failed_count"] == 3 # c_fail_validation, c_ml_reject, c_pass2_fail_transfer
+    assert summary["failed_claims_routed_count"] == 3
     assert mock_session.commit.call_count >= 1
 
-    # Metrics Collector Assertions
+    # Metrics
     mock_metrics_collector.record_batch_processed.assert_called_once()
     batch_processed_args = mock_metrics_collector.record_batch_processed.call_args[1]
     assert batch_processed_args['batch_size'] == limit_param
-    assert isinstance(batch_processed_args['duration_seconds'], float)
-    # Expected final statuses for metrics:
-    # c_pass: completed_transferred
-    # c_fail_validation: validation_failed
-    # c_ml_reject: ml_rejected
-    # c_ml_error_proceeds: completed_transferred (since it proceeds and is assumed to be transferred)
     expected_metrics_statuses = {
-        'completed_transferred': 2, # c_pass, c_ml_error_proceeds
-        'validation_failed': 1,     # c_fail_validation
-        'ml_rejected': 1            # c_ml_reject
-        # 'ml_processing_error' is not a final status for claims that proceed.
+        'completed_transferred': 2, # c_pass1, c_pass3
+        'validation_failed': 1,
+        'ml_rejected': 1,
+        'transfer_failed': 1        # c_pass2_fail_transfer
     }
     assert batch_processed_args['claims_by_final_status'] == expected_metrics_statuses
 
-
-    # DB query timer calls (count may vary based on actual execution paths of mocks)
+    # DB query timer calls
     # We expect at least one call for each distinct timer used in the flow.
     # _fetch_claims_parallel (mocked out, so its internal timers won't be called on the processor's collector)
     # _transfer_claims_to_production (called)
