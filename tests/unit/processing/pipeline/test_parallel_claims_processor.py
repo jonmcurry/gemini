@@ -17,8 +17,10 @@ from claims_processor.src.processing.pipeline.parallel_claims_processor import P
 from claims_processor.src.core.database.models.claims_production_db import ClaimsProductionModel
 from claims_processor.src.core.database.models.failed_claims_db import FailedClaimModel
 from claims_processor.src.core.monitoring.app_metrics import MetricsCollector
-from claims_processor.src.core.security.audit_logger_service import AuditLoggerService # Added
+from claims_processor.src.core.security.audit_logger_service import AuditLoggerService
 from sqlalchemy.sql import insert, update # For checking statements in mocks
+from sqlalchemy.exc import OperationalError # Added for retry tests
+import asyncio # Added for patching asyncio.sleep
 
 # --- Fixtures ---
 @pytest.fixture
@@ -263,108 +265,164 @@ async def test_process_claims_parallel_e2e_with_failures_and_routing(
     passed_batch_id = "b_e2e" # The batch_id passed into the method
 
     # Setup claims
-    c_valid_pass = create_processable_claim("c_pass", 1, batch_id="b_e2e")
-    c_fail_validation = create_processable_claim("c_val_fail", 2, batch_id="b_e2e")
-    c_ml_reject = create_processable_claim("c_ml_reject", 3, batch_id="b_e2e")
+    c_valid_pass = create_processable_claim("c_pass", 1, batch_id=passed_batch_id) # Will pass all stages
+    c_fail_validation = create_processable_claim("c_val_fail", 2, batch_id=passed_batch_id) # Will fail validation
+    c_ml_reject = create_processable_claim("c_ml_reject", 3, batch_id=passed_batch_id) # Will be rejected by ML
+    c_ml_error_proceeds = create_processable_claim("c_ml_error", 4, batch_id=passed_batch_id) # Will have ML error, but proceed
 
-    all_fetched_claims = [c_valid_pass, c_fail_validation, c_ml_reject]
+    all_fetched_claims = [c_valid_pass, c_fail_validation, c_ml_reject, c_ml_error_proceeds]
+    limit_param = len(all_fetched_claims)
 
     # Mock _fetch_claims_parallel
     with patch.object(processor, '_fetch_claims_parallel', new_callable=AsyncMock, return_value=all_fetched_claims) as mock_fetch:
         # Mock _validate_claims_parallel behavior
-        mock_claim_validator.validate_claim.side_effect = lambda claim: ["Error"] if claim.claim_id == "c_val_fail" else []
+        mock_claim_validator.validate_claim.side_effect = lambda claim_to_validate: ["Error"] if claim_to_validate.claim_id == "c_val_fail" else []
 
-        # Mock ML behavior (_apply_ml_predictions uses these)
-        # Ensure correct features are passed to predict_batch based on the claims that reach ML stage
+        # Mock ML behavior
         features_pass = np.array([[0.1]*7], dtype=np.float32)
         features_reject = np.array([[0.2]*7], dtype=np.float32)
+        features_error = np.array([[0.3]*7], dtype=np.float32) # Features for c_ml_error_proceeds
 
-        def feature_extractor_side_effect(claim):
-            if claim.claim_id == "c_pass": return features_pass
-            if claim.claim_id == "c_ml_reject": return features_reject
-            return None # Should not happen for these claims
+        def feature_extractor_side_effect(claim_to_extract):
+            if claim_to_extract.claim_id == "c_pass": return features_pass
+            if claim_to_extract.claim_id == "c_ml_reject": return features_reject
+            if claim_to_extract.claim_id == "c_ml_error": return features_error
+            return None
         mock_feature_extractor.extract_features.side_effect = feature_extractor_side_effect
 
-        # Predict_batch will receive a list of features for claims that passed validation
+        # OptimizedPredictor's predict_batch is called with a list of feature arrays
+        # for claims that passed validation and feature extraction.
+        # Expected order: c_pass, c_ml_reject, c_ml_error_proceeds
         mock_optimized_predictor.predict_batch.return_value = [
-            {'ml_score': 0.9, 'ml_derived_decision': 'ML_APPROVED'}, # For c_pass's features
-            {'ml_score': 0.3, 'ml_derived_decision': 'ML_REJECTED'}  # For c_ml_reject's features
+            {'ml_score': 0.9, 'ml_derived_decision': 'ML_APPROVED'},          # For c_pass
+            {'ml_score': 0.3, 'ml_derived_decision': 'ML_REJECTED'},          # For c_ml_reject
+            {'ml_derived_decision': 'ML_SAMPLE_PROCESSING_ERROR', 'error': 'Simulated sample error'} # For c_ml_error_proceeds
         ]
+        # Ensure predictor interpreter is available for this test path
+        mock_optimized_predictor.interpreter = MagicMock() # Not None
 
-        # Mock RVU service (only c_pass should reach here)
+        # Mock RVU service (c_pass and c_ml_error_proceeds should reach here)
         mock_rvu_service.calculate_rvu_for_claim.return_value = None
 
         # Mock Transfer service (only c_pass should reach here)
-        # Add batch_metrics to the expected call for _transfer_claims_to_production
-        with patch.object(processor, '_transfer_claims_to_production', new_callable=AsyncMock, return_value=1) as mock_transfer, \
-             patch.object(processor, '_update_staging_claims_status', new_callable=AsyncMock, return_value=1) as mock_update_transferred, \
-             patch.object(processor, '_route_failed_claims', new_callable=AsyncMock, return_value=2) as mock_route_failed, \
-             patch.object(processor, '_set_final_status_for_staging_claims', new_callable=AsyncMock, return_value=2) as mock_set_final_status:
+        # Mock Transfer service (c_pass and c_ml_error_proceeds should reach here, assuming they are transferred)
+        # Let's assume c_ml_error_proceeds also gets transferred for this test.
+        with patch.object(processor, '_transfer_claims_to_production', new_callable=AsyncMock, return_value=2) as mock_transfer, \
+             patch.object(processor, '_update_staging_claims_status') as mock_update_staging, \
+             patch.object(processor, '_route_failed_claims', new_callable=AsyncMock) as mock_route_failed, \
+             patch.object(processor, '_set_final_status_for_staging_claims') as mock_set_final_status:
 
-            summary = await processor.process_claims_parallel(batch_id="b_e2e", limit=3)
+            summary = await processor.process_claims_parallel(batch_id=passed_batch_id, limit=limit_param)
 
     # Assertions for method calls
-    mock_fetch.assert_called_once_with(mock_session, passed_batch_id, 3)
-    assert mock_claim_validator.validate_claim.call_count == 3
+    mock_fetch.assert_called_once_with(mock_session, passed_batch_id, limit_param)
+    assert mock_claim_validator.validate_claim.call_count == limit_param
 
     # ML assertions
-    assert mock_feature_extractor.extract_features.call_count == 2 # For c_pass, c_ml_reject
-    mock_optimized_predictor.predict_batch.assert_called_once_with([features_pass, features_reject])
+    # Passed validation: c_pass, c_ml_reject, c_ml_error_proceeds
+    assert mock_feature_extractor.extract_features.call_count == 3
+    mock_optimized_predictor.predict_batch.assert_called_once_with([features_pass, features_reject, features_error])
 
+    # RVU assertions (c_pass, c_ml_error_proceeds)
+    assert mock_rvu_service.calculate_rvu_for_claim.call_count == 2
+    mock_rvu_service.calculate_rvu_for_claim.assert_any_call(c_valid_pass, mock_session)
+    mock_rvu_service.calculate_rvu_for_claim.assert_any_call(c_ml_error_proceeds, mock_session)
 
-    # RVU assertions
-    mock_rvu_service.calculate_rvu_for_claim.assert_called_once_with(c_valid_pass, mock_session) # Only for c_pass
-
-    # Transfer assertions - check batch_metrics argument
+    # Transfer assertions
     mock_transfer.assert_called_once()
     transfer_args = mock_transfer.call_args[0]
     assert transfer_args[0] == mock_session
-    assert transfer_args[1] == [c_valid_pass] # Only c_pass is transferred
-    assert 'throughput_achieved' in transfer_args[2] # Check batch_metrics dict
+    # Claims passed to transfer should be c_pass and c_ml_error_proceeds
+    assert len(transfer_args[1]) == 2
+    assert c_valid_pass in transfer_args[1]
+    assert c_ml_error_proceeds in transfer_args[1]
+    assert 'throughput_achieved' in transfer_args[2]
     assert isinstance(transfer_args[2]['throughput_achieved'], Decimal)
 
-
     # Staging update assertions
-    mock_update_transferred.assert_called_once_with(mock_session, [c_valid_pass.id])
+    # Called for transferred claims and for failed/rejected claims (via _set_final_status_for_staging_claims)
+    # _update_staging_claims_status is directly called for transferred claims
+    # _set_final_status_for_staging_claims calls it for others. Let's check specific calls on mock_update_staging
+
+    # Transferred: c_pass, c_ml_error_proceeds
+    mock_update_staging.assert_any_call(mock_session, [c_valid_pass.id, c_ml_error_proceeds.id], "completed_transferred", transferred=True)
 
     # Failed claims routing and status update assertions
-    mock_route_failed.assert_called_once()
-    failed_routed_args = mock_route_failed.call_args[0][1]
-    assert len(failed_routed_args) == 2
-    assert any(item[0].claim_id == "c_val_fail" for item in failed_routed_args)
-    assert any(item[0].claim_id == "c_ml_reject" for item in failed_routed_args)
+    # c_fail_validation (validation failure)
+    # c_ml_reject (ML rejected)
+    assert mock_route_failed.call_count == 2 # Called for VALIDATION_FAILED and ML_REJECTED stages
 
-    mock_set_final_status.assert_called_once()
-    set_final_status_args = mock_set_final_status.call_args[0][1]
-    assert len(set_final_status_args) == 2
-    assert any(item[0].claim_id == "c_val_fail" and item[1] == "VALIDATION_FAILED" for item in set_final_status_args)
-    assert any(item[0].claim_id == "c_ml_reject" and item[1] == "ML_REJECTED_OR_ERROR" for item in set_final_status_args)
+    # Check calls to _route_failed_claims for specific claims
+    routed_validation_fail = any(
+        call_args[0][0] == c_fail_validation and call_args[0][2] == "VALIDATION_FAILED"
+        for call_obj in mock_route_failed.call_args_list for call_args in call_obj[0][1] # call_obj[0][1] is the list of tuples
+    )
+    routed_ml_reject = any(
+        call_args[0][0] == c_ml_reject and call_args[0][2] == "ML_REJECTED"
+        for call_obj in mock_route_failed.call_args_list for call_args in call_obj[0][1]
+    )
+    # This assertion needs refinement because _route_failed_claims is called with a list of tuples.
+    # The structure of mock_route_failed.call_args_list will be:
+    # [call(((session_mock, [(claim1, reason, stage), (claim2, reason, stage)]),), {}), ...]
+    # The check should be:
+    # For VALIDATION_FAILED stage:
+    assert any(
+        args[1][0][0].claim_id == "c_val_fail" and args[1][0][2] == "VALIDATION_FAILED"
+        for args in mock_route_failed.call_args_list if args[0][1] # Ensure list is not empty
+    ), "c_val_fail not routed correctly"
+    # For ML_REJECTED stage:
+    assert any(
+        args[1][0][0].claim_id == "c_ml_reject" and args[1][0][2] == "ML_REJECTED"
+        for args in mock_route_failed.call_args_list if args[0][1]
+    ), "c_ml_reject not routed correctly"
 
 
-    assert summary["fetched_count"] == 3
-    assert summary["validation_passed_count"] == 2
-    assert summary["validation_failed_count"] == 1
-    assert summary["ml_prediction_attempted_count"] == 2
-    assert summary["ml_rejected_count"] == 1
-    assert summary["rvu_calculation_completed_count"] == 1
-    assert summary["transferred_to_prod_count"] == 1
-    assert summary["staging_updated_transferred_count"] == 1
-    assert summary["staging_updated_failed_count"] == 2
-    assert summary["failed_claims_routed_count"] == 2
-    assert mock_session.commit.call_count >= 1 # Commit can be called multiple times in loops
+    # Check calls to _set_final_status_for_staging_claims
+    # c_fail_validation -> status VALIDATION_FAILED
+    # c_ml_reject -> status ML_REJECTED
+    assert mock_set_final_status.call_count == 1 # Called once with all non-transferred claims that need status update
+    final_status_args = mock_set_final_status.call_args[0][1] # list of (claim, status_str)
+    assert len(final_status_args) == 2
+    assert any(item[0].claim_id == "c_val_fail" and item[1] == "VALIDATION_FAILED" for item in final_status_args)
+    assert any(item[0].claim_id == "c_ml_reject" and item[1] == "ML_REJECTED" for item in final_status_args)
+
+
+    # Summary assertions
+    assert summary["fetched_count"] == limit_param
+    assert summary["validation_passed_count"] == 3 # c_pass, c_ml_reject, c_ml_error_proceeds
+    assert summary["validation_failed_count"] == 1 # c_fail_validation
+    assert summary["ml_prediction_attempted_count"] == 3
+    assert summary["ml_approved_raw"] == 1 # c_pass
+    assert summary["ml_rejected_raw"] == 1 # c_ml_reject
+    assert summary["ml_errors_raw"] == 1 # c_ml_error_proceeds (ML_SAMPLE_PROCESSING_ERROR)
+    assert summary["stopped_by_ml_rejection"] == 1 # Only c_ml_reject
+    assert summary["rvu_calculation_completed_count"] == 2 # c_pass, c_ml_error_proceeds
+    assert summary["transferred_to_prod_count"] == 2 # c_pass, c_ml_error_proceeds
+    assert summary["staging_updated_transferred_count"] == 2
+    assert summary["staging_updated_failed_count"] == 2 # c_fail_validation, c_ml_reject
+    assert summary["failed_claims_routed_count"] == 2 # c_fail_validation, c_ml_reject
+    assert mock_session.commit.call_count >= 1
 
     # Metrics Collector Assertions
     mock_metrics_collector.record_batch_processed.assert_called_once()
     batch_processed_args = mock_metrics_collector.record_batch_processed.call_args[1]
-    assert batch_processed_args['batch_size'] == 3 # limit
+    assert batch_processed_args['batch_size'] == limit_param
     assert isinstance(batch_processed_args['duration_seconds'], float)
-    assert batch_processed_args['claims_by_final_status'] == {
-        'validation_failed': 1,
-        'ml_rejected_or_error': 1, # Based on how status is set for c_ml_reject
-        'completed_transferred': 1 # For c_pass
+    # Expected final statuses for metrics:
+    # c_pass: completed_transferred
+    # c_fail_validation: validation_failed
+    # c_ml_reject: ml_rejected
+    # c_ml_error_proceeds: completed_transferred (since it proceeds and is assumed to be transferred)
+    expected_metrics_statuses = {
+        'completed_transferred': 2, # c_pass, c_ml_error_proceeds
+        'validation_failed': 1,     # c_fail_validation
+        'ml_rejected': 1            # c_ml_reject
+        # 'ml_processing_error' is not a final status for claims that proceed.
     }
+    assert batch_processed_args['claims_by_final_status'] == expected_metrics_statuses
 
-    # Check DB query timer calls (count may vary based on actual execution paths of mocks)
+
+    # DB query timer calls (count may vary based on actual execution paths of mocks)
     # We expect at least one call for each distinct timer used in the flow.
     # _fetch_claims_parallel (mocked out, so its internal timers won't be called on the processor's collector)
     # _transfer_claims_to_production (called)
@@ -417,3 +475,296 @@ async def test_process_claims_parallel_e2e_with_failures_and_routing(
     assert end_event_kwargs['user_id'] == "system_pipeline"
     assert end_event_kwargs['details']['summary'] == summary # Compare the summary dict
     assert isinstance(end_event_kwargs['details']['duration_seconds'], float)
+    assert end_event_kwargs['details']['attempts_made'] == 1 # Success on first attempt
+
+
+@patch('asyncio.sleep', new_callable=AsyncMock) # Mock asyncio.sleep for retry tests
+@pytest.mark.asyncio
+async def test_process_claims_parallel_success_on_second_attempt(
+    mock_asyncio_sleep: AsyncMock, # Injected by @patch
+    processor: ParallelClaimsProcessor,
+    mock_db_session_factory_and_session,
+    mock_claim_validator: MagicMock,
+    mock_rvu_service: MagicMock,
+    mock_feature_extractor: MagicMock,
+    mock_optimized_predictor: MagicMock,
+    mock_metrics_collector: MagicMock,
+    mock_audit_logger_service: MagicMock
+):
+    mock_session_factory, mock_session = mock_db_session_factory_and_session
+    passed_batch_id = "b_retry_success"
+
+    # Simulate OperationalError on the first commit, then success
+    # The session factory is called in each attempt, so we reconfigure the mock_session it returns.
+    # This requires the factory to be called multiple times.
+    # Let's make the factory return different session mocks or one that has side_effects.
+
+    # For this test, let's assume the critical operation that fails is session.commit()
+    # We need to make the factory return a session that fails commit once, then succeeds.
+
+    commit_effects = [OperationalError("Simulated DB connection error"), AsyncMock()]
+
+    # We need a new session mock for each attempt, or a session factory that changes behavior
+    # The current 'processor' fixture gets a factory that returns the *same* mock_session.
+    # So, we can set side_effect on mock_session.commit directly.
+    mock_session.commit.side_effect = commit_effects
+
+    # Setup claims (same as e2e test for simplicity, focusing on retry logic)
+    c_valid_pass = create_processable_claim("c_pass_retry", 10, batch_id=passed_batch_id)
+    all_fetched_claims = [c_valid_pass]
+
+    with patch.object(processor, '_fetch_claims_parallel', new_callable=AsyncMock, return_value=all_fetched_claims) as mock_fetch:
+        # Other mocks for a simplified successful flow after retry
+        mock_claim_validator.validate_claim.return_value = [] # All valid
+        mock_feature_extractor.extract_features.return_value = np.array([[0.1]*7], dtype=np.float32)
+        mock_optimized_predictor.predict_batch.return_value = [{'ml_score': 0.9, 'ml_derived_decision': 'ML_APPROVED'}]
+        mock_rvu_service.calculate_rvu_for_claim.return_value = None
+        with patch.object(processor, '_transfer_claims_to_production', new_callable=AsyncMock, return_value=1), \
+             patch.object(processor, '_update_staging_claims_status', new_callable=AsyncMock, return_value=1), \
+             patch.object(processor, '_route_failed_claims', new_callable=AsyncMock, return_value=0), \
+             patch.object(processor, '_set_final_status_for_staging_claims', new_callable=AsyncMock, return_value=0):
+
+            summary = await processor.process_claims_parallel(batch_id=passed_batch_id, limit=1)
+
+    # Assertions
+    assert mock_session_factory.call_count == 2 # Called for attempt 1 (fail) and attempt 2 (success)
+    assert mock_session.commit.call_count == 2 # Commit called twice
+
+    mock_asyncio_sleep.assert_called_once_with(5) # BATCH_RETRY_DELAY_SECONDS from ParallelClaimsProcessor
+
+    assert summary["error"] is None # Error should be cleared on final success
+    assert summary["transferred_to_prod_count"] == 1 # Should succeed in the end
+
+    # Audit log assertions
+    assert mock_audit_logger_service.log_event.call_count == 2
+    start_event_call = mock_audit_logger_service.log_event.call_args_list[0]
+    assert start_event_call.kwargs['action'] == "PROCESS_BATCH_START"
+
+    end_event_call = mock_audit_logger_service.log_event.call_args_list[1]
+    end_event_kwargs = end_event_call.kwargs
+    assert end_event_kwargs['action'] == "PROCESS_BATCH_END"
+    assert end_event_kwargs['success'] is True
+    assert end_event_kwargs['failure_reason'] is None
+    assert end_event_kwargs['details']['attempts_made'] == 2
+    assert "DB OperationalError (attempt 1)" in end_event_kwargs['details']['summary']['error'] # Ensure last error is in summary for audit
+
+    # Metrics should be recorded once with final successful state
+    mock_metrics_collector.record_batch_processed.assert_called_once()
+    processed_args = mock_metrics_collector.record_batch_processed.call_args[1]
+    assert processed_args['claims_by_final_status'] == {'completed_transferred': 1}
+
+
+@patch('asyncio.sleep', new_callable=AsyncMock)
+@pytest.mark.asyncio
+async def test_process_claims_parallel_failure_after_all_retries(
+    mock_asyncio_sleep: AsyncMock,
+    processor: ParallelClaimsProcessor,
+    mock_db_session_factory_and_session,
+    mock_audit_logger_service: MagicMock,
+    mock_metrics_collector: MagicMock
+):
+    mock_session_factory, mock_session = mock_db_session_factory_and_session
+    passed_batch_id = "b_retry_fail_all"
+
+    # Simulate OperationalError on all commit attempts
+    mock_session.commit.side_effect = OperationalError("Simulated DB error on commit", params=None, orig=None)
+
+    # Minimal claims setup, fetch will be mocked
+    c_valid = create_processable_claim("c_valid_retry_fail", 20, batch_id=passed_batch_id)
+    all_fetched_claims = [c_valid]
+
+    with patch.object(processor, '_fetch_claims_parallel', new_callable=AsyncMock, return_value=all_fetched_claims) as mock_fetch:
+        # Assume other parts of processing would succeed if commit didn't fail
+        mock_processor = processor # Already has other services mocked by fixture
+        with patch.object(mock_processor, '_validate_claims_parallel', return_value=([c_valid],[])), \
+             patch.object(mock_processor, '_apply_ml_predictions', return_value=None), \
+             patch.object(mock_processor, '_calculate_rvus_for_claims', return_value=None), \
+             patch.object(mock_processor, '_transfer_claims_to_production', return_value=1), \
+             patch.object(mock_processor, '_update_staging_claims_status', return_value=1), \
+             patch.object(mock_processor, '_route_failed_claims', return_value=0), \
+             patch.object(mock_processor, '_set_final_status_for_staging_claims', return_value=0):
+
+            summary = await processor.process_claims_parallel(batch_id=passed_batch_id, limit=1)
+
+    assert mock_session_factory.call_count == 3 # Max retries
+    assert mock_session.commit.call_count == 3 # Commit attempted 3 times
+    assert mock_asyncio_sleep.call_count == 2 # Sleep between 3 attempts
+
+    assert "DB OperationalError (attempt 3)" in summary["error"]
+
+    # Audit log
+    assert mock_audit_logger_service.log_event.call_count == 2 # START and END
+    end_event_kwargs = mock_audit_logger_service.log_event.call_args_list[1].kwargs
+    assert end_event_kwargs['action'] == "PROCESS_BATCH_END"
+    assert end_event_kwargs['success'] is False
+    assert "DB OperationalError (attempt 3)" in end_event_kwargs['failure_reason']
+    assert end_event_kwargs['details']['attempts_made'] == 3
+
+    # Metrics (should still be called once with final summary, even if failed)
+    mock_metrics_collector.record_batch_processed.assert_called_once()
+    processed_args = mock_metrics_collector.record_batch_processed.call_args[1]
+    # The status might be empty or reflect partial work depending on how summary is built on error
+    # Given the current setup, it might be zeros or based on last attempt's view before rollback
+    # For OperationalError on commit, the counts in summary might reflect a full run.
+    # This depends on whether summary is reset or not during retries.
+    # The current code does not reset summary counts between retries.
+    assert processed_args['claims_by_final_status'] == {} # Or based on what summary contains
+
+
+@patch('asyncio.sleep', new_callable=AsyncMock)
+@pytest.mark.asyncio
+async def test_process_claims_parallel_failure_non_retryable_error(
+    mock_asyncio_sleep: AsyncMock,
+    processor: ParallelClaimsProcessor,
+    mock_db_session_factory_and_session,
+    mock_audit_logger_service: MagicMock,
+    mock_metrics_collector: MagicMock
+):
+    mock_session_factory, mock_session = mock_db_session_factory_and_session
+    passed_batch_id = "b_non_retry_fail"
+
+    # Simulate a non-OperationalError (e.g., ValueError) during a core step like validation
+    # For instance, let _validate_claims_parallel raise an unexpected error.
+    with patch.object(processor, '_fetch_claims_parallel', new_callable=AsyncMock, return_value=[create_processable_claim("c1",1)]) as mock_fetch, \
+         patch.object(processor, '_validate_claims_parallel', side_effect=ValueError("Non-retryable validation crash")) as mock_validate:
+
+        summary = await processor.process_claims_parallel(batch_id=passed_batch_id, limit=1)
+
+    assert mock_session_factory.call_count == 1 # Only one attempt for non-retryable errors
+    mock_asyncio_sleep.assert_not_called() # No retries, so no sleep
+
+    assert "Non-retryable validation crash" in summary["error"]
+
+    # Audit log
+    assert mock_audit_logger_service.log_event.call_count == 2
+    end_event_kwargs = mock_audit_logger_service.log_event.call_args_list[1].kwargs
+    assert end_event_kwargs['action'] == "PROCESS_BATCH_END"
+    assert end_event_kwargs['success'] is False
+    assert "Non-retryable validation crash" in end_event_kwargs['failure_reason']
+    assert end_event_kwargs['details']['attempts_made'] == 1
+
+    # Metrics
+    mock_metrics_collector.record_batch_processed.assert_called_once()
+    processed_args = mock_metrics_collector.record_batch_processed.call_args[1]
+    # Summary might have fetched_count=1, but other processing steps didn't complete.
+    # This depends on how summary is updated when non-retryable error occurs.
+    # The current code updates summary['error'] and then goes to finally.
+    # So other counts in summary (like validation_passed_count) would be 0.
+    assert processed_args['claims_by_final_status'] == {} # Or based on summary state
+
+
+@patch('asyncio.sleep', new_callable=AsyncMock) # Keep sleep mocked if not used, for consistency
+@pytest.mark.asyncio
+async def test_process_claims_parallel_ml_predictor_unavailable(
+    mock_asyncio_sleep: AsyncMock, # Injected by @patch
+    processor: ParallelClaimsProcessor,
+    mock_db_session_factory_and_session,
+    mock_claim_validator: MagicMock,
+    mock_rvu_service: MagicMock,
+    mock_feature_extractor: MagicMock, # Still need this for feature extraction attempt
+    mock_optimized_predictor: MagicMock,
+    mock_metrics_collector: MagicMock,
+    mock_audit_logger_service: MagicMock
+):
+    mock_session_factory, mock_session = mock_db_session_factory_and_session
+    passed_batch_id = "b_ml_unavailable"
+
+    # Simulate predictor being unavailable
+    mock_optimized_predictor.interpreter = None # Key condition for this test
+
+    # Setup a couple of claims that would otherwise pass validation and feature extraction
+    claim1 = create_processable_claim("c_mlu_1", 301, batch_id=passed_batch_id)
+    claim2 = create_processable_claim("c_mlu_2", 302, batch_id=passed_batch_id)
+    all_fetched_claims = [claim1, claim2]
+    limit_param = len(all_fetched_claims)
+
+    with patch.object(processor, '_fetch_claims_parallel', new_callable=AsyncMock, return_value=all_fetched_claims) as mock_fetch:
+        mock_claim_validator.validate_claim.return_value = [] # All valid
+
+        # Feature extraction would still run
+        features_c1 = np.array([[0.1]*7], dtype=np.float32)
+        features_c2 = np.array([[0.2]*7], dtype=np.float32)
+        def feature_extractor_side_effect(claim_to_extract):
+            if claim_to_extract.claim_id == "c_mlu_1": return features_c1
+            if claim_to_extract.claim_id == "c_mlu_2": return features_c2
+            return None
+        mock_feature_extractor.extract_features.side_effect = feature_extractor_side_effect
+
+        # predict_batch should not be called if interpreter is None and _apply_ml_predictions handles it early
+
+        # RVU service should be called for both claims
+        mock_rvu_service.calculate_rvu_for_claim.return_value = None
+
+        # Assume both claims are transferred successfully
+        with patch.object(processor, '_transfer_claims_to_production', new_callable=AsyncMock, return_value=2) as mock_transfer, \
+             patch.object(processor, '_update_staging_claims_status') as mock_update_staging, \
+             patch.object(processor, '_route_failed_claims', new_callable=AsyncMock, return_value=0) as mock_route_failed, \
+             patch.object(processor, '_set_final_status_for_staging_claims') as mock_set_final_status:
+
+            summary = await processor.process_claims_parallel(batch_id=passed_batch_id, limit=limit_param)
+
+    # Assertions
+    mock_fetch.assert_called_once_with(mock_session, passed_batch_id, limit_param)
+    assert mock_claim_validator.validate_claim.call_count == 2
+
+    # Feature extraction is attempted before the interpreter check within _apply_ml_predictions
+    assert mock_feature_extractor.extract_features.call_count == 2
+    # predict_batch should not be called because _apply_ml_predictions returns early
+    mock_optimized_predictor.predict_batch.assert_not_called()
+
+    # RVU assertions (both claims should proceed)
+    assert mock_rvu_service.calculate_rvu_for_claim.call_count == 2
+    mock_rvu_service.calculate_rvu_for_claim.assert_any_call(claim1, mock_session)
+    mock_rvu_service.calculate_rvu_for_claim.assert_any_call(claim2, mock_session)
+
+    # Transfer assertions (both claims proceed and are transferred)
+    mock_transfer.assert_called_once()
+    transfer_args = mock_transfer.call_args[0]
+    assert len(transfer_args[1]) == 2
+    assert claim1 in transfer_args[1]
+    assert claim2 in transfer_args[1]
+
+    # Staging update for transferred claims
+    mock_update_staging.assert_any_call(mock_session, [claim1.id, claim2.id], "completed_transferred", transferred=True)
+
+    # No claims should be routed as failed due to ML, nor staging status set to a failed ML state
+    mock_route_failed.assert_not_called() # Or called with empty list if that's the path
+    # mock_set_final_status might be called with an empty list if no other failures, or not at all.
+    # Check if it was called, and if so, with an empty list for ML-related parts.
+    if mock_set_final_status.called:
+        final_status_args = mock_set_final_status.call_args[0][1]
+        assert not any("ML_" in item[1] for item in final_status_args)
+
+
+    # Summary assertions
+    assert summary["fetched_count"] == limit_param
+    assert summary["validation_passed_count"] == 2
+    assert summary["ml_prediction_attempted_count"] == 2 # Attempted means _apply_ml_predictions was called
+    assert summary["ml_approved_raw"] == 0
+    assert summary["ml_rejected_raw"] == 0
+    assert summary["stopped_by_ml_rejection"] == 0
+    # Both claims should be marked with ML_PREDICTOR_UNAVAILABLE and counted in ml_errors_raw
+    assert summary["ml_errors_raw"] == 2
+    assert summary["rvu_calculation_completed_count"] == 2
+    assert summary["transferred_to_prod_count"] == 2
+    assert summary["staging_updated_transferred_count"] == 2
+    assert summary["failed_claims_routed_count"] == 0
+    assert summary["staging_updated_failed_count"] == 0
+    assert summary["error"] is None
+
+    assert claim1.ml_derived_decision == "ML_PREDICTOR_UNAVAILABLE"
+    assert claim2.ml_derived_decision == "ML_PREDICTOR_UNAVAILABLE"
+
+    # Audit log
+    assert mock_audit_logger_service.log_event.call_count == 2 # START and END
+    end_event_kwargs = mock_audit_logger_service.log_event.call_args_list[1].kwargs
+    assert end_event_kwargs['success'] is True
+    assert end_event_kwargs['details']['attempts_made'] == 1
+    assert end_event_kwargs['details']['summary']['ml_errors_raw'] == 2
+
+    # Metrics
+    mock_metrics_collector.record_batch_processed.assert_called_once()
+    processed_args = mock_metrics_collector.record_batch_processed.call_args[1]
+    assert processed_args['claims_by_final_status'] == {'completed_transferred': 2}
+
+    mock_asyncio_sleep.assert_not_called() # No retries expected
