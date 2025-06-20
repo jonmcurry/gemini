@@ -27,25 +27,26 @@ class ClaimProcessingService:
     def __init__(self, db_session: AsyncSession, metrics_collector: MetricsCollector): # Added metrics_collector
         self.db = db_session
         self.metrics_collector = metrics_collector # Store it
+        self.settings = get_settings() # Store settings instance
         self.validator = ClaimValidator()
         cache_manager = get_cache_manager()
         # Pass metrics_collector to RVUService
         self.rvu_service = RVUService(cache_manager=cache_manager, metrics_collector=self.metrics_collector)
-        current_settings = get_settings()
-        self.concurrent_processing_semaphore = asyncio.Semaphore(current_settings.MAX_CONCURRENT_CLAIM_PROCESSING)
+        # Use self.settings for consistency
+        self.concurrent_processing_semaphore = asyncio.Semaphore(self.settings.MAX_CONCURRENT_CLAIM_PROCESSING)
         self.feature_extractor = FeatureExtractor()
         # Pass metrics_collector to OptimizedPredictor
         self.predictor = OptimizedPredictor(
-            model_path=current_settings.ML_MODEL_PATH,
+            model_path=self.settings.ML_MODEL_PATH, # Use self.settings
             metrics_collector=self.metrics_collector,
-            feature_count=current_settings.ML_FEATURE_COUNT # Ensure feature_count is passed if init expects it
+            feature_count=self.settings.ML_FEATURE_COUNT # Use self.settings
         )
         logger.info("ClaimProcessingService initialized",
                     db_session_id=id(db_session),
                     cache_manager_id=id(cache_manager),
                     metrics_collector_id=id(self.metrics_collector),
-                    concurrency_limit=current_settings.MAX_CONCURRENT_CLAIM_PROCESSING,
-                    ml_model_path=current_settings.ML_MODEL_PATH)
+                    concurrency_limit=self.settings.MAX_CONCURRENT_CLAIM_PROCESSING, # Use self.settings
+                    ml_model_path=self.settings.ML_MODEL_PATH) # Use self.settings
 
     async def _process_single_claim_concurrently(self, db_claim: ClaimModel) -> Dict[str, Any]:
         start_time = time.monotonic()
@@ -246,12 +247,12 @@ class ClaimProcessingService:
                          error=str(e), exc_info=True)
             # Do not rollback here, let the outer transaction handle it.
 
-
-    async def process_pending_claims_batch(self, batch_size: int = 100):
+    async def process_pending_claims_batch(self, batch_size_override: Optional[int] = None):
+        effective_batch_size = batch_size_override if batch_size_override is not None else self.settings.FETCH_BATCH_SIZE
         batch_start_time = time.monotonic()
-        logger.info("Starting batch processing of claims with concurrency", batch_size=batch_size)
+        logger.info("Starting batch processing of claims with concurrency", batch_size=effective_batch_size)
 
-        fetched_db_claims = await self._fetch_pending_claims(batch_size)
+        fetched_db_claims = await self._fetch_pending_claims(effective_batch_size)
 
         if not fetched_db_claims:
             logger.info("No pending claims to process.")
@@ -352,13 +353,13 @@ class ClaimProcessingService:
 
         return final_summary
 
-    async def _fetch_pending_claims(self, batch_size: int) -> list[ClaimModel]:
-        logger.info("Fetching pending claims from database", batch_size=batch_size)
+    async def _fetch_pending_claims(self, effective_batch_size: int) -> list[ClaimModel]:
+        logger.info("Fetching pending claims from database", batch_size=effective_batch_size)
         stmt = (
             select(ClaimModel)
             .where(ClaimModel.processing_status == 'pending')
             .order_by(ClaimModel.created_at.asc())
-            .limit(batch_size)
+            .limit(effective_batch_size)
             .options(joinedload(ClaimModel.line_items))
         )
         result = await self.db.execute(stmt)

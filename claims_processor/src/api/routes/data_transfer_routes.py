@@ -6,15 +6,21 @@ from typing import Dict, Any, Optional
 # Assuming 'data_transfer_routes.py' is in 'claims_processor/src/api/routes/'
 from ...core.database.db_session import AsyncSessionLocal, AsyncSession
 from ...processing.data_transfer_service import DataTransferService
-# No AuditLoggerService import here yet, can be added if auditing the trigger directly here.
+from ...core.monitoring.audit_logger import AuditLogger # Import new AuditLogger
+from ..dependencies import get_audit_logger # Import new dependency getter
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(
-    prefix="/data-transfer", # This prefix is for routes within this router
-    tags=["Data Transfer"]
+    # prefix="/data-transfer", # Prefix is already applied by main app router for this file
+    tags=["Data Transfer"] # Tags are fine
 )
 
-async def run_data_transfer_background(limit: int, client_ip: Optional[str], user_agent_header: Optional[str]):
+async def run_data_transfer_background(
+    limit: int,
+    client_ip: Optional[str],
+    user_agent_header: Optional[str],
+    audit_logger_instance: AuditLogger # Added AuditLogger instance
+):
     """
     Background task wrapper for transferring claims to production.
     Manages its own database session.
@@ -23,29 +29,39 @@ async def run_data_transfer_background(limit: int, client_ip: Optional[str], use
         "Background task started: run_data_transfer_background",
         record_limit=limit, client_ip=client_ip, user_agent=user_agent_header
     )
-    session: Optional[AsyncSession] = None # To ensure it's defined for finally block if needed
+    session: Optional[AsyncSession] = None
     try:
-        async with AsyncSessionLocal() as session:
-            # TODO: Optionally, log trigger of this background task to AuditLog using this session
-            # audit_service = AuditLoggerService(db_session=session)
-            # await audit_service.log_event(action="DATA_TRANSFER_TASK_STARTED", ...)
+        await audit_logger_instance.log_access(
+            user_id="background_system", action="DATA_TRANSFER_TASK_STARTED", resource="DataTransferTask",
+            resource_id=f"limit_{limit}", ip_address=client_ip, user_agent=user_agent_header,
+            success=True, details={"message": "Data transfer background task initiated."}
+        )
 
+        async with AsyncSessionLocal() as session:
             data_transfer_service = DataTransferService(db_session=session)
             result = await data_transfer_service.transfer_claims_to_production(limit=limit)
             logger.info("Data transfer background task finished successfully by service.", result=result, record_limit=limit)
 
-            # TODO: Optionally, log completion summary to AuditLog as well, using this session.
-            # await audit_service.log_event(action="DATA_TRANSFER_TASK_COMPLETED", details=result, ...)
+            await audit_logger_instance.log_access(
+                user_id="background_system", action="DATA_TRANSFER_TASK_COMPLETED", resource="DataTransferTask",
+                resource_id=f"limit_{limit}", ip_address=client_ip, user_agent=user_agent_header,
+                success=True, details=result
+            )
 
     except Exception as e:
         logger.error(
             "Error in data transfer background task execution",
             error=str(e), exc_info=True, record_limit=limit
         )
-        # TODO: Handle/log failure more robustly (e.g., update a task status table or log to AuditLog).
-        # async with AsyncSessionLocal() as error_session:
-        #     audit_service_err = AuditLoggerService(db_session=error_session)
-        #     await audit_service_err.log_event(action="DATA_TRANSFER_TASK_FAILED", failure_reason=str(e), ...)
+        try:
+            await audit_logger_instance.log_access(
+                user_id="background_system", action="DATA_TRANSFER_TASK_FAILED", resource="DataTransferTask",
+                resource_id=f"limit_{limit}", ip_address=client_ip, user_agent=user_agent_header,
+                success=False, failure_reason=f"Background task error: {str(e)}",
+                details={"message": "Data transfer background task failed during execution."}
+            )
+        except Exception as audit_err_e:
+            logger.error("Critical: Failed to log data transfer task failure audit event", error=str(audit_err_e), exc_info=True)
     finally:
         logger.debug("Finished run_data_transfer_background execution attempt.")
 
@@ -58,43 +74,37 @@ async def run_data_transfer_background(limit: int, client_ip: Optional[str], use
 async def trigger_production_data_transfer(
     request: Request,
     background_tasks: BackgroundTasks,
-    limit: int = 1000 # Example: make limit configurable via query param
+    limit: int = 1000, # Example: make limit configurable via query param
+    audit_logger: AuditLogger = Depends(get_audit_logger) # Inject AuditLogger
 ) -> Dict[str, Any]:
     """
     Triggers a background task to transfer processed claims from the staging
     `claims` table to the `claims_production` table.
     """
-    client_ip = request.client.host if request.client else "N/A"
-    user_agent_header = request.headers.get("user-agent", "N/A")
+    client_ip = request.client.host if request.client else None # Allow None
+    user_agent_header = request.headers.get("user-agent")
 
     logger.info(
         "Received request to trigger data transfer to production in background.",
         record_limit=limit, client_ip=client_ip, user_agent=user_agent_header
     )
 
-    # Audit logging for the trigger action (using its own session)
-    # This part can be added if AuditLoggerService is imported and configured.
-    # For now, focusing on the task trigger.
-    # async with AsyncSessionLocal() as audit_session:
-    #     audit_service = AuditLoggerService(db_session=audit_session)
-    #     try:
-    #         await audit_service.log_event(
-    #             action="TRIGGER_DATA_TRANSFER_TO_PROD",
-    #             success=True,
-    #             user_id="api_user_placeholder", # Replace with actual user if available
-    #             ip_address=client_ip,
-    #             user_agent=user_agent_header,
-    #             details={"requested_limit": limit}
-    #         )
-    #     except Exception as audit_exc:
-    #         logger.error("Failed to log audit event for data transfer trigger", error=str(audit_exc), exc_info=True)
-
+    await audit_logger.log_access(
+        user_id=None, # Or derive from authenticated user if available
+        action="TRIGGER_DATA_TRANSFER",
+        resource="DataTransferTrigger",
+        ip_address=client_ip,
+        user_agent=user_agent_header,
+        success=True,
+        details={"requested_limit": limit}
+    )
 
     background_tasks.add_task(
         run_data_transfer_background,
         limit=limit,
         client_ip=client_ip,
-        user_agent_header=user_agent_header
+        user_agent_header=user_agent_header,
+        audit_logger_instance=audit_logger # Pass the audit_logger instance
     )
 
     return {
