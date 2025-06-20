@@ -1,0 +1,3 @@
+# This file is to ensure the 'models/' directory is tracked by Git.
+# ML model files (e.g., .tflite, .pkl, .onnx) will be stored here.
+# These model files themselves might be tracked by Git LFS if they are large.
