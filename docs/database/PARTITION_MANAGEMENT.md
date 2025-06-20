@@ -40,6 +40,8 @@ CREATE TABLE claim_line_items_y2024m09 PARTITION OF claim_line_items
 
 Partitions for `claims_production` are currently created yearly based on the `service_from_date` column.
 
+**Note on Primary Key:** The `claims_production` table, as implemented by migration `4d5e6f708192_create_claims_production_table_for_analytics.py`, uses a composite primary key: `(id, service_from_date)`. The `id` column in this table is populated with the value from the `id` column of the source record in the staging `claims` table. This implemented strategy ensures that the primary key includes the partitioning key, which is a common requirement for partitioned tables. This differs from the example DDL in the main `REQUIREMENTS.MD` (Section 5) which illustrates `id` as a standalone `SERIAL PRIMARY KEY`. The implemented composite key structure is consistent with the data transfer logic and partitioning scheme.
+
 ### Example DDL for Future Partitions (`claims_production`)
 
 The following are examples for creating partitions for the 3 years starting from Y2026:

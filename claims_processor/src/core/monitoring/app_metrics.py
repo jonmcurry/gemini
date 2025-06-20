@@ -8,62 +8,79 @@ logger = structlog.get_logger(__name__)
 # --- Prometheus Metric Definitions ---
 # These are defined globally so they are registered with the default REGISTRY
 
-# Processing metrics
+# --- Prometheus Metric Definitions (Consolidated) ---
+# These are defined globally so they are registered with the default REGISTRY
+
+# 1. Claims Processing Metrics
 CLAIMS_PROCESSED_TOTAL = Counter(
     'claims_processed_total',
     'Total claims processed, labeled by their final status.',
     ['final_status']  # e.g., 'completed_transferred', 'validation_failed', 'ml_rejected', 'processing_error'
 )
 
-CLAIMS_PROCESSING_DURATION_SECONDS = Histogram(
-    'claims_processing_duration_seconds',
+# Renamed from CLAIMS_PROCESSING_DURATION_SECONDS
+CLAIMS_BATCH_PROCESSING_DURATION_SECONDS = Histogram(
+    'claims_batch_processing_duration_seconds', # Renamed
     'Time spent processing a batch of claims, in seconds.',
-    # Buckets can be customized e.g. [.005, .01, .025, .05, ..., 15] for 100k claims in <15s
-    # Using buckets from previous metrics.py for CLAIMS_BATCH_PROCESSING_DURATION_SECONDS
-    buckets=(1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, float('inf'))
+    buckets=(1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, float('inf')) # Adjusted buckets
 )
 
-CLAIMS_THROUGHPUT_CLAIMS_PER_SECOND = Gauge(
-    'claims_throughput_claims_per_second',
-    'Current claims processing throughput for a completed batch.'
+# Added new metric for individual claims
+CLAIM_INDIVIDUAL_PROCESSING_DURATION_SECONDS = Histogram(
+    'claim_individual_processing_duration_seconds',
+    'Time spent processing an individual claim end-to-end (can be high level).',
+    # Buckets suitable for individual claim processing time (likely shorter than batches)
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, float('inf'))
 )
 
-# Database metrics (basic examples)
+# Renamed from CLAIMS_THROUGHPUT_CLAIMS_PER_SECOND
+CLAIMS_THROUGHPUT_GAUGE = Gauge(
+    'claims_throughput_gauge', # Renamed
+    'Current claims processing throughput for a completed batch (claims per second).'
+)
+
+# 2. Database Metrics
 DATABASE_QUERY_DURATION_SECONDS = Histogram(
     'database_query_duration_seconds',
     'Duration of key database queries, in seconds.',
     ['query_name'] # e.g., 'fetch_pending_claims', 'transfer_to_production', 'update_staging_status'
 )
 
-# ML metrics
+# Added new metric
+DATABASE_CONNECTIONS_ACTIVE_GAUGE = Gauge(
+    'database_connections_active_gauge',
+    'Current number of active database connections.',
+    ['database_name'] # e.g., 'staging_db_pool', 'production_db_pool'
+)
+
+# 3. ML Metrics
 ML_PREDICTIONS_TOTAL = Counter(
     'ml_predictions_total',
     'Total ML predictions made, labeled by outcome.',
     ['outcome'] # e.g., 'ML_APPROVED', 'ML_REJECTED', 'ML_ERROR', 'ML_SKIPPED'
 )
 
-ML_PREDICTION_CONFIDENCE = Histogram(
-    'ml_prediction_confidence',
+# Renamed from ML_PREDICTION_CONFIDENCE
+ML_PREDICTION_CONFIDENCE_HISTOGRAM = Histogram(
+    'ml_prediction_confidence_histogram', # Renamed
     'Distribution of ML prediction confidence scores (ml_score).',
     buckets=tuple(x / 10.0 for x in range(11)) # 0.0, 0.1, ..., 1.0
-)
-
-# Cache metrics
-# This definition will replace/override any previous CACHE_OPERATIONS_TOTAL if this module is imported after.
-# Ensure consistency or consolidate metric definitions.
-CACHE_OPERATIONS_TOTAL = Counter(
-    'cache_operations_total',
-    'Total cache operations, labeled by type and outcome.',
-    ['cache_type', 'operation_type', 'outcome']
 )
 
 ML_INFERENCE_DURATION_SECONDS = Histogram(
     'ml_inference_duration_seconds',
     'Duration of individual ML model inference (invoke) calls, in seconds.',
-    buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, float('inf')) # Fine-grained buckets
+    buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, float('inf'))
 )
 
-logger.info("Application Prometheus metrics defined in app_metrics.py.")
+# 4. Cache Metrics
+CACHE_OPERATIONS_TOTAL = Counter(
+    'cache_operations_total',
+    'Total cache operations, labeled by type and outcome.',
+    ['cache_type', 'operation_type', 'outcome'] # e.g., rvu_cache, get, hit/miss/error
+)
+
+logger.info("Application Prometheus metrics consolidated and defined in app_metrics.py.")
 
 
 class MetricsCollector:
@@ -77,23 +94,25 @@ class MetricsCollector:
 
     def record_batch_processed(self, batch_size: int, duration_seconds: float, claims_by_final_status: Dict[str, int]):
         """
-        Record metrics for a processed batch.
+        Record metrics for a processed batch. Uses CLAIMS_BATCH_PROCESSING_DURATION_SECONDS.
         """
         if duration_seconds > 0:
-            CLAIMS_PROCESSING_DURATION_SECONDS.observe(duration_seconds)
-            # Ensure successfully_processed_count is available for accurate throughput
-            # For now, using batch_size as a proxy for attempted, actual throughput might be based on successfully_processed_count
-            # Let's assume claims_by_final_status contains a count for 'successfully_processed_count' or similar.
-            successfully_processed = claims_by_final_status.get('processing_complete', 0) + \
-                                     claims_by_final_status.get('completed_transferred', 0) # Example of success states
+            CLAIMS_BATCH_PROCESSING_DURATION_SECONDS.observe(duration_seconds) # Use renamed metric
+
+            # Calculate successfully processed claims for throughput calculation
+            # This definition of "successful" might need adjustment based on actual final_status values
+            successfully_processed = sum(
+                count for status, count in claims_by_final_status.items()
+                if status in ['completed_transferred', 'processing_complete'] # Define what constitutes success
+            )
 
             if successfully_processed > 0:
                 throughput = successfully_processed / duration_seconds
-                CLAIMS_THROUGHPUT_CLAIMS_PER_SECOND.set(throughput)
-            else: # If no claims were successfully processed in this batch
-                CLAIMS_THROUGHPUT_CLAIMS_PER_SECOND.set(0)
-        else: # Batch duration was zero or negative (unlikely but handle)
-            CLAIMS_THROUGHPUT_CLAIMS_PER_SECOND.set(0)
+                CLAIMS_THROUGHPUT_GAUGE.set(throughput) # Use renamed metric
+            else:
+                CLAIMS_THROUGHPUT_GAUGE.set(0)
+        else:
+            CLAIMS_THROUGHPUT_GAUGE.set(0)
 
         for status, count in claims_by_final_status.items():
             if count > 0:
@@ -101,10 +120,14 @@ class MetricsCollector:
 
         logger.debug("Batch processed metrics recorded", batch_size=batch_size, duration_s=duration_seconds, status_counts=claims_by_final_status)
 
+    def record_individual_claim_duration(self, duration_seconds: float):
+        """Records the processing duration for an individual claim."""
+        CLAIM_INDIVIDUAL_PROCESSING_DURATION_SECONDS.observe(duration_seconds)
+
     def record_ml_prediction(self, outcome: str, confidence_score: Optional[float]):
         ML_PREDICTIONS_TOTAL.labels(outcome=outcome).inc()
-        if confidence_score is not None: # Only observe if a score is available
-            ML_PREDICTION_CONFIDENCE.observe(confidence_score)
+        if confidence_score is not None:
+            ML_PREDICTION_CONFIDENCE_HISTOGRAM.observe(confidence_score) # Use renamed metric
 
     def record_cache_operation(self, cache_type: str, operation_type: str, outcome: str):
         CACHE_OPERATIONS_TOTAL.labels(cache_type=cache_type, operation_type=operation_type, outcome=outcome).inc()
@@ -112,44 +135,15 @@ class MetricsCollector:
     def record_database_query_duration(self, query_name: str, duration_seconds: float):
         DATABASE_QUERY_DURATION_SECONDS.labels(query_name=query_name).observe(duration_seconds)
 
-    def record_ml_inference_duration(self, duration_seconds: float): # New method
+    def set_database_connections_active(self, db_name: str, count: int):
+        """Sets the current number of active database connections."""
+        DATABASE_CONNECTIONS_ACTIVE_GAUGE.labels(database_name=db_name).set(count)
+
+    def record_ml_inference_duration(self, duration_seconds: float):
         ML_INFERENCE_DURATION_SECONDS.observe(duration_seconds)
 
-    # Helper for timing code blocks (can be used with 'with' statement)
-    class Timer:
-        def __init__(self, collector_instance: 'MetricsCollector', metric_observer_func, *metric_labels):
-            self.collector = collector_instance # Not used if observer_func is bound or static
-            self.metric_observer_func = metric_observer_func
-            self.metric_labels = metric_labels
-            self.start_time: Optional[float] = None
-
-        def __enter__(self):
-            self.start_time = time.perf_counter()
-            return self
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            if self.start_time is not None:
-                duration_seconds = time.perf_counter() - self.start_time
-                if self.metric_labels:
-                    self.metric_observer_func(*self.metric_labels, duration_seconds) # For labeled Histograms like DB query
-                else:
-                    self.metric_observer_func(duration_seconds) # For non-labeled Histograms like ML inference
-
-    def time_db_query(self, query_name: str) -> Timer:
-        """Returns a Timer context manager for a database query."""
-        # Pass the specific method of the collector instance if methods are not static
-        return self.Timer(self, self.record_database_query_duration, query_name)
-        # If record_database_query_duration were static or global func:
-        # return self.Timer(MetricsCollector, MetricsCollector.record_database_query_duration, query_name)
-        # Or if it's a bound method:
-        # return self.Timer(self, self.record_database_query_duration, query_name)
-        # The current Timer uses self.collector.record_database_query_duration(self.query_name, duration_seconds)
-        # which implies record_database_query_duration is an instance method.
-        # The original Timer was fine, let's revert Timer to be specific for DB queries for now,
-        # and use direct timing for ML inference as per plan.
-
-    # Reverting Timer to its simpler form for time_db_query
-    class Timer:
+    # Timer class for timing database queries
+    class _DatabaseTimer: # Renamed to avoid potential confusion if Timer is used elsewhere
         def __init__(self, collector_instance: 'MetricsCollector', query_name: str):
             self.collector = collector_instance
             self.query_name = query_name
@@ -164,8 +158,9 @@ class MetricsCollector:
                 duration_seconds = time.perf_counter() - self.start_time
                 self.collector.record_database_query_duration(self.query_name, duration_seconds)
 
-    def time_db_query(self, query_name: str) -> Timer:
-        return self.Timer(self, query_name)
+    def time_db_query(self, query_name: str) -> _DatabaseTimer: # Return type updated
+        """Returns a Timer context manager for a database query."""
+        return self._DatabaseTimer(self, query_name)
 
 
 # Optional: Create a global instance if this collector is to be used as a singleton directly

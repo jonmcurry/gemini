@@ -14,18 +14,22 @@ from decimal import Decimal
 from sqlalchemy.sql import insert, update # Added update
 from datetime import datetime, timezone # Added datetime, timezone
 from sqlalchemy.dialects.postgresql import insert as pg_insert # Added for ON CONFLICT
+from typing import Optional # For Optional type hint
+from ..core.config.settings import get_settings # For batch size setting
 
 logger = structlog.get_logger(__name__)
 
 class DataTransferService:
     def __init__(self, db_session: AsyncSession):
         self.db = db_session
+        self.settings = get_settings() # Store settings if needed by other methods or for consistency
         logger.info("DataTransferService initialized.")
 
-    async def transfer_claims_to_production(self, limit: int = 1000) -> Dict[str, Any]:
-        logger.info("Starting transfer of claims to production", record_limit=limit)
+    async def transfer_claims_to_production(self, limit: Optional[int] = None) -> Dict[str, Any]:
+        effective_limit = limit if limit is not None else self.settings.TRANSFER_BATCH_SIZE
+        logger.info("Starting transfer of claims to production", record_limit=effective_limit)
 
-        staging_claims_to_transfer = await self._select_claims_from_staging(limit)
+        staging_claims_to_transfer = await self._select_claims_from_staging(effective_limit)
 
         if not staging_claims_to_transfer:
             logger.info("No claims found in staging ready for transfer to production.")

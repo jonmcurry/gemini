@@ -15,11 +15,26 @@ def mock_db_session() -> MagicMock:
     session.execute = AsyncMock()
     session.commit = AsyncMock()
     session.rollback = AsyncMock()
+    session.add = MagicMock() # Added from my plan
+    session.add_all = MagicMock() # Added from my plan
+    # For 'async with session.begin()'
+    async_cm = AsyncMock()
+    session.begin = MagicMock(return_value=async_cm)
     return session
 
 @pytest.fixture
-def data_transfer_service(mock_db_session: MagicMock) -> DataTransferService:
-    return DataTransferService(db_session=mock_db_session)
+def mock_settings_fixture(): # Renamed to avoid conflict with a potential 'settings' variable
+    settings = MagicMock()
+    settings.TRANSFER_BATCH_SIZE = 100
+    # Add other settings if DataTransferService uses them directly
+    return settings
+
+@pytest.fixture
+def data_transfer_service(mock_db_session: MagicMock, mock_settings_fixture: MagicMock) -> DataTransferService:
+    # DataTransferService now initializes self.settings = get_settings()
+    with patch('claims_processor.src.processing.data_transfer_service.get_settings', return_value=mock_settings_fixture):
+        service = DataTransferService(db_session=mock_db_session)
+    return service
 
 # --- Test _select_claims_from_staging ---
 @pytest.mark.asyncio
@@ -73,11 +88,23 @@ def test_map_staging_to_production_records_maps_correctly(
     assert prod_rec["id"] == staging_claim.id
     assert prod_rec["claim_id"] == staging_claim.claim_id
     assert prod_rec["ml_prediction_score"] == staging_claim.ml_score
-    assert prod_rec["risk_category"] == "LOW"
+    assert prod_rec["risk_category"] == "LOW" # Based on 0.95
     assert prod_rec["processing_duration_ms"] == staging_claim.processing_duration_ms
     assert prod_rec["throughput_achieved"] is None
+    # Additional assertions from my planned test
+    assert prod_rec["patient_first_name"] == "Test"
+    assert prod_rec["patient_last_name"] == "User"
+    # Assuming patient_date_of_birth is mapped directly as string if it was string in ClaimModel
+    # If ClaimModel.patient_date_of_birth is date, and mapping keeps it as date, this is fine.
+    # The current ClaimModel in data_transfer_service uses it as date, so mapping should be date.
+    assert prod_rec["patient_date_of_birth"] == date(1990,1,1)
+    assert prod_rec["service_from_date"] == date(2023,1,1)
+    assert prod_rec["service_to_date"] == date(2023,1,5)
 
-def test_map_staging_to_production_records_risk_categories(
+def test_map_staging_to_production_empty_list(data_transfer_service: DataTransferService):
+    assert data_transfer_service._map_staging_to_production_records([]) == []
+
+def test_map_staging_to_production_records_risk_categories( # Name kept from existing
     data_transfer_service: DataTransferService
 ):
     claims_data = [
