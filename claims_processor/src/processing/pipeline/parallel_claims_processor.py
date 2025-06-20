@@ -21,19 +21,23 @@ from ..ml_pipeline.feature_extractor import FeatureExtractor
 from ..ml_pipeline.optimized_predictor import OptimizedPredictor
 from ....core.monitoring.app_metrics import MetricsCollector
 from ....core.security.audit_logger_service import AuditLoggerService
-from ....core.security.encryption_service import EncryptionService # Added
-from ....api.models.claim_models import ProcessableClaimLineItem # Ensure this is available for manual mapping
+from ....core.security.encryption_service import EncryptionService
+from ....api.models.claim_models import ProcessableClaimLineItem
 
 # Added for retry logic
 import asyncio
 from sqlalchemy.exc import OperationalError
-from datetime import date # For date.fromisoformat
+from datetime import date # For date.fromisoformat, already imported via datetime but explicit is fine
 
 logger = structlog.get_logger(__name__)
 
 # Define retry parameters (can be moved to settings later)
 MAX_BATCH_RETRIES = 3
 BATCH_RETRY_DELAY_SECONDS = 5
+
+# Configuration for chunked retries in _transfer_claims_to_production
+TRANSFER_CHUNK_SIZE = 500 # Size of smaller chunks if initial bulk insert fails
+MIN_CLAIMS_TO_ATTEMPT_CHUNKED_RETRY = 101 # Only attempt chunking if the failing batch had more than this many claims
 
 class ParallelClaimsProcessor:
     def __init__(self,
@@ -44,7 +48,7 @@ class ParallelClaimsProcessor:
                  optimized_predictor: OptimizedPredictor,
                  metrics_collector: MetricsCollector,
                  audit_logger_service: AuditLoggerService,
-                 encryption_service: EncryptionService): # Added
+                 encryption_service: EncryptionService):
         self.db_session_factory = db_session_factory
         self.validator = claim_validator
         self.rvu_service = rvu_service
@@ -52,7 +56,7 @@ class ParallelClaimsProcessor:
         self.predictor = optimized_predictor
         self.metrics_collector = metrics_collector
         self.audit_logger_service = audit_logger_service
-        self.encryption_service = encryption_service # Added
+        self.encryption_service = encryption_service
         logger.info("ParallelClaimsProcessor initialized with all services including EncryptionService.")
 
     async def _fetch_claims_parallel(self, session: AsyncSession, batch_id: Optional[str] = None, limit: int = 1000) -> List[ProcessableClaim]:
@@ -99,9 +103,11 @@ class ParallelClaimsProcessor:
             processable_claims: List[ProcessableClaim] = []
             for claim_db in claim_db_models:
                 try:
-                    # Decrypt fields before Pydantic validation/conversion
+                    claim_data_dict = {c.name: getattr(claim_db, c.name) for c in claim_db.__table__.columns}
+
+                    # Decrypt patient_date_of_birth
                     decrypted_dob_obj: Optional[date] = None
-                    if claim_db.patient_date_of_birth: # This is now a string column
+                    if claim_db.patient_date_of_birth: # This is an encrypted string from DB
                         decrypted_dob_str = self.encryption_service.decrypt(claim_db.patient_date_of_birth)
                         if decrypted_dob_str:
                             try:
@@ -109,34 +115,29 @@ class ParallelClaimsProcessor:
                             except ValueError:
                                 logger.warn("Failed to parse decrypted date string for patient_date_of_birth",
                                             claim_id=claim_db.claim_id, db_id=claim_db.id, decrypted_str=decrypted_dob_str)
-                        elif decrypted_dob_str is None: # Decryption failed explicitly
-                             logger.warn("Failed to decrypt patient_date_of_birth", claim_id=claim_db.claim_id, db_id=claim_db.id)
+                        elif decrypted_dob_str is None: # Decryption failed
+                             logger.warn("Failed to decrypt patient_date_of_birth for claim (DB ID, Claim ID)",
+                                         db_id=claim_db.id, claim_business_id=claim_db.claim_id)
+                    claim_data_dict['patient_date_of_birth'] = decrypted_dob_obj
 
+                    # Decrypt medical_record_number
                     decrypted_mrn: Optional[str] = None
-                    if claim_db.medical_record_number: # This is a string column
+                    if claim_db.medical_record_number: # This is an encrypted string from DB
                         decrypted_mrn = self.encryption_service.decrypt(claim_db.medical_record_number)
-                        if decrypted_mrn is None:
-                             logger.warn("Failed to decrypt medical_record_number", claim_id=claim_db.claim_id, db_id=claim_db.id)
+                        if decrypted_mrn is None: # Decryption failed
+                             logger.warn("Failed to decrypt medical_record_number for claim (DB ID, Claim ID)",
+                                         db_id=claim_db.id, claim_business_id=claim_db.claim_id)
+                    claim_data_dict['medical_record_number'] = decrypted_mrn
 
-                    # Prepare data for ProcessableClaim, converting SQLAlchemy model to dict first
-                    claim_data_for_pydantic = {c.name: getattr(claim_db, c.name) for c in claim_db.__table__.columns}
-
-                    # Update with decrypted (and parsed) values
-                    claim_data_for_pydantic['patient_date_of_birth'] = decrypted_dob_obj
-                    claim_data_for_pydantic['medical_record_number'] = decrypted_mrn
-
-                    # Handle line items: convert each line item to ProcessableClaimLineItem
-                    # ProcessableClaim expects List[ProcessableClaimLineItem]
+                    # Handle line items - they are not encrypted in this scope
                     line_items_pydantic = []
                     if claim_db.line_items:
                         for li_db in claim_db.line_items:
-                            # Assuming ProcessableClaimLineItem.model_validate can handle the ORM object directly
-                            # or convert li_db to dict similarly if needed.
                             line_items_pydantic.append(ProcessableClaimLineItem.model_validate(li_db))
-                    claim_data_for_pydantic['line_items'] = line_items_pydantic
+                    claim_data_dict['line_items'] = line_items_pydantic
 
-                    # Create ProcessableClaim instance
-                    p_claim = ProcessableClaim(**claim_data_for_pydantic)
+                    # Create ProcessableClaim instance using the prepared dictionary
+                    p_claim = ProcessableClaim(**claim_data_dict)
                     processable_claims.append(p_claim)
 
                 except Exception as e:
@@ -237,43 +238,133 @@ class ParallelClaimsProcessor:
         logger.info(f"ML prediction application completed for {len(claims_with_features)} claims that had features.")
 
 
-    async def _transfer_claims_to_production(self, session: AsyncSession, claims: List[ProcessableClaim], metrics: Optional[Dict]=None) -> int:
-        if not claims: logger.info("No claims for transfer."); return 0
-        logger.info(f"Preparing {len(claims)} claims for production transfer.")
-        throughput = metrics.get('throughput_achieved') if metrics else None; insert_list = []
-        for claim in claims:
+    async def _transfer_claims_to_production(
+        self,
+        session: AsyncSession,
+        claims_to_transfer: List[ProcessableClaim],
+        batch_processing_metrics: Optional[Dict[str, Any]] = None
+    ) -> List[ProcessableClaim]: # Returns list of successfully transferred claims
+        """
+        Transfers processed claims to the claims_production table using a bulk insert.
+        Attempts to retry with smaller chunks if the initial bulk insert fails for a large batch.
+        """
+        if not claims_to_transfer:
+            logger.info("No claims provided for transfer to production.")
+            return []
+
+        logger.info(f"Preparing {len(claims_to_transfer)} claims for production table.")
+
+        throughput_for_batch = None
+        # Use 'processing_duration_ms' from the ProcessableClaim if available (set per claim),
+        # otherwise, try to get a batch-level one. This assumes processing_duration_ms was set on each claim.
+        # The current code in `process_claims_parallel` sets `claim.processing_duration_ms` for claims_for_transfer.
+
+        if batch_processing_metrics: # This dict is for overall batch metrics, not individual claim duration
+            try:
+                throughput_for_batch = Decimal(str(batch_processing_metrics.get('throughput_achieved', '0')))
+            except Exception:
+                logger.warn("Could not parse 'throughput_achieved' for batch, will be null in prod table.", exc_info=True)
+
+        insert_data_list = []
+        for claim in claims_to_transfer:
+            # Use individual claim's processing_duration_ms if available
+            processing_duration_ms_for_claim = int(claim.processing_duration_ms) if claim.processing_duration_ms is not None else None
+
             data = {
                 "id": claim.id, "claim_id": claim.claim_id, "facility_id": claim.facility_id,
-                "patient_account_number": claim.patient_account_number, "patient_first_name": claim.patient_first_name,
-                "patient_last_name": claim.patient_last_name, "patient_date_of_birth": claim.patient_date_of_birth,
-                "service_from_date": claim.service_from_date, "service_to_date": claim.service_to_date,
+                "patient_account_number": claim.patient_account_number,
+                "patient_first_name": claim.patient_first_name, # Assuming ProcessableClaim has these
+                "patient_last_name": claim.patient_last_name,   # Assuming ProcessableClaim has these
+                "patient_date_of_birth": claim.patient_date_of_birth, # Already date object
+                "service_from_date": claim.service_from_date,
+                "service_to_date": claim.service_to_date,
                 "total_charges": claim.total_charges,
                 "ml_prediction_score": Decimal(str(claim.ml_score)) if claim.ml_score is not None else None,
-                "processing_duration_ms": int(claim.processing_duration_ms) if claim.processing_duration_ms is not None else None,
-                "throughput_achieved": Decimal(str(throughput)) if throughput is not None else None,
+                "processing_duration_ms": processing_duration_ms_for_claim,
+                "throughput_achieved": throughput_for_batch, # Batch-level throughput
             }
-            risk_cat = "UNKNOWN" # Default risk category
-            # Ensure score is Decimal for comparison, handling None or non-Decimal types gracefully
-            score_for_risk_eval: Optional[Decimal] = None
-            if claim.ml_score is not None:
-                try: score_for_risk_eval = Decimal(str(claim.ml_score))
-                except: logger.warn("Could not convert ml_score to Decimal for risk category", value=claim.ml_score)
-
-            if score_for_risk_eval is not None:
-                if score_for_risk_eval >= Decimal("0.8"): risk_cat = "LOW"
-                elif score_for_risk_eval >= Decimal("0.5"): risk_cat = "MEDIUM"
-                else: risk_cat = "HIGH"
-            elif claim.ml_derived_decision: # Fallback to decision if score is None but decision exists
-                if "ERROR" in claim.ml_derived_decision.upper(): risk_cat = "ERROR_IN_ML"
-                elif "SKIPPED" in claim.ml_derived_decision.upper(): risk_cat = "ML_SKIPPED"
+            # Refined risk category mapping
+            risk_cat = "UNKNOWN_RISK"
+            if claim.ml_derived_decision:
+                decision_upper = claim.ml_derived_decision.upper()
+                if decision_upper == "ML_APPROVED": risk_cat = "LOW_RISK"
+                elif decision_upper == "ML_REJECTED": risk_cat = "HIGH_RISK_REJECTED" # Should not happen if only approved go here
+                elif "ERROR" in decision_upper or "SKIPPED" in decision_upper or "UNAVAILABLE" in decision_upper:
+                    risk_cat = "ML_PROCESSING_ISSUE"
+                # Fallback for other non-empty ml_derived_decision values
+                elif claim.ml_score is not None: # If decision is unknown but score exists
+                    try:
+                        score_for_risk_eval = Decimal(str(claim.ml_score))
+                        if score_for_risk_eval >= Decimal("0.8"): risk_cat = "LOW_RISK" # Thresholds might differ from approval
+                        elif score_for_risk_eval >= Decimal("0.5"): risk_cat = "MEDIUM_RISK"
+                        else: risk_cat = "HIGH_RISK"
+                    except Exception:
+                        logger.warn("Could not convert ml_score to Decimal for risk category mapping", value=claim.ml_score)
             data["risk_category"] = risk_cat
-            insert_list.append(data)
-        if not insert_list: logger.warn("No data mapped for prod transfer."); return 0
+            insert_data_list.append(data)
+
+        if not insert_data_list:
+            logger.warn("No data mapped for production transfer, though claims were provided.")
+            return []
+
         try:
-            with self.metrics_collector.time_db_query('transfer_to_production_insert'):
-                await session.execute(insert(ClaimsProductionModel).values(insert_list))
-            return len(insert_list)
-        except Exception as e: logger.error("DB error during prod insert", error=str(e), exc_info=True); return 0 # Corrected: error=str(e)
+            # Initial bulk insert attempt
+            with self.metrics_collector.time_db_query('transfer_to_production_bulk_insert'):
+                stmt = insert(ClaimsProductionModel).values(insert_data_list)
+                await session.execute(stmt)
+            logger.info(f"Successfully bulk inserted {len(insert_data_list)} claims into production table in one go.")
+            return list(claims_to_transfer) # Return all original claims as successful
+
+        except OperationalError as oe_bulk:
+            logger.warn(
+                f"Initial bulk insert of {len(claims_to_transfer)} claims failed. Error: {oe_bulk}. "
+                f"Checking if chunked retry is applicable.",
+                batch_size=len(claims_to_transfer),
+                min_for_chunking=MIN_CLAIMS_TO_ATTEMPT_CHUNKED_RETRY
+            )
+
+            if len(claims_to_transfer) >= MIN_CLAIMS_TO_ATTEMPT_CHUNKED_RETRY:
+                logger.info(f"Attempting chunked insert with chunk size {TRANSFER_CHUNK_SIZE}.")
+                successfully_transferred_claims_in_chunks: List[ProcessableClaim] = []
+
+                for i in range(0, len(claims_to_transfer), TRANSFER_CHUNK_SIZE):
+                    chunk_of_claims = claims_to_transfer[i:i + TRANSFER_CHUNK_SIZE]
+                    chunk_of_data_to_insert = insert_data_list[i:i + TRANSFER_CHUNK_SIZE]
+
+                    if not chunk_of_data_to_insert: continue
+
+                    logger.info(f"Attempting to insert chunk {i // TRANSFER_CHUNK_SIZE + 1} with {len(chunk_of_data_to_insert)} claims.")
+                    try:
+                        with self.metrics_collector.time_db_query('transfer_to_production_chunked_insert'):
+                            stmt_chunk = insert(ClaimsProductionModel).values(chunk_of_data_to_insert)
+                            await session.execute(stmt_chunk)
+                        successfully_transferred_claims_in_chunks.extend(chunk_of_claims)
+                        logger.info(f"Successfully inserted chunk {i // TRANSFER_CHUNK_SIZE + 1}.")
+                    except Exception as e_chunk:
+                        logger.error(
+                            f"Failed to insert chunk {i // TRANSFER_CHUNK_SIZE + 1} "
+                            f"({len(chunk_of_data_to_insert)} claims) into production table. Error: {e_chunk}",
+                            exc_info=True
+                        )
+
+                logger.info(f"Chunked insert process complete. Total successfully transferred in chunks: {len(successfully_transferred_claims_in_chunks)} out of {len(claims_to_transfer)}.")
+                return successfully_transferred_claims_in_chunks
+            else:
+                logger.error(
+                    f"Initial bulk insert failed, and batch size {len(claims_to_transfer)} is below threshold "
+                    f"{MIN_CLAIMS_TO_ATTEMPT_CHUNKED_RETRY} for chunked retry. All claims in this batch failed transfer.",
+                    error_details=str(oe_bulk)
+                )
+                return []
+
+        except Exception as e_other:
+            logger.error(
+                "Unexpected error during bulk insert to claims_production table.",
+                error=str(e_other),
+                num_claims_attempted=len(insert_data_list),
+                exc_info=True
+            )
+            return []
 
     async def _update_staging_claims_status(self, session: AsyncSession, ids: List[int], status: str, transferred: bool = False) -> int:
         if not ids: logger.info("No IDs for staging update."); return 0
@@ -442,25 +533,41 @@ class ParallelClaimsProcessor:
                     batch_throughput = summary["fetched_count"] / batch_duration_for_metrics
 
                 batch_metrics_for_transfer = {"throughput_achieved": Decimal(str(round(batch_throughput,2)))}
-                for claim_obj_transfer_dur_set in claims_for_transfer: # Renamed claim
+                for claim_obj_transfer_dur_set in claims_for_transfer:
                     claim_obj_transfer_dur_set.processing_duration_ms = batch_duration_for_metrics * 1000.0
 
                 if claims_for_transfer:
-                    inserted_to_prod_count = await self._transfer_claims_to_production(session, claims_for_transfer, batch_metrics_for_transfer)
-                    summary["transferred_to_prod_count"] = inserted_to_prod_count
+                    # _transfer_claims_to_production now returns a list of successfully transferred ProcessableClaim objects
+                    successfully_transferred_claims_list = await self._transfer_claims_to_production(
+                        session, claims_for_transfer, batch_metrics_for_transfer
+                    )
+                    summary["transferred_to_prod_count"] = len(successfully_transferred_claims_list)
 
-                    successfully_transferred_claims = claims_for_transfer[:inserted_to_prod_count]
-                    failed_to_transfer_claims = claims_for_transfer[inserted_to_prod_count:]
+                    if successfully_transferred_claims_list:
+                        ids_actually_transferred = [c.id for c in successfully_transferred_claims_list if c.id is not None]
+                        if ids_actually_transferred:
+                            updated_staging_transferred = await self._update_staging_claims_status(
+                                session, ids_actually_transferred, "completed_transferred", transferred=True
+                            )
+                            summary["staging_updated_transferred_count"] = updated_staging_transferred
 
-                    if successfully_transferred_claims:
-                        ids_transferred = [c.id for c in successfully_transferred_claims]
-                        updated_staging_transferred = await self._update_staging_claims_status(session, ids_transferred, "completed_transferred", transferred=True)
-                        summary["staging_updated_transferred_count"] = updated_staging_transferred
+                    # Identify claims that failed the transfer process
+                    if len(successfully_transferred_claims_list) < len(claims_for_transfer):
+                        successfully_transferred_ids = {c.id for c in successfully_transferred_claims_list}
+                        claims_that_failed_transfer = [
+                            claim for claim in claims_for_transfer if claim.id not in successfully_transferred_ids
+                        ]
+                        if claims_that_failed_transfer:
+                            logger.warn(f"{len(claims_that_failed_transfer)} claims failed the transfer stage (even after potential chunking).", batch_id=log_batch_id)
+                            for failed_transfer_claim in claims_that_failed_transfer:
+                                claims_to_route_as_failed.append(
+                                    (failed_transfer_claim, "Failed during transfer to production database.", "TRANSFER_FAILED")
+                                )
+                                claims_to_update_final_status_in_staging.append(
+                                    (failed_transfer_claim, "TRANSFER_FAILED")
+                                )
 
-                    for claim_obj_transfer_failed in failed_to_transfer_claims: # Renamed claim
-                        claims_to_route_as_failed.append((claim_obj_transfer_failed, "Failed during transfer to production step.", "TRANSFER_FAILED"))
-                        claims_to_update_final_status_in_staging.append((claim_obj_transfer_failed, "TRANSFER_FAILED"))
-
+                # This processes claims_to_update_final_status_in_staging which now includes TRANSFER_FAILED
                 if claims_to_update_final_status_in_staging:
                     updated_failed_staging_count = await self._set_final_status_for_staging_claims(session, claims_to_update_final_status_in_staging)
                     summary["staging_updated_failed_count"] = updated_failed_staging_count
