@@ -16,47 +16,51 @@ from .rvu_service import RVUService
 from ..core.cache.cache_manager import get_cache_manager
 from .ml_pipeline.feature_extractor import FeatureExtractor
 from .ml_pipeline.optimized_predictor import OptimizedPredictor
+# Import MetricsCollector instead of individual metrics
+from ..core.monitoring.app_metrics import MetricsCollector
+from ..core.database.models.failed_claims_db import FailedClaimModel # Added FailedClaimModel
 
-from ..core.monitoring.metrics import (
-    CLAIMS_PROCESSED_TOTAL,
-    CLAIM_PROCESSING_DURATION_SECONDS,
-    CLAIMS_BATCH_PROCESSING_DURATION_SECONDS,
-    CLAIMS_THROUGHPUT_LAST_BATCH,
-    ML_PREDICTIONS_TOTAL,
-    ML_PREDICTION_CONFIDENCE_SCORE
-)
 
 logger = structlog.get_logger(__name__)
 
 class ClaimProcessingService:
-    def __init__(self, db_session: AsyncSession):
+    def __init__(self, db_session: AsyncSession, metrics_collector: MetricsCollector): # Added metrics_collector
         self.db = db_session
+        self.metrics_collector = metrics_collector # Store it
         self.validator = ClaimValidator()
         cache_manager = get_cache_manager()
-        self.rvu_service = RVUService(cache_manager=cache_manager)
+        # Pass metrics_collector to RVUService
+        self.rvu_service = RVUService(cache_manager=cache_manager, metrics_collector=self.metrics_collector)
         current_settings = get_settings()
         self.concurrent_processing_semaphore = asyncio.Semaphore(current_settings.MAX_CONCURRENT_CLAIM_PROCESSING)
         self.feature_extractor = FeatureExtractor()
-        self.predictor = OptimizedPredictor(model_path=current_settings.ML_MODEL_PATH)
+        # Pass metrics_collector to OptimizedPredictor
+        self.predictor = OptimizedPredictor(
+            model_path=current_settings.ML_MODEL_PATH,
+            metrics_collector=self.metrics_collector,
+            feature_count=current_settings.ML_FEATURE_COUNT # Ensure feature_count is passed if init expects it
+        )
         logger.info("ClaimProcessingService initialized",
                     db_session_id=id(db_session),
                     cache_manager_id=id(cache_manager),
+                    metrics_collector_id=id(self.metrics_collector),
                     concurrency_limit=current_settings.MAX_CONCURRENT_CLAIM_PROCESSING,
                     ml_model_path=current_settings.ML_MODEL_PATH)
 
     async def _process_single_claim_concurrently(self, db_claim: ClaimModel) -> Dict[str, Any]:
         start_time = time.monotonic()
-        status_for_metric: str = "unknown_processing_error"
-        ml_decision_for_metric_label: str = "ML_NOT_REACHED"
-        ml_confidence_score_for_metric: float = 0.0
+        status_for_metric: str = "unknown_processing_error" # This will be the final_status for CLAIMS_PROCESSED_TOTAL
+        # ML metrics are now handled by OptimizedPredictor, so no direct calls here
+        # ml_decision_for_metric_label: str = "ML_NOT_REACHED"
+        # ml_confidence_score_for_metric: float = 0.0
         current_duration_ms: Optional[float] = None
         processable_claim_instance: Optional[ProcessableClaim] = None
 
         result_dict = {
             "db_id": db_claim.id,
-            "claim_id": db_claim.claim_id,
+            "claim_id": db_claim.claim_id, # Initial value, might be updated by ProcessableClaim
             "status": status_for_metric,
-            "ml_decision": ml_decision_for_metric_label,
+            "ml_decision": "N/A", # Default, updated after ML
             "errors": None,
             "error_detail_str": None
         }
@@ -70,20 +74,28 @@ class ClaimProcessingService:
                     result_dict["claim_id"] = processable_claim_instance.claim_id
                 except Exception as e:
                     status_for_metric = "conversion_error"
-                    logger.error("Pydantic conversion error", claim_db_id=db_claim.id, error=str(e), exc_info=True)
+                    error_reason = f"Pydantic conversion error: {str(e)}"
+                    logger.error(error_reason, claim_db_id=db_claim.id, exc_info=True)
                     current_duration_ms = (time.monotonic() - start_time) * 1000.0
+                    # Store failed claim before updating staging table
+                    await self._store_failed_claim(db_claim_to_update=db_claim, processable_claim_instance=None,
+                                                   failed_stage="CONVERSION_ERROR", reason=error_reason)
                     await self._update_claim_and_lines_in_db(db_claim, None, status_for_metric,
                                                              duration_ms=current_duration_ms,
-                                                             validation_errors=[f"Pydantic conversion error: {str(e)}"])
+                                                             validation_errors=[error_reason])
                     result_dict.update({"status": status_for_metric, "error_detail_str": str(e)})
                     return result_dict
 
                 validation_errors = self.validator.validate_claim(processable_claim_instance)
                 if validation_errors:
                     status_for_metric = "validation_failed"
+                    error_reason_val = f"Validation errors: {'; '.join(validation_errors)}"
                     logger.warn("Claim validation failed", claim_id=processable_claim_instance.claim_id, errors=validation_errors)
                     current_duration_ms = (time.monotonic() - start_time) * 1000.0
                     processable_claim_instance.processing_duration_ms = current_duration_ms
+                    # Store failed claim
+                    await self._store_failed_claim(db_claim_to_update=db_claim, processable_claim_instance=processable_claim_instance,
+                                                   failed_stage="VALIDATION", reason=error_reason_val)
                     await self._update_claim_and_lines_in_db(db_claim, processable_claim_instance, status_for_metric,
                                                              duration_ms=current_duration_ms,
                                                              validation_errors=validation_errors)
@@ -94,33 +106,45 @@ class ClaimProcessingService:
 
                 try:
                     features = self.feature_extractor.extract_features(processable_claim_instance)
-                    prediction_scores = await self.predictor.predict_async(features)
-                    if prediction_scores.ndim == 2 and prediction_scores.shape[0] > 0 and prediction_scores.shape[1] >= 2:
-                        prob_approve = prediction_scores[0][1]
-                        ml_confidence_score_for_metric = float(prob_approve)
-                        ML_PREDICTION_CONFIDENCE_SCORE.observe(ml_confidence_score_for_metric)
-                        current_settings = get_settings()
-                        if prob_approve >= current_settings.ML_APPROVAL_THRESHOLD:
-                            ml_decision_for_metric_label = "ML_APPROVED"
-                        else:
-                            ml_decision_for_metric_label = "ML_REJECTED"
+                    # OptimizedPredictor.predict_batch expects a list of features
+                    # Assuming predict_async was a typo and it should use predict_batch logic or similar
+                    # For simplicity, let's assume predict_batch is called elsewhere or this is adapted.
+                    # The key is that OptimizedPredictor itself now handles its ML metrics.
+                    # The call to self.predictor.predict_async(features) needs to be aligned with actual OptimizedPredictor method.
+                    # Let's assume it returns a dict like {'ml_score': score, 'ml_derived_decision': decision}
+                    prediction_result = await self.predictor.predict_batch([features]) # Pass as a batch of one
+
+                    ml_score = None
+                    ml_decision = "ML_ERROR" # Default if result is not as expected
+
+                    if prediction_result and isinstance(prediction_result, list) and prediction_result[0]:
+                        pred_data = prediction_result[0]
+                        ml_score = pred_data.get('ml_score')
+                        ml_decision = pred_data.get('ml_derived_decision', "ML_ERROR")
                     else:
-                        ml_decision_for_metric_label = "ML_ERROR_UNEXPECTED_FORMAT"
+                        logger.warn("Unexpected prediction result format from OptimizedPredictor", claim_id=processable_claim_instance.claim_id)
+                        ml_decision = "ML_ERROR_UNEXPECTED_FORMAT"
+
                 except Exception as ml_exc:
-                    ml_decision_for_metric_label = "ML_PROCESSING_ERROR"
+                    ml_decision = "ML_PROCESSING_ERROR"
                     logger.error("Error during ML processing step", claim_id=processable_claim_instance.claim_id, error=str(ml_exc), exc_info=True)
 
-                ML_PREDICTIONS_TOTAL.labels(ml_decision_outcome=ml_decision_for_metric_label).inc()
-                processable_claim_instance.ml_score = ml_confidence_score_for_metric
-                processable_claim_instance.ml_derived_decision = ml_decision_for_metric_label
-                result_dict["ml_decision"] = ml_decision_for_metric_label
-                log_ml_info = {"ml_decision": ml_decision_for_metric_label, "ml_score": ml_confidence_score_for_metric}
+                # ML metrics (Counter for total, Histogram for confidence) are now recorded by OptimizedPredictor's methods.
+                # We just store the results.
+                processable_claim_instance.ml_score = Decimal(str(ml_score)) if ml_score is not None else None
+                processable_claim_instance.ml_derived_decision = ml_decision
+                result_dict["ml_decision"] = ml_decision
+                log_ml_info = {"ml_decision": ml_decision, "ml_score": ml_score}
 
-                if ml_decision_for_metric_label == "ML_REJECTED":
+                if ml_decision == "ML_REJECTED":
                     status_for_metric = "ml_rejected"
-                    logger.warn("Claim rejected by ML model", claim_id=processable_claim_instance.claim_id, score=ml_confidence_score_for_metric)
+                    error_reason_ml = f"ML Rejected. Score: {ml_score}, Threshold: {get_settings().ML_APPROVAL_THRESHOLD}"
+                    logger.warn("Claim rejected by ML model", claim_id=processable_claim_instance.claim_id, score=ml_score)
                     current_duration_ms = (time.monotonic() - start_time) * 1000.0
                     processable_claim_instance.processing_duration_ms = current_duration_ms
+                    # Store failed claim
+                    await self._store_failed_claim(db_claim_to_update=db_claim, processable_claim_instance=processable_claim_instance,
+                                                   failed_stage="ML_REJECTION", reason=error_reason_ml)
                     await self._update_claim_and_lines_in_db(db_claim, processable_claim_instance, status_for_metric,
                                                              duration_ms=current_duration_ms, ml_log_info=log_ml_info)
                     result_dict["status"] = status_for_metric
@@ -128,7 +152,7 @@ class ClaimProcessingService:
 
                 try:
                     await self.rvu_service.calculate_rvu_for_claim(processable_claim_instance, self.db)
-                    status_for_metric = "processing_complete"
+                    status_for_metric = "processing_complete" # Successfully processed
                     logger.info("RVU calculation successful", claim_id=processable_claim_instance.claim_id)
                     current_duration_ms = (time.monotonic() - start_time) * 1000.0
                     processable_claim_instance.processing_duration_ms = current_duration_ms
@@ -138,12 +162,16 @@ class ClaimProcessingService:
                     return result_dict
                 except Exception as e_rvu:
                     status_for_metric = "rvu_calculation_failed"
-                    logger.error("RVU calculation failed", claim_id=processable_claim_instance.claim_id, error=str(e_rvu), exc_info=True)
+                    error_reason_rvu = f"RVU calculation error: {str(e_rvu)}"
+                    logger.error(error_reason_rvu, claim_id=processable_claim_instance.claim_id, exc_info=True)
                     current_duration_ms = (time.monotonic() - start_time) * 1000.0
                     if processable_claim_instance: processable_claim_instance.processing_duration_ms = current_duration_ms
+                    # Store failed claim
+                    await self._store_failed_claim(db_claim_to_update=db_claim, processable_claim_instance=processable_claim_instance,
+                                                   failed_stage="RVU_CALCULATION_FAILED", reason=error_reason_rvu)
                     await self._update_claim_and_lines_in_db(db_claim, processable_claim_instance, status_for_metric,
                                                              duration_ms=current_duration_ms,
-                                                             validation_errors=[f"RVU calculation error: {str(e_rvu)}"],
+                                                             validation_errors=[error_reason_rvu], # Use validation_errors to store this specific error
                                                              ml_log_info=log_ml_info)
                     result_dict.update({"status": status_for_metric, "error_detail_str": str(e_rvu)})
                     return result_dict
@@ -159,15 +187,67 @@ class ClaimProcessingService:
             raise
         finally:
             final_duration_sec = time.monotonic() - start_time
-            CLAIM_PROCESSING_DURATION_SECONDS.observe(final_duration_sec)
-            CLAIMS_PROCESSED_TOTAL.labels(final_status=status_for_metric).inc()
+            # Use MetricsCollector for individual claim duration
+            self.metrics_collector.record_individual_claim_duration(final_duration_sec)
+            # CLAIMS_PROCESSED_TOTAL is now handled by record_batch_processed at the end of a batch.
+            # We return status_for_metric from this function, and process_pending_claims_batch will aggregate.
+            # The status_for_metric at this point should be "unknown_processing_error" if this finally block is reached
+            # due to an exception within the main try block of _process_single_claim_concurrently.
+            # If it's a normal exit (successful processing), status_for_metric would be "processing_complete".
+
             # Ensure the Pydantic model has the duration if it was processed to a point where it exists
             if processable_claim_instance and processable_claim_instance.processing_duration_ms is None:
                  processable_claim_instance.processing_duration_ms = final_duration_sec * 1000.0
             # This doesn't help persist it if not already done before return. Persistence is handled before returns.
 
+    async def _store_failed_claim(
+        self,
+        db_claim_to_update: Optional[ClaimModel],
+        processable_claim_instance: Optional[ProcessableClaim],
+        failed_stage: str,
+        reason: str,
+    ):
+        logger.warn(f"Storing claim to failed_claims table. Stage: {failed_stage}, Reason: {reason}",
+                    claim_id=db_claim_to_update.claim_id if db_claim_to_update else (processable_claim_instance.claim_id if processable_claim_instance else "N/A"))
+
+        original_data_json = None
+        if processable_claim_instance:
+            original_data_json = processable_claim_instance.model_dump(mode='json')
+        elif db_claim_to_update:
+            # Basic serialization for ClaimModel if ProcessableClaim is not available (e.g. conversion error)
+            # This assumes ClaimModel attributes are directly serializable or have simple types.
+            # Adjust if complex types like relationships need specific handling.
+            original_data_json = {
+                "claim_id": db_claim_to_update.claim_id,
+                "facility_id": db_claim_to_update.facility_id,
+                "patient_account_number": db_claim_to_update.patient_account_number,
+                "total_charges": float(db_claim_to_update.total_charges) if db_claim_to_update.total_charges is not None else None,
+                # Add other relevant fields from ClaimModel
+            }
+
+        failed_claim_entry = FailedClaimModel(
+            original_claim_db_id=db_claim_to_update.id if db_claim_to_update else None,
+            claim_id=db_claim_to_update.claim_id if db_claim_to_update else (processable_claim_instance.claim_id if processable_claim_instance else None),
+            facility_id=db_claim_to_update.facility_id if db_claim_to_update else (processable_claim_instance.facility_id if processable_claim_instance else None),
+            patient_account_number=db_claim_to_update.patient_account_number if db_claim_to_update else (processable_claim_instance.patient_account_number if processable_claim_instance else None),
+            failed_at_stage=failed_stage,
+            failure_reason=reason,
+            original_claim_data=original_data_json
+        )
+
+        try:
+            self.db.add(failed_claim_entry)
+            # Note: Commit is handled by the calling function's transaction (_update_claim_and_lines_in_db or similar context)
+            logger.debug("Added FailedClaimModel instance to session.",
+                         failed_claim_id=failed_claim_entry.claim_id,
+                         original_db_id=failed_claim_entry.original_claim_db_id)
+        except Exception as e:
+            logger.error("Failed to create FailedClaimModel instance or add to session.",
+                         error=str(e), exc_info=True)
+            # Do not rollback here, let the outer transaction handle it.
+
+
     async def process_pending_claims_batch(self, batch_size: int = 100):
-        # ... (content as before, no changes here for this specific subtask) ...
         batch_start_time = time.monotonic()
         logger.info("Starting batch processing of claims with concurrency", batch_size=batch_size)
 
@@ -178,13 +258,17 @@ class ClaimProcessingService:
             summary = {
                 "message": "No pending claims to process.", "attempted_claims": 0,
                 "conversion_errors":0, "validation_failures": 0,
-                "ml_approved_raw": 0, "ml_rejected_raw": 0, "ml_errors_raw": 0,
+                "ml_approved_raw": 0, "ml_rejected_raw": 0, "ml_errors_raw": 0, # These are for info, metric is handled by predictor
                 "stopped_by_ml_rejection": 0,
                 "rvu_calculation_failures":0, "successfully_processed_count": 0,
                 "other_exceptions":0
             }
-            CLAIMS_BATCH_PROCESSING_DURATION_SECONDS.observe(time.monotonic() - batch_start_time)
-            CLAIMS_THROUGHPUT_LAST_BATCH.set(0)
+            # Use MetricsCollector for batch metrics
+            self.metrics_collector.record_batch_processed(
+                batch_size=0,
+                duration_seconds=(time.monotonic() - batch_start_time),
+                claims_by_final_status={} # No claims processed
+            )
             logger.info("Concurrent batch processing summary (no claims).", **summary)
             return summary
 
@@ -193,60 +277,78 @@ class ClaimProcessingService:
         tasks = [self._process_single_claim_concurrently(db_claim) for db_claim in fetched_db_claims]
         processing_results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Aggregate results for batch metrics
         attempted_claims = len(fetched_db_claims)
+        claims_by_final_status_for_metric: Dict[str, int] = {}
+        # Detailed counters for summary log (metrics derive from claims_by_final_status_for_metric)
         conversion_errors_count = 0
         failed_validation_count = 0
-        successfully_processed_count = 0
+        # successfully_processed_count = 0 # This will be sum from claims_by_final_status_for_metric
         failed_rvu_count = 0
+        # Raw ML counts for logging, actual ML metrics are handled by OptimizedPredictor
         ml_approved_raw_count = 0
         ml_rejected_raw_count = 0
         ml_errors_raw_count = 0
-        stopped_by_ml_rejection_count = 0
+        stopped_by_ml_rejection_count = 0 # This is a final status
         other_exceptions_count = 0
+
 
         for result in processing_results:
             if isinstance(result, Exception):
                 logger.error("Task failed with unhandled exception in asyncio.gather results", exception_type=type(result).__name__, error_detail=str(result))
                 other_exceptions_count +=1
+                # Increment a specific status for CLAIMS_PROCESSED_TOTAL via claims_by_final_status_for_metric
+                claims_by_final_status_for_metric["unhandled_exception_in_gather"] = \
+                    claims_by_final_status_for_metric.get("unhandled_exception_in_gather", 0) + 1
             elif isinstance(result, dict):
-                status = result.get("status")
-                ml_decision_from_result = result.get("ml_decision", "N/A")
+                status = result.get("status", "unknown_processing_error") # Default if status missing
+                claims_by_final_status_for_metric[status] = \
+                    claims_by_final_status_for_metric.get(status, 0) + 1
 
+                # Update detailed counters for logging summary
+                ml_decision_from_result = result.get("ml_decision", "N/A")
                 if ml_decision_from_result == "ML_APPROVED": ml_approved_raw_count += 1
                 elif ml_decision_from_result == "ML_REJECTED": ml_rejected_raw_count += 1
                 elif ml_decision_from_result.startswith("ML_ERROR") or ml_decision_from_result == "ML_PROCESSING_ERROR": ml_errors_raw_count +=1
 
                 if status == "conversion_error": conversion_errors_count +=1
                 elif status == "validation_failed": failed_validation_count += 1
-                elif status == "ml_rejected": stopped_by_ml_rejection_count += 1
+                # Note: "ml_rejected" status is counted by claims_by_final_status_for_metric
+                # if status == "ml_rejected": stopped_by_ml_rejection_count += 1 # This is now part of claims_by_final_status_for_metric
                 elif status == "rvu_calculation_failed": failed_rvu_count +=1
-                elif status == "processing_complete": successfully_processed_count += 1
+                # if status == "processing_complete": successfully_processed_count += 1 # Also from claims_by_final_status_for_metric
 
         batch_duration_seconds = time.monotonic() - batch_start_time
-        CLAIMS_BATCH_PROCESSING_DURATION_SECONDS.observe(batch_duration_seconds)
 
-        if batch_duration_seconds > 0:
-            throughput = successfully_processed_count / batch_duration_seconds
-            CLAIMS_THROUGHPUT_LAST_BATCH.set(throughput)
-        else:
-            CLAIMS_THROUGHPUT_LAST_BATCH.set(0)
+        # Use MetricsCollector for batch metrics
+        self.metrics_collector.record_batch_processed(
+            batch_size=attempted_claims,
+            duration_seconds=batch_duration_seconds,
+            claims_by_final_status=claims_by_final_status_for_metric
+        )
+
+        # For logging summary, retrieve some counts from the aggregated map
+        successfully_processed_count = claims_by_final_status_for_metric.get('processing_complete', 0)
+        stopped_by_ml_rejection_count = claims_by_final_status_for_metric.get('ml_rejected',0)
+
 
         final_summary = {
             "message": "Concurrent batch processing finished.",
             "attempted_claims": attempted_claims,
-            "conversion_errors": conversion_errors_count,
-            "validation_failures": failed_validation_count,
-            "ml_approved_raw": ml_approved_raw_count,
-            "ml_rejected_raw": ml_rejected_raw_count,
-            "ml_errors_raw": ml_errors_raw_count,
-            "stopped_by_ml_rejection": stopped_by_ml_rejection_count,
-            "rvu_calculation_failures": failed_rvu_count,
-            "successfully_processed_count": successfully_processed_count,
-            "other_exceptions" : other_exceptions_count,
+            "conversion_errors": claims_by_final_status_for_metric.get('conversion_error',0), # From map
+            "validation_failures": claims_by_final_status_for_metric.get('validation_failed',0), # From map
+            "ml_approved_raw": ml_approved_raw_count, # Informational from ML results
+            "ml_rejected_raw": ml_rejected_raw_count, # Informational from ML results
+            "ml_errors_raw": ml_errors_raw_count,     # Informational from ML results
+            "stopped_by_ml_rejection": stopped_by_ml_rejection_count, # From map
+            "rvu_calculation_failures": claims_by_final_status_for_metric.get('rvu_calculation_failed',0), # From map
+            "successfully_processed_count": successfully_processed_count, # From map
+            "other_exceptions" : claims_by_final_status_for_metric.get('unhandled_exception_in_gather',0) + \
+                                 claims_by_final_status_for_metric.get('unknown_processing_error',0), # From map
             "batch_duration_seconds": round(batch_duration_seconds, 2),
-            "throughput_claims_per_second": CLAIMS_THROUGHPUT_LAST_BATCH._value.get()
+            "throughput_claims_per_second": CLAIMS_THROUGHPUT_GAUGE._value.get() # Read from global metric
         }
-        logger.info("Concurrent batch processing summary.", **final_summary)
+        logger.info("Concurrent batch processing summary.", **final_summary) # type: ignore
 
         return final_summary
 

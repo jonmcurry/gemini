@@ -1,12 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks # Added Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from typing import Optional # Added for type hinting
+from typing import Optional, Callable # Added Callable
+from fastapi import Query # Added Query
 
-from ..models.claim_models import ClaimCreate, ClaimResponse
-from ...core.database.db_session import get_db_session, AsyncSessionLocal # Added AsyncSessionLocal
+from ..models.claim_models import ClaimCreate, ClaimResponse, BatchProcessResponse # Added BatchProcessResponse
+from ...core.database.db_session import get_db_session, AsyncSessionLocal
 from ...core.database.models.claims_db import ClaimModel
-from ...core.security.audit_logger_service import AuditLoggerService # Import AuditLoggerService
+from ...core.security.audit_logger_service import AuditLoggerService # This is the old one, might need to switch to new AuditLogger if scope includes it
+from ...core.monitoring.audit_logger import AuditLogger as NewAuditLogger # New one
+from ..dependencies import get_audit_logger as get_new_audit_logger # Dependency for new one
+from ...core.monitoring.app_metrics import MetricsCollector # Import MetricsCollector
+from ..dependencies import get_metrics_collector # Dependency for MetricsCollector
 from ...processing.claims_processing_service import ClaimProcessingService
 import structlog
 
@@ -117,10 +122,7 @@ async def run_batch_processing_background(batch_size: int, client_ip: Optional[s
         except Exception as e:
             logger.error("Error in background batch processing task execution", error=str(e), exc_info=True, batch_size=batch_size)
             try:
-                # Ensure session for audit logging error is still valid or create new
-                # If the session failed, this might also fail.
-                # A truly robust audit for task failure might need to ensure it can write independently.
-                await audit_service_bg.log_event( # Reusing session; if session is bad, this might fail.
+        await audit_service_bg.log_event(
                     action="PROCESS_BATCH_CLAIMS_TASK_FAILED", success=False,
                     resource="ClaimBatchInternal", resource_id=f"batch_size_{batch_size}",
                     user_id="background_system", ip_address=client_ip, user_agent=user_agent_header,
@@ -130,28 +132,82 @@ async def run_batch_processing_background(batch_size: int, client_ip: Optional[s
             except Exception as audit_err_e:
                  logger.error("Critical: Failed to log batch processing task failure audit event", error=str(audit_err_e), exc_info=True)
 
-@router.post("/process-batch/", summary="Trigger Batch Processing of Claims (Background)")
-async def trigger_batch_processing_background(
+# Updated helper function for background task to accept MetricsCollector
+async def run_batch_processing_background(
+    batch_size: int,
+    client_ip: Optional[str],
+    user_agent_header: Optional[str],
+    metrics_collector_instance: MetricsCollector, # Added MetricsCollector instance
+    # new_audit_logger_instance: NewAuditLogger # If new audit logger is to be used here
+):
+    logger.info("Background task started: run_batch_processing_background", batch_size=batch_size, client_ip=client_ip)
+
+    async with AsyncSessionLocal() as session: # For ClaimProcessingService and old AuditLoggerService
+        # old_audit_service_bg = AuditLoggerService(db_session=session) # Keep old for now if not migrating this part
+        # If migrating audit here, use new_audit_logger_instance passed in.
+
+        try:
+            # Example of logging with old audit service, adjust if migrating
+            # await old_audit_service_bg.log_event(
+            #     action="PROCESS_BATCH_CLAIMS_TASK_STARTED", success=True,
+            #     resource="ClaimBatchInternal", resource_id=f"batch_size_{batch_size}",
+            #     user_id="background_system", ip_address=client_ip, user_agent=user_agent_header,
+            #     details={"message": "Background processing service initiated."}
+            # )
+
+            # Pass metrics_collector to ClaimProcessingService
+            service = ClaimProcessingService(db_session=session, metrics_collector=metrics_collector_instance)
+            result = await service.process_pending_claims_batch(batch_size=batch_size)
+            logger.info("Background task processing finished by service", batch_size=batch_size, result=result)
+
+            # await old_audit_service_bg.log_event(
+            #     action="PROCESS_BATCH_CLAIMS_TASK_COMPLETED", success=True,
+            #     resource="ClaimBatchInternal", resource_id=f"batch_size_{batch_size}",
+            #     user_id="background_system", ip_address=client_ip, user_agent=user_agent_header,
+            #     details=result
+            # )
+        except Exception as e:
+            logger.error("Error in background batch processing task execution", error=str(e), exc_info=True, batch_size=batch_size)
+            # try:
+            #     await old_audit_service_bg.log_event(
+            #         action="PROCESS_BATCH_CLAIMS_TASK_FAILED", success=False,
+            #         resource="ClaimBatchInternal", resource_id=f"batch_size_{batch_size}",
+            #         user_id="background_system", ip_address=client_ip, user_agent=user_agent_header,
+            #         failure_reason=f"Background task error: {str(e)}",
+            #         details={"message": "Background processing service failed during execution."}
+            #     )
+            # except Exception as audit_err_e:
+            #      logger.error("Critical: Failed to log batch processing task failure audit event", error=str(audit_err_e), exc_info=True)
+
+
+@router.post("/process-batch/", summary="Trigger Batch Processing of Claims (Background)", response_model=BatchProcessResponse)
+async def trigger_batch_processing_background_endpoint( # Renamed for clarity
     request: Request,
     background_tasks: BackgroundTasks,
-    batch_size: int = 100
+    batch_size: int = Query(100, gt=0, le=10000), # Added Query for validation
+    metrics: MetricsCollector = Depends(get_metrics_collector), # Inject MetricsCollector
+    # audit: NewAuditLogger = Depends(get_new_audit_logger) # Inject new AuditLogger if to be used here
+    # old_audit_service: AuditLoggerService = Depends(temp_get_audit_logger_service) # Example if using old one for this endpoint's direct log
 ):
     client_ip = request.client.host if request.client else None
     user_agent_header = request.headers.get("user-agent")
     logger.info(f"Received request to trigger batch processing in background.", batch_size=batch_size, client_ip=client_ip)
 
-    async with AsyncSessionLocal() as audit_db_session:
-        audit_service_trigger = AuditLoggerService(db_session=audit_db_session)
-        try:
-            await audit_service_trigger.log_event(
-                action="TRIGGER_BATCH_PROCESSING", success=True, resource="ClaimBatchTrigger",
-                ip_address=client_ip, user_agent=user_agent_header,
-                details={"requested_batch_size": batch_size}
-            )
-        except Exception as audit_exc:
-            logger.error("Failed to log audit event for batch trigger action", error=str(audit_exc), exc_info=True)
+    # Example of using old audit logger for the trigger event itself.
+    # This part of audit logging can be migrated to NewAuditLogger if desired.
+    # async with AsyncSessionLocal() as audit_db_session:
+    #     audit_service_trigger = AuditLoggerService(db_session=audit_db_session) # Old service
+    #     try:
+    #         await audit_service_trigger.log_event(
+    #             action="TRIGGER_BATCH_PROCESSING", success=True, resource="ClaimBatchTrigger",
+    #             ip_address=client_ip, user_agent=user_agent_header,
+    #             details={"requested_batch_size": batch_size}
+    #         )
+    #     except Exception as audit_exc:
+    #         logger.error("Failed to log audit event for batch trigger action", error=str(audit_exc), exc_info=True)
 
-    background_tasks.add_task(run_batch_processing_background, batch_size, client_ip, user_agent_header)
+    # Pass the obtained MetricsCollector instance to the background task
+    background_tasks.add_task(run_batch_processing_background, batch_size, client_ip, user_agent_header, metrics)
 
     logger.info("Batch processing task added to background.", batch_size=batch_size)
-    return {"message": "Batch processing started in the background.", "batch_size": batch_size}
+    return BatchProcessResponse(message="Batch processing started in the background.", batch_size=batch_size)
