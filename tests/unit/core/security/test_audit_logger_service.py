@@ -1,8 +1,9 @@
 import pytest
-from unittest.mock import AsyncMock, MagicMock # Removed unused patch
+from unittest.mock import AsyncMock, MagicMock
 from typing import Any, Callable, Tuple
+import hashlib # Added
 
-from sqlalchemy.ext.asyncio import AsyncSession # For type hinting
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from claims_processor.src.core.security.audit_logger_service import AuditLoggerService
 from claims_processor.src.core.database.models.audit_log_db import AuditLogModel
@@ -65,7 +66,11 @@ async def test_log_event_success(audit_logger_service: AuditLoggerService, mock_
     assert added_log_entry.resource == "TestResource"
     assert added_log_entry.resource_id == "res_123"
     assert added_log_entry.user_id == "test_user"
-    assert added_log_entry.patient_id_hash == "hashed_patient_abc" # Based on placeholder hashing
+
+    test_patient_id_val = "patient_abc" # The value passed in the call
+    expected_hash = hashlib.sha256(test_patient_id_val.encode('utf-8')).hexdigest()
+    assert added_log_entry.patient_id_hash == expected_hash
+
     assert added_log_entry.details == {"key": "value"}
     assert added_log_entry.ip_address == "127.0.0.1"
     assert added_log_entry.user_agent == "TestAgent/1.0"
@@ -137,21 +142,7 @@ async def test_log_event_default_user_id(audit_logger_service: AuditLoggerServic
     added_log_entry = mock_session.add.call_args[0][0]
     assert added_log_entry.user_id == "system"
 
-@pytest.mark.asyncio
-async def test_log_event_patient_id_hashing_long_id(audit_logger_service: AuditLoggerService, mock_db_session_factory: Tuple[MagicMock, AsyncMock]):
-    factory_mock, mock_session = mock_db_session_factory
-    long_patient_id = "A" * 250
-    expected_hashed_id_prefix = "hashed_A"
-
-    await audit_logger_service.log_event(action="HASH_TEST_LONG", success=True, patient_id_to_hash=long_patient_id)
-
-    mock_session.add.assert_called_once()
-    added_log_entry = mock_session.add.call_args[0][0]
-    assert added_log_entry.patient_id_hash.startswith(expected_hashed_id_prefix)
-    # The placeholder hash truncates at 200 for the original ID part before adding "hashed_"
-    # So, the hashed part should be "hashed_" + "A"*200
-    assert added_log_entry.patient_id_hash == f"hashed_{'A'*200}"
-
+# Removed test_log_event_patient_id_hashing_long_id as SHA256 is fixed length output, no truncation.
 
 @pytest.mark.asyncio
 async def test_log_event_patient_id_hashing_none(audit_logger_service: AuditLoggerService, mock_db_session_factory: Tuple[MagicMock, AsyncMock]):

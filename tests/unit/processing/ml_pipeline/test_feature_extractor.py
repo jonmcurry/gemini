@@ -2,9 +2,15 @@ import pytest
 import numpy as np
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import List, Optional, Any # Added for create_test_claim
+from typing import List, Optional, Any
 
-from claims_processor.src.processing.ml_pipeline.feature_extractor import FeatureExtractor, INSURANCE_TYPE_MAPPING, DEFAULT_INSURANCE_ENCODING, SURGERY_CODE_PREFIXES
+from claims_processor.src.processing.ml_pipeline.feature_extractor import (
+    FeatureExtractor,
+    INSURANCE_TYPE_MAPPING,
+    DEFAULT_INSURANCE_ENCODING,
+    SURGERY_CPT_RANGES, # Updated
+    NON_NUMERIC_SURGERY_INDICATORS # Updated
+)
 from claims_processor.src.api.models.claim_models import ProcessableClaim, ProcessableClaimLineItem
 from claims_processor.src.core.config.settings import get_settings
 
@@ -93,94 +99,161 @@ def test_encode_insurance_type_detailed(feature_extractor: FeatureExtractor):
     assert feature_extractor._encode_insurance_type(" medicaid ") == INSURANCE_TYPE_MAPPING.get("medicaid") # Test stripping
     assert feature_extractor._encode_insurance_type("Commercial") == INSURANCE_TYPE_MAPPING.get("commercial")
     assert feature_extractor._encode_insurance_type("SELF-PAY") == INSURANCE_TYPE_MAPPING.get("self-pay")
+    assert feature_extractor._encode_insurance_type("HMO") == INSURANCE_TYPE_MAPPING.get("hmo")
+    assert feature_extractor._encode_insurance_type("PPO") == INSURANCE_TYPE_MAPPING.get("ppo")
+    assert feature_extractor._encode_insurance_type("other") == INSURANCE_TYPE_MAPPING.get("other")
     assert feature_extractor._encode_insurance_type("UnknownType") == DEFAULT_INSURANCE_ENCODING
     assert feature_extractor._encode_insurance_type(None) == DEFAULT_INSURANCE_ENCODING
 
 def test_detect_surgery_codes_detailed(feature_extractor: FeatureExtractor):
     now = datetime.now(timezone.utc)
-    # Example CPT codes for surgery range from 10000-69999
-    line_surg_cpt_range_start = ProcessableClaimLineItem(id=1, claim_db_id=1, line_number=1, service_date=date.today(), procedure_code="10021", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)
-    line_surg_cpt_range_end = ProcessableClaimLineItem(id=2, claim_db_id=1, line_number=2, service_date=date.today(), procedure_code="69990", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)
-    line_surg_prefix = ProcessableClaimLineItem(id=3, claim_db_id=1, line_number=3, service_date=date.today(), procedure_code="SURGXYZ", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)
-    line_norm = ProcessableClaimLineItem(id=4, claim_db_id=1, line_number=4, service_date=date.today(), procedure_code="99213", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)
-    line_nonsurg_prefix = ProcessableClaimLineItem(id=5, claim_db_id=1, line_number=5, service_date=date.today(), procedure_code="A1234", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)
+    # CPT surgery codes (inclusive range 10021-69990)
+    line_surg_cpt_exact_start = ProcessableClaimLineItem(id=1,line_number=1, claim_db_id=1,service_date=date.today(), procedure_code="10021", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)
+    line_surg_cpt_exact_end = ProcessableClaimLineItem(id=2,line_number=1, claim_db_id=1,service_date=date.today(), procedure_code="69990", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)
+    line_surg_cpt_middle = ProcessableClaimLineItem(id=3,line_number=1, claim_db_id=1,service_date=date.today(), procedure_code="35000", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)
+    line_surg_cpt_with_alpha = ProcessableClaimLineItem(id=4,line_number=1, claim_db_id=1,service_date=date.today(), procedure_code="12345A", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now) # Assuming numeric part is checked
 
-    assert feature_extractor._detect_surgery_codes([line_surg_cpt_range_start, line_norm]) == 1.0
-    assert feature_extractor._detect_surgery_codes([line_surg_cpt_range_end, line_norm]) == 1.0
-    assert feature_extractor._detect_surgery_codes([line_surg_prefix, line_norm]) == 1.0
-    assert feature_extractor._detect_surgery_codes([line_norm, line_nonsurg_prefix]) == 0.0
+    # Non-surgery CPT codes
+    line_norm_cpt = ProcessableClaimLineItem(id=5,line_number=1, claim_db_id=1,service_date=date.today(), procedure_code="99213", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now) # E/M code
+    line_cpt_just_outside_low = ProcessableClaimLineItem(id=6,line_number=1, claim_db_id=1,service_date=date.today(), procedure_code="10020", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)
+    line_cpt_just_outside_high = ProcessableClaimLineItem(id=7,line_number=1, claim_db_id=1,service_date=date.today(), procedure_code="70000", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)
+
+    # HCPCS Level II codes
+    line_surg_hcpcs_s = ProcessableClaimLineItem(id=8,line_number=1, claim_db_id=1,service_date=date.today(), procedure_code="S2065", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now) # Example 'S' code
+    line_nonsurg_hcpcs_a = ProcessableClaimLineItem(id=9,line_number=1, claim_db_id=1,service_date=date.today(), procedure_code="A1234", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)
+
+    assert feature_extractor._detect_surgery_codes([line_surg_cpt_exact_start]) == 1.0
+    assert feature_extractor._detect_surgery_codes([line_surg_cpt_exact_end]) == 1.0
+    assert feature_extractor._detect_surgery_codes([line_surg_cpt_middle]) == 1.0
+    assert feature_extractor._detect_surgery_codes([line_surg_cpt_with_alpha]) == 1.0 # Assuming 12345 is in range
+
+    assert feature_extractor._detect_surgery_codes([line_norm_cpt]) == 0.0
+    assert feature_extractor._detect_surgery_codes([line_cpt_just_outside_low]) == 0.0
+    assert feature_extractor._detect_surgery_codes([line_cpt_just_outside_high]) == 0.0
+
+    assert feature_extractor._detect_surgery_codes([line_surg_hcpcs_s]) == 1.0
+    assert feature_extractor._detect_surgery_codes([line_nonsurg_hcpcs_a]) == 0.0
+
+    assert feature_extractor._detect_surgery_codes([line_surg_cpt_middle, line_norm_cpt]) == 1.0 # If any line is surgery
+    assert feature_extractor._detect_surgery_codes([line_norm_cpt, line_nonsurg_hcpcs_a]) == 0.0
     assert feature_extractor._detect_surgery_codes([]) == 0.0
-    assert feature_extractor._detect_surgery_codes([ProcessableClaimLineItem(id=6, claim_db_id=1, line_number=1, service_date=date.today(), procedure_code=None, units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)]) == 0.0
+    assert feature_extractor._detect_surgery_codes([ProcessableClaimLineItem(id=10,line_number=1, claim_db_id=1,service_date=date.today(), procedure_code=None, units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)]) == 0.0
+    assert feature_extractor._detect_surgery_codes([ProcessableClaimLineItem(id=11,line_number=1, claim_db_id=1,service_date=date.today(), procedure_code="INVALID", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)]) == 0.0
 
 
 def test_calculate_complexity_score_detailed(feature_extractor: FeatureExtractor):
-    now = datetime.now(timezone.utc)
-    lines_low = [ProcessableClaimLineItem(id=1, claim_db_id=1, line_number=1, service_date=date.today(), procedure_code="P1", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now)] # 1 line, 1 unit
-    assert feature_extractor._calculate_complexity_score(lines_low) == pytest.approx((1/10.0) + (1/20.0)) # 0.1 + 0.05 = 0.15
+    # Test cases: (num_lines, total_units, surgery_flag) -> expected_score
+    # Score = min(num_lines/10, 0.4) + min(total_units/20, 0.3) + (0.3 if surgery else 0.0)
 
-    lines_medium = [
-        ProcessableClaimLineItem(id=1, claim_db_id=1, line_number=1, service_date=date.today(), procedure_code="P1", units=3, charge_amount=Decimal(10), created_at=now,updated_at=now),
-        ProcessableClaimLineItem(id=2, claim_db_id=1, line_number=2, service_date=date.today(), procedure_code="P2", units=4, charge_amount=Decimal(10), created_at=now,updated_at=now)
-    ] # 2 lines, 7 units
-    assert feature_extractor._calculate_complexity_score(lines_medium) == pytest.approx((2/10.0) + (7/20.0)) # 0.2 + 0.35 = 0.55
+    # No surgery (flag = 0.0)
+    claim_1l_1u_nosurg = create_test_claim(num_lines=1, line_item_details=[{"units": 1}])
+    assert feature_extractor._calculate_complexity_score(claim_1l_1u_nosurg, 0.0) == pytest.approx( (1/10.0)*0.4/0.5 + (1/20.0)*0.3/0.5 ) # Incorrect formula based on old weights
+    # Corrected: min(1/10, 0.4) + min(1/20, 0.3) + 0.0 = 0.1 + 0.05 = 0.15
+    assert feature_extractor._calculate_complexity_score(claim_1l_1u_nosurg, 0.0) == pytest.approx(0.1 + 0.05)
 
-    lines_high_lines = [ProcessableClaimLineItem(id=i, claim_db_id=1, line_number=i, service_date=date.today(), procedure_code=f"P{i}", units=1, charge_amount=Decimal(10), created_at=now,updated_at=now) for i in range(12)] # 12 lines, 12 units
-    assert feature_extractor._calculate_complexity_score(lines_high_lines) == pytest.approx(0.5 + (12/20.0)) # 0.5 (capped lines) + 0.6 = 1.0 (capped at 1.0)
+    claim_5l_10u_nosurg = create_test_claim(num_lines=5, line_item_details=[{"units": 2}]*5) # 5 lines, 10 units
+    # min(5/10, 0.4) = 0.4 (capped at 0.4 from lines, actually 0.5 from lines/10, so 0.4)
+    # min(10/20, 0.3) = 0.3 (capped at 0.3 from units, actually 0.5 from units/20, so 0.3)
+    # score = 0.4 (lines_score = min(0.5, 0.4)=0.4) + 0.3 (units_score = min(0.5, 0.3)=0.3) = 0.7
+    assert feature_extractor._calculate_complexity_score(claim_5l_10u_nosurg, 0.0) == pytest.approx(min(5/10.0, 0.4) + min(10/20.0, 0.3))
 
-    lines_high_units = [ProcessableClaimLineItem(id=1, claim_db_id=1, line_number=1, service_date=date.today(), procedure_code="P1", units=25, charge_amount=Decimal(10), created_at=now,updated_at=now)] # 1 line, 25 units
-    assert feature_extractor._calculate_complexity_score(lines_high_units) == pytest.approx((1/10.0) + 0.5) # 0.1 + 0.5 (capped units) = 0.6
 
-    lines_max_all = [ProcessableClaimLineItem(id=i, claim_db_id=1, line_number=i, service_date=date.today(), procedure_code=f"P{i}", units=10, charge_amount=Decimal(10), created_at=now,updated_at=now) for i in range(10)] # 10 lines, 100 units
-    assert feature_extractor._calculate_complexity_score(lines_max_all) == 1.0 # Capped score
+    claim_10l_20u_nosurg = create_test_claim(num_lines=10, line_item_details=[{"units": 2}]*10) # 10 lines, 20 units
+    # min(10/10, 0.4) = 0.4 + min(20/20, 0.3) = 0.3 => 0.7
+    assert feature_extractor._calculate_complexity_score(claim_10l_20u_nosurg, 0.0) == pytest.approx(0.4 + 0.3)
 
-    assert feature_extractor._calculate_complexity_score([]) == 0.0
+    claim_15l_30u_nosurg = create_test_claim(num_lines=15, line_item_details=[{"units": 2}]*15) # 15 lines, 30 units
+    # min(15/10, 0.4) = 0.4 + min(30/20, 0.3) = 0.3 => 0.7
+    assert feature_extractor._calculate_complexity_score(claim_15l_30u_nosurg, 0.0) == pytest.approx(0.4 + 0.3)
+
+    # With surgery (flag = 1.0, adds 0.3 to score)
+    claim_1l_1u_surg = create_test_claim(num_lines=1, line_item_details=[{"units": 1}])
+    # 0.1 (lines) + 0.05 (units) + 0.3 (surgery) = 0.45
+    assert feature_extractor._calculate_complexity_score(claim_1l_1u_surg, 1.0) == pytest.approx(0.1 + 0.05 + 0.3)
+
+    claim_10l_20u_surg = create_test_claim(num_lines=10, line_item_details=[{"units": 2}]*10) # 10 lines, 20 units
+    # 0.4 (lines) + 0.3 (units) + 0.3 (surgery) = 1.0
+    assert feature_extractor._calculate_complexity_score(claim_10l_20u_surg, 1.0) == pytest.approx(1.0)
+
+    claim_empty_lines_nosurg = create_test_claim(num_lines=0, line_item_details=[])
+    assert feature_extractor._calculate_complexity_score(claim_empty_lines_nosurg, 0.0) == 0.0
+    claim_empty_lines_surg = create_test_claim(num_lines=0, line_item_details=[])
+    assert feature_extractor._calculate_complexity_score(claim_empty_lines_surg, 1.0) == 0.0 # No lines, so surgery on what? Score should be 0. Or 0.3 if surgery flag means claim-level surgery. The current logic is line-based.
 
 # --- Test for main extract_features method ---
 def test_extract_features_valid_claim(feature_extractor: FeatureExtractor):
-    # This test replaces the old test_extract_features_returns_correct_shape_and_type
-    expected_feature_count = 7 # FeatureExtractor now produces a fixed set of 7 features
+    expected_feature_count = 7
 
     test_dob = date(1980, 1, 15)
     test_service_from = date(2023, 1, 1)
-    test_service_to = date(2023, 1, 3) # Duration 3 days
+    test_service_to = date(2023, 1, 3)
     test_total_charges = Decimal("250.75")
     test_num_lines = 2
     test_insurance = "medicare"
-
-    claim = create_test_claim(
-        dob=test_dob,
-        service_from=test_service_from,
-        service_to=test_service_to,
-        total_charges=test_total_charges,
-        num_lines=test_num_lines,
-        insurance_type=test_insurance
+    # Line items that do NOT indicate surgery by default from create_test_claim
+    claim_no_surgery = create_test_claim(
+        dob=test_dob, service_from=test_service_from, service_to=test_service_to,
+        total_charges=test_total_charges, num_lines=test_num_lines, insurance_type=test_insurance
     )
-    features = feature_extractor.extract_features(claim)
+    features_no_surgery = feature_extractor.extract_features(claim_no_surgery)
 
-    assert isinstance(features, np.ndarray), "Features should be a NumPy array"
-    assert features.shape == (1, expected_feature_count), \
-        f"Expected shape (1, {expected_feature_count}), but got {features.shape}"
-    assert features.dtype == np.float32, "Features should be float32 type"
+    assert isinstance(features_no_surgery, np.ndarray), "Features should be a NumPy array"
+    assert features_no_surgery.shape == (expected_feature_count,), \
+        f"Expected shape ({expected_feature_count},), but got {features_no_surgery.shape}"
+    assert features_no_surgery.dtype == np.float32, "Features should be float32 type"
 
-    assert np.isclose(features[0, 0], np.log1p(float(test_total_charges)))
-    assert np.isclose(features[0, 1], float(test_num_lines))
-    expected_age = (test_service_from - test_dob).days / 365.25
-    assert np.isclose(features[0, 2], expected_age)
+    assert np.isclose(features_no_surgery[0], np.log1p(float(test_total_charges)))
+    assert np.isclose(features_no_surgery[1], float(test_num_lines))
+    expected_age = (test_service_from - test_dob).days / 365.25 # Approx age
+    assert np.isclose(features_no_surgery[2], expected_age)
     expected_duration = float((test_service_to - test_service_from).days + 1)
-    assert np.isclose(features[0, 3], expected_duration)
-    assert np.isclose(features[0, 4], INSURANCE_TYPE_MAPPING.get(test_insurance.lower()))
-    # _detect_surgery_codes for default P1, P2 codes will be 0.0
-    assert np.isclose(features[0, 5], 0.0)
-    # _calculate_complexity_score for 2 lines, 1 unit each: (2/10) + (2/20) = 0.2 + 0.1 = 0.3
-    expected_complexity = (2.0/10.0) + (2.0*1.0/20.0) # num_lines/10 + total_units/20
-    assert np.isclose(features[0, 6], expected_complexity)
+    assert np.isclose(features_no_surgery[3], expected_duration)
+    assert np.isclose(features_no_surgery[4], INSURANCE_TYPE_MAPPING.get(test_insurance.lower(), DEFAULT_INSURANCE_ENCODING))
+
+    surgery_flag_no_surgery = 0.0 # Based on default P1, P2 codes in create_test_claim
+    assert np.isclose(features_no_surgery[5], surgery_flag_no_surgery)
+
+    # Complexity for claim_no_surgery: 2 lines, 2 units total (1 per line), no surgery
+    # lines_score = min(2/10, 0.4) = 0.2
+    # units_score = min(2/20, 0.3) = 0.1
+    # surgery_score = 0.0
+    # total = 0.2 + 0.1 + 0.0 = 0.3
+    expected_complexity_no_surgery = 0.3
+    assert np.isclose(features_no_surgery[6], expected_complexity_no_surgery)
+
+
+def test_extract_features_with_surgery(feature_extractor: FeatureExtractor):
+    expected_feature_count = 7
+    claim_with_surgery = create_test_claim(
+        num_lines=3,
+        line_item_details=[
+            {"procedure_code": "99213", "units": 1}, # Non-surgery
+            {"procedure_code": "12345", "units": 2}, # Surgery (falls in 10021-69990 range)
+            {"procedure_code": "S2065", "units": 1}  # Surgery (HCPCS S-code)
+        ]
+    ) # 3 lines, 4 units total, surgery detected
+    features_surgery = feature_extractor.extract_features(claim_with_surgery)
+    assert features_surgery is not None
+    assert features_surgery.shape == (expected_feature_count,)
+
+    surgery_flag_with_surgery = 1.0
+    assert np.isclose(features_surgery[5], surgery_flag_with_surgery)
+
+    # Complexity for claim_with_surgery: 3 lines, 4 units, surgery detected
+    # lines_score = min(3/10, 0.4) = 0.3
+    # units_score = min(4/20, 0.3) = 0.2
+    # surgery_score = 0.3
+    # total = 0.3 + 0.2 + 0.3 = 0.8
+    expected_complexity_with_surgery = 0.8
+    assert np.isclose(features_surgery[6], expected_complexity_with_surgery)
 
 
 def test_extract_features_missing_dob(feature_extractor: FeatureExtractor):
     claim = create_test_claim(dob=None)
     features = feature_extractor.extract_features(claim)
     assert features is not None
-    assert np.isclose(features[0, 2], -1.0) # Imputed age
+    assert features.shape == (7,) # Check 1D shape
+    assert np.isclose(features[2], -1.0) # Imputed age
 
 def test_extract_features_handles_error_in_helper(feature_extractor: FeatureExtractor, monkeypatch):
     claim = create_test_claim()

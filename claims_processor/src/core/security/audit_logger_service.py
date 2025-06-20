@@ -1,7 +1,8 @@
 import structlog
 from typing import Optional, Dict, Any, Callable
 from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import datetime # Not strictly needed if AuditLogModel uses server_default for timestamp
+# from datetime import datetime # Not strictly needed if AuditLogModel uses server_default for timestamp
+import hashlib # Added for SHA-256 hashing
 
 # Assuming AuditLogModel is correctly imported
 from ..database.models.audit_log_db import AuditLogModel
@@ -67,13 +68,16 @@ class AuditLoggerService:
         """
 
         # Placeholder for hashing patient_id. In a real system, use a consistent, secure hash.
-        # For now, just appending '_hashed' or storing as is if no real hashing mechanism.
-        # REQUIREMENTS.md: self._hash_patient_id(patient_id)
-        # Let's just use a simple prefix for now.
-        hashed_patient_id = f"hashed_{patient_id_to_hash}" if patient_id_to_hash else None
-        if patient_id_to_hash and len(patient_id_to_hash) > 200 : # Avoid overly long pseudo-hash
-             hashed_patient_id = f"hashed_{patient_id_to_hash[:200]}"
-
+        hashed_patient_id = None
+        if patient_id_to_hash:
+            # Using direct SHA-256. For enhanced security in a real system,
+            # consider using a keyed hash (HMAC) or including a system-wide pepper/salt
+            # that is managed via configuration and not stored with the hash.
+            # The purpose here is to make the patient_id non-reversible in logs,
+            # not necessarily for authentication or password storage.
+            data_to_hash = patient_id_to_hash
+            hashed_patient_id = hashlib.sha256(data_to_hash.encode('utf-8')).hexdigest()
+            # SHA-256 hexdigest is 64 characters. AuditLogModel.patient_id_hash is String(255).
 
         log_entry_data = {
             # 'timestamp' has server_default=func.now() in AuditLogModel
