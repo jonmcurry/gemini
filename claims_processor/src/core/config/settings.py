@@ -13,13 +13,17 @@ class Settings(BaseSettings):
     # Concurrency settings
     MAX_CONCURRENT_CLAIM_PROCESSING: int = 10 # Default value
 
-    # RVU data file path
-    RVU_DATA_FILE_PATH: str = "data/rvu_data.csv" # Default path
-
     # ML Model settings
     ML_MODEL_PATH: Optional[str] = "models/dummy_claim_model.tflite"
     ML_FEATURE_COUNT: int = 7
     ML_APPROVAL_THRESHOLD: float = 0.8
+
+    # Application Security Settings
+    APP_ENCRYPTION_KEY: str = "must_be_32_bytes_long_for_aes256_key!"
+    # IMPORTANT: This is a default development key.
+    # It MUST be overridden by an environment variable in production for security.
+    # The key should be a 32-byte (256-bit) cryptographically secure random string.
+
     # Add other settings as needed later
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_file_encoding='utf-8')

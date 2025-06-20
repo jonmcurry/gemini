@@ -13,7 +13,12 @@ class ClaimModel(Base):
 
     patient_first_name = Column(String(100), nullable=True)
     patient_last_name = Column(String(100), nullable=True)
-    patient_date_of_birth = Column(Date, nullable=True)
+    patient_date_of_birth = Column(String(255), nullable=True) # Changed for encryption
+    medical_record_number = Column(String(150), nullable=True, index=True)
+
+    financial_class = Column(String(50), nullable=True, index=True)
+    insurance_type = Column(String(100), nullable=True, index=True)
+    insurance_plan_id = Column(String(100), nullable=True, index=True)
 
     # service_from_date is part of composite PK and partition key
     service_from_date = Column(Date, nullable=False, index=True)
@@ -28,10 +33,16 @@ class ClaimModel(Base):
     updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     processed_at = Column(TIMESTAMP(timezone=True), nullable=True)
 
+    # New fields for tracking transfer and ML results that might influence transfer/analytics
+    transferred_to_prod_at = Column(TIMESTAMP(timezone=True), nullable=True, index=True)
+    processing_duration_ms = Column(Integer, nullable=True)
+    ml_score = Column(Numeric(5, 4), nullable=True)
+    ml_derived_decision = Column(String(50), nullable=True)
+
     line_items = relationship("ClaimLineItemModel", back_populates="claim", cascade="all, delete-orphan")
 
     __table_args__ = (
-        PrimaryKeyConstraint('id', 'service_from_date', name='pk_claims'), # Composite Primary Key
+        PrimaryKeyConstraint('id', 'service_from_date', name='pk_claims'),
         {'postgresql_partition_by': 'RANGE (service_from_date)'}
     )
 

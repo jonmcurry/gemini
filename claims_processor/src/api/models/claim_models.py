@@ -56,10 +56,15 @@ class ProcessableClaim(BaseModel):
     claim_id: str # Business claim ID
     facility_id: str
     patient_account_number: str
+    medical_record_number: Optional[str] = None # Added MRN
 
     patient_first_name: Optional[str] = None
     patient_last_name: Optional[str] = None
     patient_date_of_birth: Optional[date] = None
+
+    insurance_type: Optional[str] = None
+    insurance_plan_id: Optional[str] = None # Added
+    financial_class: Optional[str] = None
 
     service_from_date: date
     service_to_date: date
@@ -74,6 +79,13 @@ class ProcessableClaim(BaseModel):
     processed_at: Optional[datetime] = None
 
     line_items: List[ProcessableClaimLineItem] = []
+
+    # New fields for ML results
+    ml_score: Optional[float] = None
+    ml_derived_decision: Optional[str] = None # e.g., "ML_APPROVED", "ML_REJECTED"
+
+    # New field for processing duration
+    processing_duration_ms: Optional[float] = None # Duration in milliseconds
 
     # If using Pydantic V2
     model_config = {"from_attributes": True}
