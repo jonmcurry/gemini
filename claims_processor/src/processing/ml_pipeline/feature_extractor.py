@@ -11,17 +11,29 @@ logger = structlog.get_logger(__name__)
 INSURANCE_TYPE_MAPPING = {
     "medicare": 1.0,
     "medicaid": 2.0,
-    "commercial": 3.0,
-    "self-pay": 4.0,
-    "hmo": 5.0,
-    "ppo": 6.0,
-    "other": 7.0,
-    # Add more as needed
+    "commercial": 3.0,        # General commercial
+    "commercial ppo": 3.1,
+    "commercial hmo": 3.2,
+    "commercial pos": 3.3,
+    "blue cross blue shield": 4.0, # General BCBS
+    "bcbs ppo": 4.1,
+    "bcbs hmo": 4.2,
+    "self pay": 5.0,            # Note: "self-pay" in old map, "self pay" in new. Standardize.
+    "workers compensation": 6.0,
+    "other government": 7.0,    # e.g., Other federal or state non-Medicaid/Medicare
+    "tricare": 8.0,
+    "champva": 9.0,
+    "other": 10.0,              # Explicit 'other' mapped category
+    # Consider standardizing keys: e.g. "self-pay" vs "self pay". Let's use "self-pay".
 }
-DEFAULT_INSURANCE_ENCODING = 0.0 # For unknown, None, or unmapped 'other'
+# Correcting "self pay" to "self-pay" for consistency with previous version if it was intentional
+INSURANCE_TYPE_MAPPING["self-pay"] = INSURANCE_TYPE_MAPPING.pop("self pay", 5.0) # Keep 5.0 if "self pay" was the key
+
+DEFAULT_INSURANCE_ENCODING = 0.0 # For None or unmapped types
 
 # Define CPT code ranges for surgery (inclusive)
-# General Surgery: 10021–69990. This is a broad range.
+# General Surgery: 10021–69990. This is a broad range and includes most surgical procedures
+# but might also cover some non-invasive procedures or tests that fall within these CPT numerical sequences.
 # Specific sub-ranges can be added for more granularity if needed.
 SURGERY_CPT_RANGES = [
     (10021, 69990),
@@ -32,6 +44,13 @@ SURGERY_CPT_RANGES = [
 # If a code starts with 'S' and is not in CPT format, it might be a HCPCS Level II code.
 # Let's keep a small set of prefixes for non-numeric or non-CPT codes if needed.
 NON_NUMERIC_SURGERY_INDICATORS = {"S"} # Example: HCPCS Level II 'S' codes often indicate surgery
+
+# Constants for complexity score calculation
+MAX_LINES_FOR_SCORE_CONTRIB = 10.0
+MAX_UNITS_FOR_SCORE_CONTRIB = 20.0
+WEIGHT_LINES = 0.4
+WEIGHT_UNITS = 0.3
+WEIGHT_SURGERY = 0.3
 
 class FeatureExtractor:
     """
@@ -118,21 +137,34 @@ class FeatureExtractor:
     def _calculate_complexity_score(self, claim: ProcessableClaim, surgery_detected_flag: float) -> float:
         # claim argument is now the full ProcessableClaim
         line_items = claim.line_items
-        if not line_items: return 0.0
+        score_from_lines = 0.0
+        score_from_units = 0.0
 
-        num_lines = len(line_items)
-        total_units = sum(item.units for item in line_items) # item.units is int, not Optional
+        if line_items:
+            num_lines = float(len(line_items))
+            total_units = float(sum(item.units for item in line_items))
 
-        # Base score components
-        lines_score = min(num_lines / 10.0, 0.4)  # Max 0.4 from number of lines (e.g., 10+ lines)
-        units_score = min(total_units / 20.0, 0.3) # Max 0.3 from total units (e.g., 20+ units)
-        surgery_score = 0.3 if surgery_detected_flag == 1.0 else 0.0 # 0.3 if surgery
+            score_from_lines = min(num_lines / MAX_LINES_FOR_SCORE_CONTRIB, 1.0) * WEIGHT_LINES
+            score_from_units = min(total_units / MAX_UNITS_FOR_SCORE_CONTRIB, 1.0) * WEIGHT_UNITS
 
-        # Combine scores
-        # Example: Normalize to 0-1 range. Max possible sum here is 0.4 + 0.3 + 0.3 = 1.0
-        complexity = lines_score + units_score + surgery_score
+        score_from_surgery = surgery_detected_flag * WEIGHT_SURGERY
 
-        return min(max(complexity, 0.0), 1.0) # Ensure it's capped between 0 and 1
+        total_score = score_from_lines + score_from_units + score_from_surgery
+
+        final_score = min(max(total_score, 0.0), 1.0) # Explicit cap, though weights sum to 1.0
+
+        logger.debug(
+            "Calculated complexity score components",
+            claim_id=claim.claim_id,
+            num_lines=len(line_items) if line_items else 0,
+            total_units=sum(item.units for item in line_items) if line_items else 0,
+            surgery_flag=surgery_detected_flag,
+            score_lines=score_from_lines,
+            score_units=score_from_units,
+            score_surgery=score_from_surgery,
+            final_score=final_score
+        )
+        return final_score
 
 
     def extract_features(self, claim: ProcessableClaim) -> Optional[np.ndarray]:
