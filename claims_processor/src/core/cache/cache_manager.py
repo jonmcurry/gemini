@@ -15,17 +15,26 @@ class CacheManager:
     # Let's refine to a more common pattern: instance-based, or a clear singleton factory.
     # For now, making it instance-based for clarity unless a shared global client is explicitly managed.
 
-    _client: aiomcache.Client # Class variable for a shared client instance
+    # _client: aiomcache.Client # This class variable is not used if client is instance variable.
+                                # If it were, __init__ would be different.
 
-    def __init__(self, host: str, port: int):
-        # This constructor will be called for every CacheManager instance.
-        # To share a client, it should be managed at class level or by a factory.
-        # Using a simplified approach where each service gets its own CacheManager instance,
-        # but they could all point to the same underlying client if initialized carefully.
-        # For the `get_cache_manager` factory below, this works.
-        self.client = aiomcache.Client(host, port, pool_size=2) # pool_size can be configured
-        logger.info("CacheManager initialized, new aiomcache.Client created", host=host, port=port)
+    def __init__(self, hosts_str: str, port: int):
+        # Parse the hosts_str
+        host_list = [h.strip() for h in hosts_str.split(',') if h.strip()]
 
+        if not host_list:
+            logger.error("MEMCACHED_HOSTS is empty or invalid. Defaulting to localhost.", hosts_input=hosts_str)
+            self.primary_host = "localhost"
+        else:
+            self.primary_host = host_list[0]
+            if len(host_list) > 1:
+                logger.warn(f"Multiple Memcached hosts configured ('{hosts_str}'), "
+                              f"but aiomcache.Client uses only the first one ('{self.primary_host}') in this setup.",
+                              all_hosts=host_list)
+
+        self.port = port
+        self.client = aiomcache.Client(self.primary_host, self.port, pool_size=2) # pool_size can be configured
+        logger.info("CacheManager initialized, new aiomcache.Client created", host=self.primary_host, port=self.port)
 
     async def get(self, key: str) -> Optional[Any]:
         try:
@@ -60,46 +69,34 @@ class CacheManager:
                 logger.error("Error closing Memcached client via CacheManager instance", error=str(e), exc_info=True)
 
 # --- Global Cache Manager Singleton Pattern ---
-_global_cache_manager_instance: Optional[CacheManager] = None
-_global_aiomcache_client: Optional[aiomcache.Client] = None
+# _global_cache_manager_instance: Optional[CacheManager] = None # Renamed for clarity in factory
+# _global_aiomcache_client: Optional[aiomcache.Client] = None # Not used with current CacheManager design
 
-async def get_global_aiomcache_client() -> aiomcache.Client:
-    """Creates and returns a single, shared aiomcache.Client instance."""
-    global _global_aiomcache_client
-    if _global_aiomcache_client is None:
+# get_global_aiomcache_client is not needed if CacheManager creates its own client instance
+# and get_cache_service manages the singleton of CacheManager.
+
+# GlobalCacheManager class is not needed.
+
+_singleton_cache_manager_instance: Optional[CacheManager] = None
+
+async def get_cache_service() -> CacheManager:
+    """Factory function to get a singleton CacheManager instance."""
+    global _singleton_cache_manager_instance
+    if _singleton_cache_manager_instance is None:
         settings = get_settings()
-        logger.info("Creating global aiomcache.Client instance.", host=settings.MEMCACHED_HOST, port=settings.MEMCACHED_PORT)
-        _global_aiomcache_client = aiomcache.Client(settings.MEMCACHED_HOST, settings.MEMCACHED_PORT, pool_size=2)
-    return _global_aiomcache_client
-
-class GlobalCacheManager:
-    """Uses a globally shared aiomcache.Client instance."""
-    def __init__(self):
-        # This class will be instantiated multiple times, but self.client will refer to the same global client.
-        # This is not ideal. The factory `get_cache_service_with_global_client` is better.
-        # For a simpler CacheManager to be injected, the previous CacheManager class is fine if instantiated once.
-        # Let's refine `get_cache_manager` to return a CacheManager that uses a global client.
-        pass # Keep this simple; logic moved to factory/dependency
-
-async def get_cache_service() -> CacheManager: # Renamed for clarity, this is the service/manager
-    """Factory function to get a CacheManager instance that uses a shared global aiomcache.Client."""
-    global _global_cache_manager_instance
-    if _global_cache_manager_instance is None:
-        settings = get_settings()
-        # The CacheManager can be simplified if it always uses a client passed to it or a global one.
-        # Let's make CacheManager always create its own client for now, and get_cache_manager will be a singleton of THAT.
-        _global_cache_manager_instance = CacheManager(host=settings.MEMCACHED_HOST, port=settings.MEMCACHED_PORT)
-        logger.info("Global CacheManager instance created.")
-    return _global_cache_manager_instance
+        # Pass MEMCACHED_HOSTS (plural) to CacheManager constructor
+        _singleton_cache_manager_instance = CacheManager(hosts_str=settings.MEMCACHED_HOSTS, port=settings.MEMCACHED_PORT)
+        logger.info("Singleton CacheManager instance created.")
+    return _singleton_cache_manager_instance
 
 
 async def close_global_cache(): # Call this on app shutdown
-    """Closes the global CacheManager's underlying client."""
-    global _global_cache_manager_instance
-    if _global_cache_manager_instance:
-        logger.info("Closing global CacheManager's client.")
-        await _global_cache_manager_instance.close()
-        _global_cache_manager_instance = None # Clear the instance
+    """Closes the client of the singleton CacheManager instance."""
+    global _singleton_cache_manager_instance
+    if _singleton_cache_manager_instance:
+        logger.info("Closing client of singleton CacheManager instance.")
+        await _singleton_cache_manager_instance.close()
+        _singleton_cache_manager_instance = None # Clear the instance
     else:
         logger.info("No global CacheManager instance to close.")
 

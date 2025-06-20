@@ -7,6 +7,8 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 from decimal import Decimal
 import time
+import asyncio # For asyncio.sleep
+from sqlalchemy.exc import OperationalError # For retry logic
 
 from ..core.config.settings import get_settings
 from ..core.database.models.claims_db import ClaimModel
@@ -382,42 +384,73 @@ class ClaimProcessingService:
             return
 
         logger.info("Updating claim and lines in DB", claim_db_id=db_claim_to_update.id, new_status=new_status, ml_info=ml_log_info or "N/A", duration_ms=duration_ms)
-        try:
-            db_claim_to_update.processing_status = new_status
 
-            if duration_ms is not None:
-                db_claim_to_update.processing_duration_ms = int(duration_ms)
+        # Populate fields before retry loop
+        db_claim_to_update.processing_status = new_status
+        if duration_ms is not None:
+            db_claim_to_update.processing_duration_ms = int(duration_ms)
+        if processed_pydantic_claim:
+            if processed_pydantic_claim.ml_score is not None:
+                db_claim_to_update.ml_score = Decimal(str(processed_pydantic_claim.ml_score))
+            if processed_pydantic_claim.ml_derived_decision is not None:
+                db_claim_to_update.ml_derived_decision = processed_pydantic_claim.ml_derived_decision
+        if validation_errors:
+            logger.warn("Storing/logging errors for claim", claim_id=db_claim_to_update.claim_id, errors=validation_errors)
+            # Example: db_claim_to_update.error_details = {"errors": validation_errors}
+        if new_status == "processing_complete" and processed_pydantic_claim:
+            map_pydantic_line_items = {line.id: line for line in processed_pydantic_claim.line_items}
+            for db_line_item in db_claim_to_update.line_items:
+                if db_line_item.id in map_pydantic_line_items:
+                    pydantic_line = map_pydantic_line_items[db_line_item.id]
+                    if pydantic_line.rvu_total is not None:
+                        db_line_item.rvu_total = pydantic_line.rvu_total
+            db_claim_to_update.processed_at = datetime.now(timezone.utc)
 
-            if processed_pydantic_claim: # Check if Pydantic model exists (it won't for early conversion error)
-                if processed_pydantic_claim.ml_score is not None:
-                    # Ensure conversion to Decimal for Numeric field if ml_score is float
-                    db_claim_to_update.ml_score = Decimal(str(processed_pydantic_claim.ml_score))
-                if processed_pydantic_claim.ml_derived_decision is not None:
-                    db_claim_to_update.ml_derived_decision = processed_pydantic_claim.ml_derived_decision
+        max_retries = 3
+        base_delay = 0.1  # seconds
 
-            if validation_errors:
-                logger.warn("Storing/logging errors for claim", claim_id=db_claim_to_update.claim_id, errors=validation_errors)
-                # Example: db_claim_to_update.error_details = {"errors": validation_errors} # If such a field exists
+        for attempt in range(max_retries):
+            try:
+                # Add to session (again) in case of rollback from a previous failed attempt.
+                # This ensures the object (and any related objects like FailedClaimModel if added in the same session)
+                # are considered for the current transaction attempt.
+                self.db.add(db_claim_to_update)
+                # If FailedClaimModel instances are also added to self.db in the same scope,
+                # they will be part of this commit attempt.
 
-            if new_status == "processing_complete" and processed_pydantic_claim:
-                map_pydantic_line_items = {line.id: line for line in processed_pydantic_claim.line_items}
-                for db_line_item in db_claim_to_update.line_items:
-                    if db_line_item.id in map_pydantic_line_items:
-                        pydantic_line = map_pydantic_line_items[db_line_item.id]
-                        if pydantic_line.rvu_total is not None:
-                            db_line_item.rvu_total = pydantic_line.rvu_total
-                db_claim_to_update.processed_at = datetime.now(timezone.utc)
+                await self.db.commit()
 
-            self.db.add(db_claim_to_update)
-            await self.db.commit()
+                logger.info(f"Attempt {attempt + 1}: Claim and lines updated successfully in DB",
+                            claim_db_id=db_claim_to_update.id, new_status=db_claim_to_update.processing_status)
 
-            await self.db.refresh(db_claim_to_update)
-            if db_claim_to_update.line_items:
-                for line_item_to_refresh in db_claim_to_update.line_items:
-                    await self.db.refresh(line_item_to_refresh)
+                # Refresh operations after successful commit
+                await self.db.refresh(db_claim_to_update)
+                if db_claim_to_update.line_items: # Assuming line_items are already loaded or handled by session
+                    for line_item_to_refresh in db_claim_to_update.line_items:
+                        await self.db.refresh(line_item_to_refresh)
+                return # Exit method on successful commit and refresh
 
-            logger.info("Claim and lines updated successfully in DB", claim_db_id=db_claim_to_update.id, new_status=db_claim_to_update.processing_status)
+            except OperationalError as oe:
+                logger.warn(f"Attempt {attempt + 1} of {max_retries}: OperationalError during DB commit. Retrying...",
+                            claim_db_id=db_claim_to_update.id, error=str(oe))
+                await self.db.rollback()
+                if attempt + 1 == max_retries:
+                    logger.error(f"All {max_retries} retries failed for OperationalError.", claim_db_id=db_claim_to_update.id)
+                    raise # Re-raise the exception to be caught by the outer handler in _process_single_claim_concurrently
 
-        except Exception as e:
-            await self.db.rollback()
-            logger.error("Failed to update claim and lines in DB", claim_db_id=db_claim_to_update.id if db_claim_to_update else "Unknown ID", error=str(e), exc_info=True)
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay) # Use asyncio.sleep for async code
+
+            except Exception as e: # Catch other non-retryable SQLAlchemy errors or general errors during commit/refresh
+                logger.error(f"Attempt {attempt + 1} (or non-retryable error): Failed to update claim and lines in DB.",
+                             claim_db_id=db_claim_to_update.id if db_claim_to_update else "Unknown ID",
+                             error=str(e), exc_info=True)
+                await self.db.rollback()
+                # Do not retry for generic Exception, re-raise to be handled by _process_single_claim_concurrently's error handling
+                raise # This will be caught by the caller's exception handler (outer try-except in _process_single_claim_concurrently)
+
+        # This part should ideally not be reached if logic is correct (success returns, error re-raises)
+        logger.error("Fell through retry loop in _update_claim_and_lines_in_db without success or re-raising error.",
+                     claim_db_id=db_claim_to_update.id if db_claim_to_update else "Unknown ID")
+        # To ensure the calling function knows, raise a generic exception if this point is reached.
+        raise Exception(f"Failed to update claim {db_claim_to_update.id if db_claim_to_update else 'Unknown ID'} after all retries, but no specific exception was propagated.")
