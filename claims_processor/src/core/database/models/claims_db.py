@@ -13,7 +13,8 @@ class ClaimModel(Base):
 
     patient_first_name = Column(String(100), nullable=True)
     patient_last_name = Column(String(100), nullable=True)
-    patient_date_of_birth = Column(Date, nullable=True)
+    patient_date_of_birth = Column(String(255), nullable=True) # Changed for encryption
+    medical_record_number = Column(String(150), nullable=True, index=True) # Added MRN
 
     # service_from_date is part of composite PK and partition key
     service_from_date = Column(Date, nullable=False, index=True)
