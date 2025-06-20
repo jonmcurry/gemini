@@ -1,7 +1,9 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Depends # Added Request, Depends
 from datetime import datetime, timezone
 from .api.routes import claims_routes, submission_routes # Import the new router
 from .monitoring.logging.logging_config import setup_logging
+from .core.monitoring.audit_logger import AuditLogger # Added AuditLogger
+from .api.dependencies import get_audit_logger # Added get_audit_logger
 import structlog
 
 setup_logging() # Initialize logging
@@ -24,13 +26,26 @@ app.include_router(submission_routes.router, prefix="/api/v1", tags=["Claim Subm
 app.include_router(data_transfer_routes.router, prefix="/api/v1/data-transfer", tags=["Data Transfer"])
 
 @app.get("/health")
-async def health_check():
+async def health_check(
+    request: Request,
+    audit_logger: AuditLogger = Depends(get_audit_logger)
+):
     logger.info("Health check accessed")
-    return {
+    response_data = {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": "1.0.0"
     }
+
+    await audit_logger.log_access(
+        user_id=str(request.client.host if request.client else "unknown_host"), # Using client host as a stand-in
+        action="HEALTH_CHECK",
+        resource="System",
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        success=True
+    )
+    return response_data
 
 # Prometheus metrics endpoint
 from prometheus_client import generate_latest, REGISTRY
@@ -59,9 +74,13 @@ from pathlib import Path # For file path checking
 @app.get("/ready", tags=["Monitoring"])
 async def readiness_check(
     db: AsyncSession = Depends(get_db_session),
-    cache: CacheManager = Depends(get_cache_service)
+    cache: CacheManager = Depends(get_cache_service),
     # settings: Settings = Depends(get_settings) # Alternative: inject settings
+    # audit_logger: AuditLogger = Depends(get_audit_logger) # Example if needed here
 ) -> Dict[str, Any]:
+    # Add HTTPException import if not already present at the top of the file
+    from fastapi import HTTPException
+
     checks = {
         "database": {"status": "unhealthy", "details": "Check not performed"},
         "cache": {"status": "unhealthy", "details": "Check not performed"},

@@ -1,1 +1,59 @@
-# Development environment
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .. # Project root (one level up from 'docker' directory)
+      dockerfile: docker/Dockerfile # Path to Dockerfile from project root
+    container_name: claims_processor_app
+    command: uvicorn claims_processor.src.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/claims_processor/src
+    volumes:
+      - ../claims_processor:/app/claims_processor
+      - ../alembic.ini:/app/alembic.ini
+      - ../migrations:/app/migrations
+      # If .env file is used and is in project root:
+      # - ../.env:/app/.env # This line is commented out as env_file is preferred
+    ports:
+      - "8000:8000"
+    # environment: # These are examples; env_file is preferred for actual values
+      # - DATABASE_URL=postgresql+asyncpg://claims_user:claims_password@db:5432/claims_staging_db
+      # - MEMCACHED_HOST=cache
+      # - MEMCACHED_PORT=11211
+      # - APP_ENCRYPTION_KEY=your_development_encryption_key_32_bytes
+    env_file:
+      - ../.env # Path to .env file from the project root (one level up from 'docker' directory)
+    depends_on:
+      db:
+        condition: service_healthy # Wait for db to be healthy
+      cache:
+        # No standard healthcheck for memcached in compose, app should handle connection retry
+        condition: service_started
+
+
+  db:
+    image: postgres:14-alpine
+    container_name: claims_processor_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    ports:
+      - "54320:5432" # Expose PostgreSQL on host port 54320 to avoid conflicts
+    environment:
+      - POSTGRES_USER=claims_user       # Defined in .env or here
+      - POSTGRES_PASSWORD=claims_password # Defined in .env or here
+      - POSTGRES_DB=claims_staging_db     # Defined in .env or here
+    env_file:
+      - ../.env # Also source from .env for consistency if preferred
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-claims_user} -d $${POSTGRES_DB:-claims_staging_db}"] # Use $$ to escape $ for shell
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  cache:
+    image: memcached:1.6-alpine
+    container_name: claims_processor_cache
+    ports:
+      - "11211:11211"
+
+volumes:
+  postgres_data: # No need for driver: local, it's default
