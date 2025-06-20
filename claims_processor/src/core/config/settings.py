@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     # It MUST be overridden by an environment variable in production for security.
     # The key should be a 32-byte (256-bit) cryptographically secure random string.
 
+    # RVU Service Settings
+    RVU_MEDICARE_CONVERSION_FACTOR: float = 38.87
+    RVU_DEFAULT_VALUE: float = 1.00
+
     # Add other settings as needed later
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_file_encoding='utf-8')

@@ -1,3 +1,4 @@
+import asyncio # Added for to_thread
 import structlog
 from typing import List, Dict, Any, Optional
 from pathlib import Path
@@ -93,18 +94,26 @@ class OptimizedPredictor:
                     if self.metrics_collector: self.metrics_collector.record_ml_prediction(outcome=ml_decision_outcome_label, confidence_score=None)
                     continue
 
-                if features_sample_2d.shape != (1, self.feature_count):
-                    logger.warn(f"Sample {i} feature shape {features_sample_2d.shape} does not match model expected (1, {self.feature_count}). Skipping.")
+                # features_sample_2d is actually a single sample's features.
+                # It can be 1D (feature_count,) or 2D (1, feature_count).
+                # The interpreter expects (1, feature_count).
+                features_for_interpreter: Optional[np.ndarray] = None
+                if features_sample_2d.ndim == 1 and features_sample_2d.shape[0] == self.feature_count:
+                    features_for_interpreter = np.expand_dims(features_sample_2d, axis=0)
+                elif features_sample_2d.shape == (1, self.feature_count): # Already in expected shape
+                    features_for_interpreter = features_sample_2d
+                else:
+                    logger.warn(f"Sample {i} feature shape {features_sample_2d.shape} is not ({self.feature_count},) or (1, {self.feature_count}). Skipping.")
                     predictions.append({"error": "Feature shape mismatch", "ml_score": None, "ml_derived_decision": "ML_ERROR"})
                     ml_decision_outcome_label="ML_ERROR_FEATURE_SHAPE"
                     if self.metrics_collector: self.metrics_collector.record_ml_prediction(outcome=ml_decision_outcome_label, confidence_score=None)
                     continue
 
-                final_features = features_sample_2d
-                if features_sample_2d.dtype != np.float32:
-                    logger.warn(f"Sample {i} feature dtype {features_sample_2d.dtype} is not np.float32. Attempting conversion.")
+                final_features = features_for_interpreter # Use the (potentially) reshaped features
+                if final_features.dtype != np.float32: # Check dtype of the final_features
+                    logger.warn(f"Sample {i} feature dtype {final_features.dtype} is not np.float32. Attempting conversion.")
                     try:
-                        final_features = features_sample_2d.astype(np.float32)
+                        final_features = final_features.astype(np.float32)
                     except Exception as cast_e:
                         logger.error(f"Could not cast sample {i} features to np.float32: {cast_e}", exc_info=True)
                         predictions.append({"error": "Feature type conversion failed", "ml_score": None, "ml_derived_decision": "ML_ERROR"})
@@ -115,7 +124,7 @@ class OptimizedPredictor:
                 self.interpreter.set_tensor(self.input_details[0]['index'], final_features)
 
                 invoke_start_time = time.perf_counter()
-                self.interpreter.invoke()
+                await asyncio.to_thread(self.interpreter.invoke) # Asynchronous invocation
                 invoke_duration_seconds = time.perf_counter() - invoke_start_time
                 if self.metrics_collector: self.metrics_collector.record_ml_inference_duration(invoke_duration_seconds)
 
