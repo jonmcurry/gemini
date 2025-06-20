@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from datetime import datetime, timezone
-from .api.routes import claims_routes # Import the new router
+from .api.routes import claims_routes, submission_routes # Import the new router
 from .core.logging_config import setup_logging
 import structlog
 
@@ -19,8 +19,9 @@ async def app_shutdown():
     logger.info("Application shutdown: closing global cache manager.")
     await close_global_cache_manager()
 
-app.include_router(claims_routes.router, prefix="/api/v1/claims", tags=["Claims Processing"]) # Renamed tag for clarity
-app.include_router(data_transfer_routes.router, prefix="/api/v1/data-transfer", tags=["Data Transfer"]) # Add new router
+app.include_router(claims_routes.router, prefix="/api/v1/claims", tags=["Claims Processing"])
+app.include_router(submission_routes.router, prefix="/api/v1", tags=["Claim Submissions"]) # Added new submission router
+app.include_router(data_transfer_routes.router, prefix="/api/v1/data-transfer", tags=["Data Transfer"])
 
 @app.get("/health")
 async def health_check():
@@ -45,8 +46,10 @@ async def get_metrics():
     return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
 # Readiness Probe
-from sqlalchemy import text
+from sqlalchemy import text, AsyncSession # Added AsyncSession for Depends
+from sqlalchemy.ext.asyncio import AsyncSession # Ensure this is the one used by get_db_session
 from typing import Dict, Any
+from .core.database.db_session import get_db_session # Added get_db_session for Depends
 from .core.cache.cache_manager import get_cache_service, CacheManager
 import uuid
 from .core.config.settings import get_settings, Settings # Add Settings for type hint and get_settings
