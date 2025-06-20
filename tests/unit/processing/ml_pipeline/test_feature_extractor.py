@@ -143,36 +143,34 @@ def test_detect_surgery_codes_detailed(feature_extractor: FeatureExtractor):
 
 def test_calculate_complexity_score_detailed(feature_extractor: FeatureExtractor):
     # Test cases: (num_lines, total_units, surgery_flag) -> expected_score
-    # Score = min(num_lines/10, 0.4) + min(total_units/20, 0.3) + (0.3 if surgery else 0.0)
+    # score_from_lines = min(num_lines / MAX_LINES_FOR_SCORE_CONTRIB, 1.0) * WEIGHT_LINES
+    # score_from_units = min(total_units / MAX_UNITS_FOR_SCORE_CONTRIB, 1.0) * WEIGHT_UNITS
+    # score_from_surgery = surgery_detected_flag * WEIGHT_SURGERY
 
     # No surgery (flag = 0.0)
-    claim_1l_1u_nosurg = create_test_claim(num_lines=1, line_item_details=[{"units": 1}])
-    assert feature_extractor._calculate_complexity_score(claim_1l_1u_nosurg, 0.0) == pytest.approx( (1/10.0)*0.4/0.5 + (1/20.0)*0.3/0.5 ) # Incorrect formula based on old weights
-    # Corrected: min(1/10, 0.4) + min(1/20, 0.3) + 0.0 = 0.1 + 0.05 = 0.15
-    assert feature_extractor._calculate_complexity_score(claim_1l_1u_nosurg, 0.0) == pytest.approx(0.1 + 0.05)
+    claim_1l_1u_nosurg = create_test_claim(num_lines=1, line_item_details=[{"units": 1}]) # 1 line, 1 unit
+    # Expected: lines = min(1/10,1)*0.4 = 0.1*0.4=0.04. units = min(1/20,1)*0.3 = 0.05*0.3=0.015. surgery=0. Total=0.055
+    assert feature_extractor._calculate_complexity_score(claim_1l_1u_nosurg, 0.0) == pytest.approx(0.04 + 0.015)
 
     claim_5l_10u_nosurg = create_test_claim(num_lines=5, line_item_details=[{"units": 2}]*5) # 5 lines, 10 units
-    # min(5/10, 0.4) = 0.4 (capped at 0.4 from lines, actually 0.5 from lines/10, so 0.4)
-    # min(10/20, 0.3) = 0.3 (capped at 0.3 from units, actually 0.5 from units/20, so 0.3)
-    # score = 0.4 (lines_score = min(0.5, 0.4)=0.4) + 0.3 (units_score = min(0.5, 0.3)=0.3) = 0.7
-    assert feature_extractor._calculate_complexity_score(claim_5l_10u_nosurg, 0.0) == pytest.approx(min(5/10.0, 0.4) + min(10/20.0, 0.3))
-
+    # Expected: lines = min(5/10,1)*0.4 = 0.5*0.4=0.2. units = min(10/20,1)*0.3 = 0.5*0.3=0.15. surgery=0. Total=0.35
+    assert feature_extractor._calculate_complexity_score(claim_5l_10u_nosurg, 0.0) == pytest.approx(0.2 + 0.15)
 
     claim_10l_20u_nosurg = create_test_claim(num_lines=10, line_item_details=[{"units": 2}]*10) # 10 lines, 20 units
-    # min(10/10, 0.4) = 0.4 + min(20/20, 0.3) = 0.3 => 0.7
+    # Expected: lines = min(10/10,1)*0.4 = 1*0.4=0.4. units = min(20/20,1)*0.3 = 1*0.3=0.3. surgery=0. Total=0.7
     assert feature_extractor._calculate_complexity_score(claim_10l_20u_nosurg, 0.0) == pytest.approx(0.4 + 0.3)
 
     claim_15l_30u_nosurg = create_test_claim(num_lines=15, line_item_details=[{"units": 2}]*15) # 15 lines, 30 units
-    # min(15/10, 0.4) = 0.4 + min(30/20, 0.3) = 0.3 => 0.7
+    # Expected: lines = min(15/10,1)*0.4 = 1*0.4=0.4. units = min(30/20,1)*0.3 = 1*0.3=0.3. surgery=0. Total=0.7
     assert feature_extractor._calculate_complexity_score(claim_15l_30u_nosurg, 0.0) == pytest.approx(0.4 + 0.3)
 
-    # With surgery (flag = 1.0, adds 0.3 to score)
+    # With surgery (flag = 1.0, adds WEIGHT_SURGERY = 0.3 to score)
     claim_1l_1u_surg = create_test_claim(num_lines=1, line_item_details=[{"units": 1}])
-    # 0.1 (lines) + 0.05 (units) + 0.3 (surgery) = 0.45
-    assert feature_extractor._calculate_complexity_score(claim_1l_1u_surg, 1.0) == pytest.approx(0.1 + 0.05 + 0.3)
+    # Expected: 0.04 (lines) + 0.015 (units) + 0.3 (surgery) = 0.355
+    assert feature_extractor._calculate_complexity_score(claim_1l_1u_surg, 1.0) == pytest.approx(0.04 + 0.015 + 0.3)
 
     claim_10l_20u_surg = create_test_claim(num_lines=10, line_item_details=[{"units": 2}]*10) # 10 lines, 20 units
-    # 0.4 (lines) + 0.3 (units) + 0.3 (surgery) = 1.0
+    # Expected: 0.4 (lines) + 0.3 (units) + 0.3 (surgery) = 1.0
     assert feature_extractor._calculate_complexity_score(claim_10l_20u_surg, 1.0) == pytest.approx(1.0)
 
     claim_empty_lines_nosurg = create_test_claim(num_lines=0, line_item_details=[])
@@ -213,25 +211,25 @@ def test_extract_features_valid_claim(feature_extractor: FeatureExtractor):
     surgery_flag_no_surgery = 0.0 # Based on default P1, P2 codes in create_test_claim
     assert np.isclose(features_no_surgery[5], surgery_flag_no_surgery)
 
-    # Complexity for claim_no_surgery: 2 lines, 2 units total (1 per line), no surgery
-    # lines_score = min(2/10, 0.4) = 0.2
-    # units_score = min(2/20, 0.3) = 0.1
+    # Complexity for claim_no_surgery: 2 lines, 2 units total (1 per line default), no surgery
+    # lines_score = min(2/10,1)*0.4 = 0.2*0.4=0.08
+    # units_score = min(2/20,1)*0.3 = 0.1*0.3=0.03
     # surgery_score = 0.0
-    # total = 0.2 + 0.1 + 0.0 = 0.3
-    expected_complexity_no_surgery = 0.3
+    # total = 0.08 + 0.03 = 0.11
+    expected_complexity_no_surgery = 0.08 + 0.03
     assert np.isclose(features_no_surgery[6], expected_complexity_no_surgery)
 
 
 def test_extract_features_with_surgery(feature_extractor: FeatureExtractor):
     expected_feature_count = 7
     claim_with_surgery = create_test_claim(
-        num_lines=3,
+        num_lines=3, # This will be overridden by line_item_details length
         line_item_details=[
-            {"procedure_code": "99213", "units": 1}, # Non-surgery
-            {"procedure_code": "12345", "units": 2}, # Surgery (falls in 10021-69990 range)
+            {"procedure_code": "99213", "units": 1},
+            {"procedure_code": "12345", "units": 2}, # Surgery (CPT range)
             {"procedure_code": "S2065", "units": 1}  # Surgery (HCPCS S-code)
         ]
-    ) # 3 lines, 4 units total, surgery detected
+    ) # 3 lines (P1, 12345, S2065), total units 1+2+1=4. Surgery detected.
     features_surgery = feature_extractor.extract_features(claim_with_surgery)
     assert features_surgery is not None
     assert features_surgery.shape == (expected_feature_count,)
@@ -240,11 +238,11 @@ def test_extract_features_with_surgery(feature_extractor: FeatureExtractor):
     assert np.isclose(features_surgery[5], surgery_flag_with_surgery)
 
     # Complexity for claim_with_surgery: 3 lines, 4 units, surgery detected
-    # lines_score = min(3/10, 0.4) = 0.3
-    # units_score = min(4/20, 0.3) = 0.2
-    # surgery_score = 0.3
-    # total = 0.3 + 0.2 + 0.3 = 0.8
-    expected_complexity_with_surgery = 0.8
+    # lines_score = min(3/10,1)*0.4 = 0.3*0.4 = 0.12
+    # units_score = min(4/20,1)*0.3 = 0.2*0.3 = 0.06
+    # surgery_score = 1.0 * 0.3 = 0.3
+    # total = 0.12 + 0.06 + 0.3 = 0.48
+    expected_complexity_with_surgery = 0.48
     assert np.isclose(features_surgery[6], expected_complexity_with_surgery)
 
 
