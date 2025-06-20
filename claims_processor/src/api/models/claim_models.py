@@ -63,6 +63,7 @@ class ProcessableClaim(BaseModel):
     patient_date_of_birth: Optional[date] = None
 
     insurance_type: Optional[str] = None
+    insurance_plan_id: Optional[str] = None # Added
     financial_class: Optional[str] = None
 
     service_from_date: date
