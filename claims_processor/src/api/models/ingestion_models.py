@@ -9,7 +9,7 @@ class IngestionClaimLineItem(BaseModel):
     service_date: date = Field(..., description="Service date for the line item.")
     procedure_code: constr(strip_whitespace=True, min_length=1, max_length=20) = Field(..., description="Procedure code.")
     units: int = Field(..., gt=0, description="Number of units, must be positive.")
-    charge_amount: condecimal(max_digits=15, decimal_places=2) = Field(..., description="Charge amount for this line item.")
+    charge_amount: condecimal(max_digits=15, decimal_places=2, ge=Decimal(0)) = Field(..., description="Charge amount for this line item, must be non-negative.")
 
     procedure_description: Optional[constr(strip_whitespace=True, max_length=500)] = Field(None, description="Optional: Procedure description.")
     rendering_provider_npi: Optional[constr(strip_whitespace=True, max_length=20)] = Field(None, description="Optional: Rendering provider NPI.")

@@ -171,3 +171,93 @@ def test_line_item_service_date_within_claim_dates_valid(validator: ClaimValidat
     claim = ProcessableClaim(**claim_data_copy)
     errors = validator.validate_claim(claim)
     assert not any(f"Line 1: Service date ({line_data['service_date']}) is outside of claim service period" in error for error in errors)
+
+
+# --- New tests to be added ---
+
+# Using a fixed UTC for tests if needed, or a library for timezone if not available by default
+# For Python 3.9+ zoneinfo is standard.
+try:
+    from zoneinfo import ZoneInfo
+    UTC = ZoneInfo("UTC")
+except ImportError:
+    UTC = timezone.utc
+
+def create_base_test_claim(**kwargs) -> ProcessableClaim:
+    # Helper to create a valid ProcessableClaim with sensible defaults
+    now = datetime.now(tz=UTC)
+
+    default_line_items_data = [
+        {
+            "id": 1, "claim_db_id": 1, "line_number": 1, "service_date": date(2024, 1, 15),
+            "procedure_code": "P0001", "units": 1, "charge_amount": Decimal("50.00"),
+            "rvu_total": None, "created_at": now, "updated_at": now
+        },
+        {
+            "id": 2, "claim_db_id": 1, "line_number": 2, "service_date": date(2024, 1, 16),
+            "procedure_code": "P0002", "units": 1, "charge_amount": Decimal("50.00"),
+            "rvu_total": None, "created_at": now, "updated_at": now
+        }
+    ]
+
+    line_items_input = kwargs.pop("line_items", None)
+
+    final_line_items = []
+    if line_items_input is not None:
+        if all(isinstance(li, ProcessableClaimLineItem) for li in line_items_input):
+            final_line_items = line_items_input
+        else:
+            for i, li_data in enumerate(line_items_input):
+                base_li_data = {"created_at": now, "updated_at": now, "id": i+1, "claim_db_id": kwargs.get("id",1)}
+                base_li_data.update(li_data)
+                final_line_items.append(ProcessableClaimLineItem(**base_li_data))
+    else:
+        for li_data in default_line_items_data:
+             final_line_items.append(ProcessableClaimLineItem(**li_data))
+
+    calculated_total_charges = sum(li.charge_amount for li in final_line_items) if final_line_items else Decimal("0.00")
+
+    data = {
+        "id": 1, "claim_id": "C001", "facility_id": "F001", "patient_account_number": "ACC001",
+        "medical_record_number": "MRN001", "patient_first_name": "John", "patient_last_name": "Doe",
+        "patient_date_of_birth": date(1990, 1, 1), "insurance_type": "PPO", "insurance_plan_id": "PLAN01",
+        "financial_class": "Personal", "service_from_date": date(2024, 1, 10),
+        "service_to_date": date(2024, 1, 20),
+        "total_charges": calculated_total_charges,
+        "processing_status": "pending", "batch_id": None, "created_at": now, "updated_at": now,
+        "processed_at": None, "ml_score": None, "ml_derived_decision": None,
+        "processing_duration_ms": None,
+        "line_items": final_line_items
+    }
+
+    if "total_charges" in kwargs: # Allow explicit override of total_charges for testing mismatch
+        data["total_charges"] = kwargs.pop("total_charges")
+
+    data.update(kwargs)
+
+    return ProcessableClaim(**data)
+
+# Test using the new helper
+def test_valid_claim_with_helper(validator: ClaimValidator):
+    claim = create_base_test_claim()
+    errors = validator.validate_claim(claim)
+    assert not errors, f"Validation errors for a supposedly valid claim (using helper): {errors}"
+
+def test_sum_of_line_charges_mismatch(validator: ClaimValidator):
+    # Default lines in create_base_test_claim sum to 100.00
+    claim = create_base_test_claim(total_charges=Decimal("101.00"))
+    errors = validator.validate_claim(claim)
+    assert any("Sum of line item charges (100.00) does not match claim total charges (101.00)" in error for error in errors)
+
+def test_sum_of_line_charges_match(validator: ClaimValidator):
+    now = datetime.now(tz=UTC)
+    lines_data_for_objects = [ # Data to create ProcessableClaimLineItem objects
+        {"id":1, "claim_db_id":1, "line_number": 1, "service_date": date(2024,1,15), "procedure_code": "P1", "units": 1, "charge_amount": Decimal("25.50"), "created_at":now, "updated_at":now},
+        {"id":2, "claim_db_id":1, "line_number": 2, "service_date": date(2024,1,16), "procedure_code": "P2", "units": 2, "charge_amount": Decimal("37.25"), "created_at":now, "updated_at":now}
+    ] # Sum = 25.50 + 2*37.25 = 25.50 + 74.50 = 100.00
+
+    line_items_obj = [ProcessableClaimLineItem(**li) for li in lines_data_for_objects]
+
+    claim = create_base_test_claim(line_items=line_items_obj, total_charges=Decimal("100.00"))
+    errors = validator.validate_claim(claim)
+    assert not any("Sum of line item charges" in error for error in errors), f"Mismatch error found: {errors}"
