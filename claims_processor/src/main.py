@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from datetime import datetime, timezone
 from .api.routes import claims_routes, submission_routes # Import the new router
-from .core.logging_config import setup_logging
+from .monitoring.logging.logging_config import setup_logging
 import structlog
 
 setup_logging() # Initialize logging
