@@ -13,6 +13,7 @@ from ..core.database.models.claims_production_db import ClaimsProductionModel
 from decimal import Decimal
 from sqlalchemy.sql import insert, update # Added update
 from datetime import datetime, timezone # Added datetime, timezone
+from sqlalchemy.dialects.postgresql import insert as pg_insert # Added for ON CONFLICT
 
 logger = structlog.get_logger(__name__)
 
@@ -157,20 +158,49 @@ class DataTransferService:
         if not production_records:
             return 0
 
-        logger.info(f"Attempting to bulk insert {len(production_records)} records into claims_production.")
+        logger.info(f"Attempting to bulk upsert {len(production_records)} records into claims_production.")
 
         try:
-            await self.db.execute(
-                insert(ClaimsProductionModel.__table__),
-                production_records
+            insert_stmt = pg_insert(ClaimsProductionModel.__table__).values(production_records)
+
+            # Define the columns to update on conflict, excluding 'id'
+            # These names must match the columns in ClaimsProductionModel and keys in production_records
+            update_columns = {
+                'claim_id': insert_stmt.excluded.claim_id,
+                'facility_id': insert_stmt.excluded.facility_id,
+                'patient_account_number': insert_stmt.excluded.patient_account_number,
+                'patient_first_name': insert_stmt.excluded.patient_first_name,
+                'patient_last_name': insert_stmt.excluded.patient_last_name,
+                'patient_date_of_birth': insert_stmt.excluded.patient_date_of_birth,
+                'service_from_date': insert_stmt.excluded.service_from_date,
+                'service_to_date': insert_stmt.excluded.service_to_date,
+                'total_charges': insert_stmt.excluded.total_charges,
+                'ml_prediction_score': insert_stmt.excluded.ml_prediction_score,
+                'processing_duration_ms': insert_stmt.excluded.processing_duration_ms,
+                'throughput_achieved': insert_stmt.excluded.throughput_achieved,
+                'risk_category': insert_stmt.excluded.risk_category,
+                # Ensure all other relevant fields from ClaimsProductionModel are here
+                # if they are present in production_records and should be updated.
+                # 'created_at' and 'updated_at' are usually handled by DB defaults or triggers
+                # and might not need to be in 'set_' unless explicitly managed here.
+            }
+
+            upsert_stmt = insert_stmt.on_conflict_do_update(
+                index_elements=['id'],  # The column that causes a conflict
+                set_=update_columns
             )
+
+            result = await self.db.execute(upsert_stmt)
             await self.db.commit()
-            logger.info(f"Successfully bulk inserted {len(production_records)} records into claims_production.")
-            return len(production_records)
+
+            # result.rowcount typically gives the number of rows affected (inserted or updated)
+            affected_rows = result.rowcount if result else 0
+            logger.info(f"Successfully bulk upserted records into claims_production. Rows affected: {affected_rows}.")
+            return affected_rows
 
         except Exception as e:
             await self.db.rollback()
-            logger.error(f"Failed to bulk insert records into claims_production: {e}", exc_info=True)
+            logger.error(f"Failed to bulk upsert records into claims_production: {e}", exc_info=True)
             return 0
 
     async def _update_staging_claims_after_transfer(self, transferred_staging_claims: List[ClaimModel]):

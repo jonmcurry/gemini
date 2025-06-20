@@ -10,19 +10,24 @@ from ..core.cache.cache_manager import CacheManager
 from ..core.database.models.rvu_data_db import RVUDataModel
 from sqlalchemy import select
 from ..core.monitoring.app_metrics import MetricsCollector
+from ..core.config.settings import get_settings # Added for configurable constants
 
 logger = structlog.get_logger(__name__)
 
-MEDICARE_CONVERSION_FACTOR = Decimal("38.87")
-DEFAULT_RVU_VALUE = Decimal("1.00") # Default RVU if a procedure code is not found in DB
+# Hardcoded constants removed, will be loaded from settings
 
 class RVUService:
     def __init__(self, cache_manager: CacheManager, metrics_collector: MetricsCollector):
+        app_settings = get_settings()
         self.cache_manager = cache_manager
         self.metrics_collector = metrics_collector
-        self.conversion_factor = MEDICARE_CONVERSION_FACTOR
-        logger.info("RVUService initialized with CacheManager and MetricsCollector.",
-                    cache_manager_id=id(cache_manager), metrics_collector_id=id(metrics_collector))
+        self.conversion_factor = Decimal(str(app_settings.RVU_MEDICARE_CONVERSION_FACTOR))
+        self.default_rvu_value = Decimal(str(app_settings.RVU_DEFAULT_VALUE))
+        logger.info("RVUService initialized with CacheManager, MetricsCollector, and settings-loaded constants.",
+                    cache_manager_id=id(cache_manager),
+                    metrics_collector_id=id(metrics_collector),
+                    conversion_factor=self.conversion_factor,
+                    default_rvu=self.default_rvu_value)
 
     async def _get_rvu_from_db(self, procedure_code: str, db_session: AsyncSession) -> Optional[Decimal]:
         """Fetches RVU for a single procedure code from the database."""
@@ -90,11 +95,11 @@ class RVUService:
                         # self.metrics_collector.record_cache_operation(cache_type='rvu', operation_type='set', outcome='error') # Implicitly covered by CacheManager
                 else:
                     # Not found in DB, use default
-                    logger.warn("RVU not found in DB, using default value.", procedure_code=procedure_code, default_rvu=DEFAULT_RVU_VALUE)
-                    rvu_per_unit = DEFAULT_RVU_VALUE
+                    logger.warn("RVU not found in DB, using default value.", procedure_code=procedure_code, default_rvu=self.default_rvu_value)
+                    rvu_per_unit = self.default_rvu_value
                     # Optionally, cache the default value to prevent repeated DB lookups for unknown codes
                     try:
-                        await self.cache_manager.set(cache_key, str(DEFAULT_RVU_VALUE), ttl=3600) # Cache default
+                        await self.cache_manager.set(cache_key, str(self.default_rvu_value), ttl=3600) # Cache default
                     except Exception as e:
                         logger.error("Cache set operation failed for default RVU", cache_key=cache_key, error=str(e))
 
