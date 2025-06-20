@@ -15,11 +15,12 @@ from claims_processor.src.processing.ml_pipeline.feature_extractor import Featur
 from claims_processor.src.processing.ml_pipeline.optimized_predictor import OptimizedPredictor
 from claims_processor.src.processing.pipeline.parallel_claims_processor import ParallelClaimsProcessor
 from claims_processor.src.core.database.models.claims_production_db import ClaimsProductionModel
-from claims_processor.src.core.database.models.failed_claims_db import FailedClaimModel # Import new model
-from claims_processor.src.core.monitoring.app_metrics import MetricsCollector # Added
+from claims_processor.src.core.database.models.failed_claims_db import FailedClaimModel
+from claims_processor.src.core.monitoring.app_metrics import MetricsCollector
+from claims_processor.src.core.security.audit_logger_service import AuditLoggerService # Added
 from sqlalchemy.sql import insert, update # For checking statements in mocks
 
-# --- Fixtures --- (existing fixtures are fine)
+# --- Fixtures ---
 @pytest.fixture
 def mock_db_session_factory_and_session():
     mock_session = AsyncMock(spec=AsyncSession)
@@ -74,6 +75,22 @@ def processor(
     mock_optimized_predictor: MagicMock,
     mock_metrics_collector: MagicMock # Added
 ) -> ParallelClaimsProcessor:
+@pytest.fixture
+def mock_audit_logger_service() -> MagicMock: # Added
+    service = MagicMock(spec=AuditLoggerService)
+    service.log_event = AsyncMock()
+    return service
+
+@pytest.fixture
+def processor(
+    mock_db_session_factory_and_session,
+    mock_claim_validator: MagicMock,
+    mock_rvu_service: MagicMock,
+    mock_feature_extractor: MagicMock,
+    mock_optimized_predictor: MagicMock,
+    mock_metrics_collector: MagicMock,
+    mock_audit_logger_service: MagicMock # Added
+) -> ParallelClaimsProcessor:
     mock_session_factory, _ = mock_db_session_factory_and_session
     service = ParallelClaimsProcessor(
         db_session_factory=mock_session_factory,
@@ -81,7 +98,8 @@ def processor(
         rvu_service=mock_rvu_service,
         feature_extractor=mock_feature_extractor,
         optimized_predictor=mock_optimized_predictor,
-        metrics_collector=mock_metrics_collector # Added
+        metrics_collector=mock_metrics_collector,
+        audit_logger_service=mock_audit_logger_service # Added
     )
     return service
 
@@ -237,9 +255,12 @@ async def test_process_claims_parallel_e2e_with_failures_and_routing(
     mock_rvu_service: MagicMock,
     mock_feature_extractor: MagicMock,
     mock_optimized_predictor: MagicMock,
-    mock_metrics_collector: MagicMock # Added
+    mock_metrics_collector: MagicMock,
+    mock_audit_logger_service: MagicMock # Added
 ):
     mock_session_factory, mock_session = mock_db_session_factory_and_session
+
+    passed_batch_id = "b_e2e" # The batch_id passed into the method
 
     # Setup claims
     c_valid_pass = create_processable_claim("c_pass", 1, batch_id="b_e2e")
@@ -282,9 +303,9 @@ async def test_process_claims_parallel_e2e_with_failures_and_routing(
 
             summary = await processor.process_claims_parallel(batch_id="b_e2e", limit=3)
 
-    # Assertions
-    mock_fetch.assert_called_once_with(mock_session, "b_e2e", 3)
-    assert mock_claim_validator.validate_claim.call_count == 3 # Called for all fetched
+    # Assertions for method calls
+    mock_fetch.assert_called_once_with(mock_session, passed_batch_id, 3)
+    assert mock_claim_validator.validate_claim.call_count == 3
 
     # ML assertions
     assert mock_feature_extractor.extract_features.call_count == 2 # For c_pass, c_ml_reject
@@ -369,9 +390,30 @@ async def test_process_claims_parallel_e2e_with_failures_and_routing(
     assert c_valid_pass.processing_duration_ms > 0
 
     # Ensure batch_metrics (throughput) was passed to _transfer_claims_to_production
-    # This was already checked in mock_transfer.assert_called_once_with
-    # transfer_args[2] was {'throughput_achieved': Decimal(...)}
     assert isinstance(transfer_args[2]['throughput_achieved'], Decimal)
-    # The actual throughput value depends on the duration, which is dynamic.
-    # We can check it's non-negative.
     assert transfer_args[2]['throughput_achieved'] >= Decimal("0")
+
+    # Audit Logger Assertions
+    assert mock_audit_logger_service.log_event.call_count == 2
+
+    # Check PROCESS_BATCH_START call
+    start_event_call = mock_audit_logger_service.log_event.call_args_list[0]
+    start_event_kwargs = start_event_call.kwargs
+    assert start_event_kwargs['action'] == "PROCESS_BATCH_START"
+    assert start_event_kwargs['resource'] == "ClaimBatch"
+    assert start_event_kwargs['resource_id'] == passed_batch_id # Since passed_batch_id is not None
+    assert start_event_kwargs['success'] is True
+    assert start_event_kwargs['user_id'] == "system_pipeline"
+    assert start_event_kwargs['details'] == {"limit": 3, "original_batch_id_param": passed_batch_id}
+
+    # Check PROCESS_BATCH_END call
+    end_event_call = mock_audit_logger_service.log_event.call_args_list[1]
+    end_event_kwargs = end_event_call.kwargs
+    assert end_event_kwargs['action'] == "PROCESS_BATCH_END"
+    assert end_event_kwargs['resource'] == "ClaimBatch"
+    assert end_event_kwargs['resource_id'] == passed_batch_id
+    assert end_event_kwargs['success'] is True # Because no major exception was raised to set summary["error"]
+    assert end_event_kwargs['failure_reason'] is None
+    assert end_event_kwargs['user_id'] == "system_pipeline"
+    assert end_event_kwargs['details']['summary'] == summary # Compare the summary dict
+    assert isinstance(end_event_kwargs['details']['duration_seconds'], float)
