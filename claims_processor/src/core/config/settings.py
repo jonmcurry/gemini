@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     VALIDATION_BATCH_SIZE: int = 2000   # Batch size for validation stage
     RVU_BATCH_SIZE: int = 3000          # Batch size for RVU calculation stage
     TRANSFER_BATCH_SIZE: int = 5000     # Batch size for transferring data to production
+    MAX_INGESTION_BATCH_SIZE: int = 10000 # Max claims allowed in a single ingestion API call
 
     # Add other settings as needed later
 

@@ -27,6 +27,7 @@ class ClaimModel(Base):
 
     processing_status = Column(String(50), default='pending', index=True)
     batch_id = Column(String(100), index=True, nullable=True)
+    priority = Column(Integer, server_default='1', nullable=False, index=True) # New priority field
 
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

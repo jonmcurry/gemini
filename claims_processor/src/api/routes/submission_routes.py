@@ -63,6 +63,27 @@ async def submit_claims_batch(
     The actual processing (validation, ML, RVU, transfer) is asynchronous.
     This endpoint stages the data.
     """
+    app_settings = get_settings()
+    if len(claims_batch) > app_settings.MAX_INGESTION_BATCH_SIZE:
+        logger.warn(
+            "Received claim submission batch exceeding max allowed size.",
+            received_size=len(claims_batch),
+            max_size=app_settings.MAX_INGESTION_BATCH_SIZE
+        )
+        # NOTE: Audit logging for this 413 error could be added here if desired.
+        # Example:
+        # await audit_logger.log_access(
+        #     user_id="api_caller", action="SUBMIT_CLAIMS_BATCH_REJECTED_SIZE", resource="ClaimSubmission",
+        #     ip_address=request.client.host if request.client else "unknown",
+        #     user_agent=request.headers.get("user-agent"), success=False,
+        #     failure_reason=f"Batch size {len(claims_batch)} exceeds max {app_settings.MAX_INGESTION_BATCH_SIZE}",
+        #     details={"received_claims": len(claims_batch), "max_allowed": app_settings.MAX_INGESTION_BATCH_SIZE}
+        # )
+        raise HTTPException(
+            status_code=413, # Payload Too Large
+            detail=f"Batch size {len(claims_batch)} exceeds maximum allowed size of {app_settings.MAX_INGESTION_BATCH_SIZE} claims."
+        )
+
     client_ip = request.client.host if request.client else "unknown"
     user_agent = request.headers.get("user-agent")
     action_name = "SUBMIT_CLAIMS_BATCH" # Consistent action name
@@ -70,7 +91,7 @@ async def submit_claims_batch(
     logger.info(f"Received claims submission batch request from {client_ip}",
                 num_claims=len(claims_batch), provided_ingestion_batch_id=ingestion_batch_id)
 
-    if not claims_batch:
+    if not claims_batch: # This check is now after the size check; it's fine.
         audit_event_batch_id = ingestion_batch_id or f"empty_submission_{uuid.uuid4()}"
         await audit_logger.log_access(
             user_id="api_caller", # Replace with actual user_id if auth is available

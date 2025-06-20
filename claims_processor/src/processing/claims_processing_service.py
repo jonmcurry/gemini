@@ -360,7 +360,7 @@ class ClaimProcessingService:
         stmt = (
             select(ClaimModel)
             .where(ClaimModel.processing_status == 'pending')
-            .order_by(ClaimModel.created_at.asc())
+            .order_by(ClaimModel.priority.desc(), ClaimModel.created_at.asc()) # Updated order_by
             .limit(effective_batch_size)
             .options(joinedload(ClaimModel.line_items))
         )
