@@ -36,7 +36,7 @@ class ClaimProcessingService:
         self.validation_ml_semaphore = asyncio.Semaphore(self.settings.VALIDATION_CONCURRENCY)
         self.rvu_semaphore = asyncio.Semaphore(self.settings.RVU_CALCULATION_CONCURRENCY)
 
-        self.feature_extractor = FeatureExtractor()
+        self.feature_extractor = FeatureExtractor(metrics_collector=self.metrics_collector)
 
         # Primary Predictor
         self.primary_predictor = OptimizedPredictor(

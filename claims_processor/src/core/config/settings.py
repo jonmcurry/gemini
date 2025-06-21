@@ -23,6 +23,16 @@ class Settings(BaseSettings):
     ML_PREDICTION_CACHE_MAXSIZE: int = 10000 # Max number of entries in the prediction cache
     ML_PREDICTION_CACHE_TTL: int = 3600      # TTL for prediction cache entries in seconds (1 hour)
 
+    # ML Feature Cache Settings
+    ML_FEATURE_CACHE_MAXSIZE: int = Field(
+        5000,
+        description="Max number of entries in the ML feature extraction cache."
+    )
+    ML_FEATURE_CACHE_TTL: int = Field(
+        3600,
+        description="TTL for ML feature cache entries in seconds (1 hour)."
+    )
+
     # ML A/B Testing Settings
     ML_CHALLENGER_MODEL_PATH: Optional[str] = Field(None, description="Optional path to a challenger ML model for A/B testing.")
     ML_AB_TEST_TRAFFIC_PERCENTAGE_TO_CHALLENGER: float = Field(
