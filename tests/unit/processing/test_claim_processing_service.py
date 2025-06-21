@@ -32,6 +32,7 @@ def mock_db_session():
     session.execute = AsyncMock()
     session.add = MagicMock()
     session.refresh = AsyncMock()
+    session.bulk_update_mappings = AsyncMock() # Added for testing batch updates
     return session
 
 @pytest.fixture
@@ -101,7 +102,7 @@ def claim_processing_service(mock_db_session, mock_metrics_collector, mock_setti
                 service.feature_extractor = MagicMock()
                 service.rvu_service.calculate_rvu_for_claim = AsyncMock()
                 service._store_failed_claim = AsyncMock()
-                service._update_claim_and_lines_in_db = AsyncMock()
+                # service._update_claim_and_lines_in_db = AsyncMock() # Removed as method will be deleted
                 return service
 
 # Helper functions (create_mock_db_claim, create_mock_processable_claim_from_db) remain the same
@@ -264,122 +265,39 @@ async def test_orchestrator_persists_ml_model_version(claim_processing_service_i
     mock_settings.ML_AB_TEST_TRAFFIC_PERCENTAGE_TO_CHALLENGER = 1.0 # Force challenger
     claim_processing_service_instance.settings = mock_settings
     # Re-initialize challenger predictor if it was None due to default fixture settings
-    if not claim_processing_service_instance.challenger_predictor:
+    if not claim_processing_service_instance.challenger_predictor: # Ensure it's mocked if settings enable it
         claim_processing_service_instance.challenger_predictor = MagicMock(spec=OptimizedPredictor)
         claim_processing_service_instance.challenger_predictor.predict_batch = AsyncMock()
+    elif hasattr(claim_processing_service_instance, 'challenger_predictor_mock'): # If fixture created it
+         claim_processing_service_instance.challenger_predictor = claim_processing_service_instance.challenger_predictor_mock
 
-    # Mock _perform_validation_and_ml to set ml_model_version_used
-    async def mock_val_ml_side_effect(claim, db_claim):
-        claim.ml_model_version_used = "challenger:test"
-        claim.processing_status = "ml_complete"
-        claim.ml_derived_decision = "ML_APPROVED" # Ensure it passes this stage
-        return claim
+
+    # Mock _perform_validation_and_ml to set ml_model_version_used and other relevant fields
+    async def mock_val_ml_side_effect(claim_arg, db_claim_arg): # Renamed args to avoid clash
+        claim_arg.ml_model_version_used = "challenger:test_version_from_val_ml"
+        claim_arg.processing_status = "ml_complete" # Assume validation and ML were successful
+        claim_arg.ml_derived_decision = "ML_APPROVED"
+        claim_arg.ml_score = Decimal("0.95")
+        return claim_arg # Return the modified ProcessableClaim
     claim_processing_service_instance._perform_validation_and_ml = AsyncMock(side_effect=mock_val_ml_side_effect)
 
     # Mock _perform_rvu_calculation to set final status
-    async def mock_rvu_side_effect(claim, db_claim):
-        claim.processing_status = "processing_complete"
-        return claim
+    async def mock_rvu_side_effect(claim_arg, db_claim_arg): # Renamed args
+        claim_arg.processing_status = "processing_complete" # Assume RVU calculation successful
+        return claim_arg # Return the modified ProcessableClaim
     claim_processing_service_instance._perform_rvu_calculation = AsyncMock(side_effect=mock_rvu_side_effect)
 
-    # Unmock _update_claim_and_lines_in_db to test its actual logic for this field
-    real_update_method = ClaimProcessingService._update_claim_and_lines_in_db.__get__(claim_processing_service_instance, ClaimProcessingService)
-    with patch.object(claim_processing_service_instance, '_update_claim_and_lines_in_db', new_callable=AsyncMock, side_effect=real_update_method) as mock_update_method_spy:
-        await claim_processing_service_instance._process_single_claim_concurrently(mock_db_claim)
+    # Call the orchestrator
+    result = await claim_processing_service_instance._process_single_claim_concurrently(mock_db_claim)
 
-        mock_update_method_spy.assert_called_once()
-        # Check the ClaimModel instance passed to the real _update_claim_and_lines_in_db
-        # The first positional argument to _update_claim_and_lines_in_db is db_claim_to_update (ClaimModel)
-        # The second is processed_pydantic_claim (ProcessableClaim)
-        call_args_instance = mock_update_method_spy.call_args[0][0] # This is db_claim_to_update
-        processed_pydantic_claim_arg = mock_update_method_spy.call_args[0][1]
+    # Assert that the returned ProcessableClaim instance has the ml_model_version_used set
+    assert isinstance(result, ProcessableClaim)
+    assert result.ml_model_version_used == "challenger:test_version_from_val_ml"
+    assert result.processing_status == "processing_complete" # Check final status from RVU mock
 
-        assert processed_pydantic_claim_arg.ml_model_version_used == "challenger:test"
-        # The actual assertion should be on db_claim_to_update *inside* the _update_claim_and_lines_in_db,
-        # which is now part of the real method call due to side_effect.
-        # So we check the state of mock_db_claim *after* the call, assuming commit was mocked.
-        # The mock_db_session.add will capture the state.
-        final_db_claim_state = claim_processing_service_instance.mock_db_session.add.call_args[0][0]
-        assert final_db_claim_state.ml_model_version_used == "challenger:test"
-
-
-# Preserving existing tests below and adapting them if necessary.
-# (The content of existing tests like _update_db_*, _fetch_pending_claims_ordering, _process_batch_error_aggregation are here)
-# ... (tests from previous state, ensure they use claim_processing_service_instance fixture) ...
-
-# --- Tests for _update_claim_and_lines_in_db ---
-@pytest.mark.asyncio
-async def test_update_db_success_first_attempt(claim_processing_service_instance: ClaimProcessingService, mock_db_session):
-    mock_claim = create_mock_db_claim()
-    claim_processing_service_instance._update_claim_and_lines_in_db = ClaimProcessingService._update_claim_and_lines_in_db.__get__(claim_processing_service_instance, ClaimProcessingService)
-
-    await claim_processing_service_instance._update_claim_and_lines_in_db(
-        db_claim_to_update=mock_claim,
-        processed_pydantic_claim=None,
-        new_status="processing_complete"
-    )
-
-    mock_db_session.add.assert_called_with(mock_claim)
-    mock_db_session.commit.assert_called_once()
-    mock_db_session.rollback.assert_not_called()
-    mock_db_session.refresh.assert_called_once_with(mock_claim)
-
-@pytest.mark.asyncio
-@patch('asyncio.sleep', new_callable=AsyncMock)
-async def test_update_db_retry_then_success(mock_sleep: AsyncMock, claim_processing_service_instance: ClaimProcessingService, mock_db_session):
-    mock_claim = create_mock_db_claim()
-    claim_processing_service_instance._update_claim_and_lines_in_db = ClaimProcessingService._update_claim_and_lines_in_db.__get__(claim_processing_service_instance, ClaimProcessingService)
-
-    mock_db_session.commit.side_effect = [OperationalError("DB error", {}, None), AsyncMock()]
-
-    await claim_processing_service_instance._update_claim_and_lines_in_db(
-        db_claim_to_update=mock_claim,
-        processed_pydantic_claim=None,
-        new_status="processing_complete"
-    )
-
-    assert mock_db_session.commit.call_count == 2
-    mock_db_session.rollback.assert_called_once()
-    mock_sleep.assert_called_once()
-    assert mock_db_session.add.call_count == 2
-    mock_db_session.refresh.assert_called_once_with(mock_claim)
-
-@pytest.mark.asyncio
-@patch('asyncio.sleep', new_callable=AsyncMock)
-async def test_update_db_all_retries_fail(mock_sleep: AsyncMock, claim_processing_service_instance: ClaimProcessingService, mock_db_session):
-    mock_claim = create_mock_db_claim()
-    claim_processing_service_instance._update_claim_and_lines_in_db = ClaimProcessingService._update_claim_and_lines_in_db.__get__(claim_processing_service_instance, ClaimProcessingService)
-    max_retries = 3
-
-    mock_db_session.commit.side_effect = OperationalError("DB error", {}, None)
-
-    with pytest.raises(OperationalError):
-        await claim_processing_service_instance._update_claim_and_lines_in_db(
-            db_claim_to_update=mock_claim,
-            processed_pydantic_claim=None,
-            new_status="processing_complete"
-        )
-
-    assert mock_db_session.commit.call_count == max_retries
-    assert mock_db_session.rollback.call_count == max_retries
-    assert mock_sleep.call_count == max_retries - 1
-
-@pytest.mark.asyncio
-async def test_update_db_non_retryable_exception(claim_processing_service_instance: ClaimProcessingService, mock_db_session):
-    mock_claim = create_mock_db_claim()
-    claim_processing_service_instance._update_claim_and_lines_in_db = ClaimProcessingService._update_claim_and_lines_in_db.__get__(claim_processing_service_instance, ClaimProcessingService)
-
-    mock_db_session.commit.side_effect = ValueError("Non-retryable error")
-
-    with pytest.raises(ValueError):
-        await claim_processing_service_instance._update_claim_and_lines_in_db(
-            db_claim_to_update=mock_claim,
-            processed_pydantic_claim=None,
-            new_status="processing_complete"
-        )
-
-    mock_db_session.commit.assert_called_once()
-    mock_db_session.rollback.assert_called_once()
+    # Further checks on what _process_single_claim_concurrently returns can be added here.
+    # The main point is that _update_claim_and_lines_in_db is no longer called from it.
+    # The state is carried on the ProcessableClaim instance.
 
 # --- Tests for _fetch_pending_claims ordering ---
 @pytest.mark.asyncio
@@ -400,35 +318,248 @@ async def test_fetch_pending_claims_ordering(claim_processing_service_instance: 
     assert "LIMIT 10" in compiled_query
 
 # --- Tests for process_pending_claims_batch error aggregation ---
+# Renamed and refactored from test_process_batch_error_aggregation
 @pytest.mark.asyncio
-async def test_process_batch_error_aggregation(claim_processing_service_instance: ClaimProcessingService, mock_metrics_collector):
-    num_claims = 5
-    num_exceptions = 2
-    mock_claims = [create_mock_db_claim(claim_id_str=f"claim_{i}", id_val=i) for i in range(num_claims)]
+async def test_batch_processing_handles_mixed_results_and_commits_successfully(
+    claim_processing_service_instance: ClaimProcessingService,
+    mock_metrics_collector: MagicMock,
+    mock_db_session: MagicMock # Get the session mock directly to check calls on its context manager
+):
+    num_total_claims = 5
+    num_processing_complete = 2
+    num_ml_rejected = 1
+    num_conversion_error = 1
+    num_unhandled_exception = 1 # from _process_single_claim_concurrently
 
-    claim_processing_service_instance._fetch_pending_claims = AsyncMock(return_value=mock_claims)
+    mock_db_claims = [create_mock_db_claim(claim_id_str=f"claim_{i}", id_val=i+1) for i in range(num_total_claims)]
 
-    async def mock_orchestrator_side_effect(db_claim: ClaimModel):
-        if db_claim.id < (num_claims - num_exceptions):
-            return {"status": "processing_complete", "claim_id": db_claim.claim_id, "ml_decision": "ML_APPROVED", "ml_model_version_used": "control:test"}
-        else:
-            return {"status": "unhandled_orchestration_error", "claim_id": db_claim.claim_id, "ml_decision": "N/A", "error_detail_str": "Simulated error", "ml_model_version_used": "control:test"}
+    claim_processing_service_instance._fetch_pending_claims = AsyncMock(return_value=mock_db_claims)
 
-    claim_processing_service_instance._process_single_claim_concurrently = AsyncMock(side_effect=mock_orchestrator_side_effect)
+    # --- Setup side effects for _process_single_claim_concurrently ---
+    mock_results_from_single_processing = []
 
-    summary = await claim_processing_service_instance.process_pending_claims_batch(batch_size_override=num_claims)
+    # Successful processing
+    for i in range(num_processing_complete):
+        pc = create_mock_processable_claim_from_db(mock_db_claims[i])
+        pc.processing_status = "processing_complete"
+        pc.ml_derived_decision = "ML_APPROVED"
+        pc.ml_model_version_used = "control:test_v1"
+        pc.ml_score = Decimal("0.85")
+        pc.processing_duration_ms = 120.0
+        # Simulate RVU calculation results
+        pc.line_items = [ProcessableClaimLineItem(id=(i*10)+j+1, claim_db_id=pc.id, line_number=j+1, service_date=date(2023,1,1), procedure_code="P01", units=1, charge_amount=Decimal(10), rvu_total=Decimal("2.5")) for j in range(2)]
+        mock_results_from_single_processing.append(pc)
+
+    # ML Rejected
+    idx = num_processing_complete
+    pc_rejected = create_mock_processable_claim_from_db(mock_db_claims[idx])
+    pc_rejected.processing_status = "ml_rejected"
+    pc_rejected.ml_derived_decision = "ML_REJECTED"
+    pc_rejected.ml_model_version_used = "control:test_v1"
+    pc_rejected.ml_score = Decimal("0.5")
+    pc_rejected.processing_duration_ms = 80.0
+    mock_results_from_single_processing.append(pc_rejected)
+
+    # Conversion Error
+    idx = num_processing_complete + num_ml_rejected
+    db_claim_for_conversion_error = mock_db_claims[idx]
+    mock_results_from_single_processing.append({
+        "error": "conversion_error", "original_db_id": db_claim_for_conversion_error.id,
+        "claim_id": db_claim_for_conversion_error.claim_id, "reason": "Simulated Pydantic conversion error",
+        "processing_duration_ms": 10.0
+    })
+
+    # Unhandled Exception from _process_single_claim_concurrently
+    idx = num_processing_complete + num_ml_rejected + num_conversion_error
+    mock_results_from_single_processing.append(RuntimeError(f"Simulated unhandled error for claim {mock_db_claims[idx].claim_id}"))
+
+    claim_processing_service_instance._process_single_claim_concurrently = AsyncMock(side_effect=mock_results_from_single_processing)
+
+    # _store_failed_claim is already an AsyncMock from the fixture.
+    # db.begin().__aexit__ (commit) should be successful by default from fixture.
+    mock_db_session.begin.return_value.__aexit__ = AsyncMock(return_value=None) # Explicitly ensure success
+
+    # --- Call the batch processing method ---
+    summary = await claim_processing_service_instance.process_pending_claims_batch(batch_size_override=num_total_claims)
+
+    # --- Assertions ---
+    assert summary["attempted_claims"] == num_total_claims
+    assert summary["by_status"].get("processing_complete") == num_processing_complete
+    assert summary["by_status"].get("ml_rejected") == num_ml_rejected
+    assert summary["by_status"].get("conversion_error") == num_conversion_error
+    assert summary["by_status"].get("unhandled_orchestration_error") == num_unhandled_exception
+
+    # Assert _store_failed_claim calls
+    # It's called by _perform_validation_and_ml for 'ml_rejected'
+    # It's called by process_pending_claims_batch for 'conversion_error'
+    # It's called by process_pending_claims_batch for unhandled exceptions from _process_single_claim_concurrently
+    assert claim_processing_service_instance._store_failed_claim.call_count == (num_ml_rejected + num_conversion_error + num_unhandled_exception)
+
+    # Assert bulk update calls
+    # One call for successful_claim_updates (processing_complete + ml_rejected)
+    # One call for failed_claim_updates_for_conversion_error (conversion_error + unhandled_orchestration_error)
+    # One call for successful_line_item_updates
+
+    # Check ClaimModel updates
+    assert mock_db_session.bulk_update_mappings.call_count >= 2 # At least one for successful, one for failed. Could be 3 if line items.
+
+    successful_updates_call = None
+    failed_updates_call = None
+    line_item_updates_call = None
+
+    for call_args in mock_db_session.bulk_update_mappings.call_args_list:
+        model_type, mappings = call_args[0]
+        if model_type == ClaimModel:
+            # Check content of mappings to differentiate
+            is_successful_batch = any(d.get('processing_status') in ["processing_complete", "ml_rejected"] for d in mappings)
+            is_failed_batch = any(d.get('processing_status') in ["conversion_error", "unhandled_orchestration_error"] for d in mappings)
+            if is_successful_batch:
+                successful_updates_call = mappings
+            elif is_failed_batch:
+                failed_updates_call = mappings
+        elif model_type == ClaimLineItemModel:
+            line_item_updates_call = mappings
+
+    assert successful_updates_call is not None and len(successful_updates_call) == (num_processing_complete + num_ml_rejected)
+    assert failed_updates_call is not None and len(failed_updates_call) == (num_conversion_error + num_unhandled_exception)
+
+    expected_line_item_updates = num_processing_complete * 2 # 2 line items per 'processing_complete' claim
+    if expected_line_item_updates > 0:
+        assert line_item_updates_call is not None and len(line_item_updates_call) == expected_line_item_updates
+        assert line_item_updates_call[0]['rvu_total'] == Decimal("2.5")
+    else:
+        assert line_item_updates_call is None
+
+
+    # Assert successful commit
+    mock_db_session.begin.return_value.__aexit__.assert_called_once_with(None, None, None)
+
+    # Assert metrics
+    mock_metrics_collector.record_batch_processed.assert_called_once()
+    metrics_call_kwargs = mock_metrics_collector.record_batch_processed.call_args.kwargs
+    assert metrics_call_kwargs['batch_size'] == num_total_claims
+    assert metrics_call_kwargs['claims_by_final_status'] == summary["by_status"]
+
+
+@pytest.mark.asyncio
+@patch('asyncio.sleep', new_callable=AsyncMock)
+async def test_batch_commit_fails_retries_then_succeeds(
+    mock_async_sleep: AsyncMock, # Patched asyncio.sleep
+    claim_processing_service_instance: ClaimProcessingService,
+    mock_db_session: MagicMock,
+    mock_metrics_collector: MagicMock
+):
+    num_claims = 2
+    mock_db_claims = [create_mock_db_claim(f"claim_retry_{i}", id_val=i) for i in range(num_claims)]
+    claim_processing_service_instance._fetch_pending_claims = AsyncMock(return_value=mock_db_claims)
+
+    processable_results = []
+    for db_claim in mock_db_claims:
+        pc = create_mock_processable_claim_from_db(db_claim)
+        pc.processing_status = "processing_complete"
+        pc.ml_derived_decision = "ML_APPROVED"
+        pc.processing_duration_ms = 50.0
+        processable_results.append(pc)
+    claim_processing_service_instance._process_single_claim_concurrently = AsyncMock(return_value=processable_results[0] if num_claims == 1 else AsyncMock(side_effect=processable_results))
+
+    # Mock commit to fail once, then succeed
+    mock_db_session.begin.return_value.__aexit__ = AsyncMock(side_effect=[
+        OperationalError("DB commit failed", {}, None), None
+    ])
+
+    summary = await claim_processing_service_instance.process_pending_claims_batch(num_claims)
+
+    assert mock_db_session.begin.return_value.__aexit__.call_count == 2 # Called twice (1 fail, 1 success)
+    mock_async_sleep.assert_called_once() # Sleep between retries
+    # bulk_update_mappings would be called twice because the operation is retried
+    assert mock_db_session.bulk_update_mappings.call_count == 2 * (1 if num_claims > 0 else 0) # 1 for ClaimModel, potentially 0 if no line items
 
     assert summary["attempted_claims"] == num_claims
-    assert summary["by_status"].get("processing_complete") == (num_claims - num_exceptions)
-    assert summary["by_status"].get("unhandled_orchestration_error") == num_exceptions
-
-    expected_statuses_for_metrics = {
-        'processing_complete': num_claims - num_exceptions,
-        'unhandled_orchestration_error': num_exceptions
-    }
-
+    assert summary["by_status"].get("processing_complete") == num_claims
+    assert summary["db_commit_errors"] == 0 # Should ultimately succeed
     mock_metrics_collector.record_batch_processed.assert_called_once()
-    args, _ = mock_metrics_collector.record_batch_processed.call_args
-    assert args[0] == num_claims
-    assert args[2] == expected_statuses_for_metrics
+
+
+@pytest.mark.asyncio
+@patch('asyncio.sleep', new_callable=AsyncMock)
+async def test_batch_commit_all_retries_fail(
+    mock_async_sleep: AsyncMock,
+    claim_processing_service_instance: ClaimProcessingService,
+    mock_db_session: MagicMock,
+    mock_metrics_collector: MagicMock
+):
+    num_claims = 2
+    max_retries = 3 # Matches default in service
+    mock_db_claims = [create_mock_db_claim(f"claim_all_fail_{i}", id_val=i) for i in range(num_claims)]
+    claim_processing_service_instance._fetch_pending_claims = AsyncMock(return_value=mock_db_claims)
+
+    processable_results = []
+    for db_claim in mock_db_claims:
+        pc = create_mock_processable_claim_from_db(db_claim)
+        pc.processing_status = "processing_complete" # Initially processed fine
+        pc.ml_derived_decision = "ML_APPROVED"
+        pc.processing_duration_ms = 50.0
+        processable_results.append(pc)
+    claim_processing_service_instance._process_single_claim_concurrently = AsyncMock(return_value=processable_results[0] if num_claims == 1 else AsyncMock(side_effect=processable_results))
+
+    # Mock commit to always fail
+    mock_db_session.begin.return_value.__aexit__ = AsyncMock(side_effect=OperationalError("DB commit always fails", {}, None))
+
+    # No pytest.raises here because the method should catch OperationalError and log it, then report in summary
+    summary = await claim_processing_service_instance.process_pending_claims_batch(num_claims)
+
+    assert mock_db_session.begin.return_value.__aexit__.call_count == max_retries
+    assert mock_async_sleep.call_count == max_retries - 1
+
+    assert summary["attempted_claims"] == num_claims
+    assert summary["by_status"].get("db_commit_error") == num_claims # All claims marked as db_commit_error
+    assert summary["db_commit_errors"] == num_claims # Specific count for this type of error
+    mock_metrics_collector.record_batch_processed.assert_called_once()
+    metrics_call_kwargs = mock_metrics_collector.record_batch_processed.call_args.kwargs
+    assert metrics_call_kwargs['claims_by_final_status'].get("db_commit_error") == num_claims
+
+
+@pytest.mark.asyncio
+async def test_batch_commit_non_retryable_error(
+    claim_processing_service_instance: ClaimProcessingService,
+    mock_db_session: MagicMock,
+    mock_metrics_collector: MagicMock
+):
+    num_claims = 1
+    mock_db_claims = [create_mock_db_claim("claim_non_retry_fail")]
+    claim_processing_service_instance._fetch_pending_claims = AsyncMock(return_value=mock_db_claims)
+
+    pc = create_mock_processable_claim_from_db(mock_db_claims[0])
+    pc.processing_status = "processing_complete"
+    claim_processing_service_instance._process_single_claim_concurrently = AsyncMock(return_value=pc)
+
+    mock_db_session.begin.return_value.__aexit__ = AsyncMock(side_effect=ValueError("Non-retryable DB error"))
+
+    # The service method should catch this, log, and then the claims are marked as db_commit_error
+    summary = await claim_processing_service_instance.process_pending_claims_batch(num_claims)
+
+    mock_db_session.begin.return_value.__aexit__.assert_called_once() # Not retried
+    assert summary["attempted_claims"] == num_claims
+    assert summary["by_status"].get("db_commit_error") == num_claims
+    assert summary["db_commit_errors"] == num_claims
+    mock_metrics_collector.record_batch_processed.assert_called_once()
+
+# Test for empty batch processing (already existed, ensure it's still valid)
+@pytest.mark.asyncio
+async def test_process_pending_claims_batch_no_claims(
+    claim_processing_service_instance: ClaimProcessingService,
+    mock_metrics_collector: MagicMock
+):
+    claim_processing_service_instance._fetch_pending_claims = AsyncMock(return_value=[]) # No claims fetched
+
+    summary = await claim_processing_service_instance.process_pending_claims_batch()
+
+    assert summary["attempted_claims"] == 0
+    assert summary["successfully_processed_count"] == 0
+    assert summary["message"] == "No pending claims to process."
+    mock_metrics_collector.record_batch_processed.assert_called_once_with(
+        batch_size=0,
+        duration_seconds=pytest.approx(0, abs=0.1), # Duration should be very small
+        claims_by_final_status={}
+    )
 ```

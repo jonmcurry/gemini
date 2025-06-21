@@ -11,7 +11,7 @@ import hashlib # For A/B testing consistent hashing
 from sqlalchemy.exc import OperationalError # For retry logic
 
 from ..core.config.settings import get_settings
-from ..core.database.models.claims_db import ClaimModel
+from ..core.database.models.claims_db import ClaimModel, ClaimLineItemModel # Added ClaimLineItemModel
 from ..api.models.claim_models import ProcessableClaim
 from .validation.claim_validator import ClaimValidator
 from .rvu_service import RVUService
@@ -179,91 +179,85 @@ class ClaimProcessingService:
                                                failed_stage="RVU_CALCULATION_FAILED", reason=error_reason_rvu)
         return processable_claim
 
-    async def _process_single_claim_concurrently(self, db_claim: ClaimModel) -> Dict[str, Any]:
+    async def _process_single_claim_concurrently(self, db_claim: ClaimModel) -> Any: # Return type can be ProcessableClaim or Dict
         start_time = time.monotonic()
         processable_claim_instance: Optional[ProcessableClaim] = None
-        final_status: str = "unknown_initial_error"
+        # final_status will be tracked on processable_claim_instance.processing_status directly
 
         try:
             logger.debug("Orchestrating single claim processing", claim_id=db_claim.claim_id, db_id=db_claim.id)
+
             # 1. Pydantic Conversion
             try:
                 processable_claim_instance = ProcessableClaim.model_validate(db_claim)
-                if processable_claim_instance.processing_status == 'pending':
+                if processable_claim_instance.processing_status == 'pending': # Default status from model_validate
                     processable_claim_instance.processing_status = "converted_to_pydantic"
-                final_status = processable_claim_instance.processing_status
             except Exception as e:
-                final_status = "conversion_error"
                 error_reason = f"Pydantic conversion error: {str(e)}"
-                logger.error(error_reason, claim_db_id=db_claim.id, exc_info=True)
-                await self._store_failed_claim(db_claim_to_update=db_claim, processable_claim_instance=None,
-                                               failed_stage="CONVERSION_ERROR", reason=error_reason)
-                current_duration_ms = (time.monotonic() - start_time) * 1000.0
-                await self._update_claim_and_lines_in_db(db_claim, None, final_status,
-                                                         duration_ms=current_duration_ms, validation_errors=[error_reason])
-                return {"db_id": db_claim.id, "claim_id": db_claim.claim_id, "status": final_status, "ml_decision": "N/A", "errors": [error_reason], "error_detail_str": str(e)}
+                logger.error(error_reason, claim_db_id=db_claim.id, claim_id=db_claim.claim_id, exc_info=True)
+                # Do not call _store_failed_claim here directly as it needs a session.
+                # The batch processor will handle storing this failure.
+                # No _update_claim_and_lines_in_db call.
+                return {
+                    "error": "conversion_error",
+                    "original_db_id": db_claim.id,
+                    "claim_id": db_claim.claim_id,
+                    "reason": error_reason,
+                    "processing_duration_ms": (time.monotonic() - start_time) * 1000.0
+                }
 
             # 2. Perform Validation and ML
+            # These methods will update processable_claim_instance.processing_status
+            # and call _store_failed_claim (which now only adds to session).
             processable_claim_instance = await self._perform_validation_and_ml(processable_claim_instance, db_claim)
-            final_status = processable_claim_instance.processing_status
 
-            if final_status in ["validation_failed", "ml_rejected", "ml_error", "validation_ml_error"]:
-                current_duration_ms = (time.monotonic() - start_time) * 1000.0
-                processable_claim_instance.processing_duration_ms = current_duration_ms
-                await self._update_claim_and_lines_in_db(db_claim, processable_claim_instance, final_status, duration_ms=current_duration_ms)
-                # Extract validation errors if any from the ProcessableClaim if the validator adds them there.
-                # For now, assuming error details are in FailedClaimModel.
-                # errors_list = getattr(processable_claim_instance, 'validation_errors_list', None)
-                return {"db_id": db_claim.id, "claim_id": processable_claim_instance.claim_id, "status": final_status,
-                        "ml_decision": processable_claim_instance.ml_derived_decision,
-                        "ml_model_version_used": processable_claim_instance.ml_model_version_used,
-                        "errors": None} # Errors logged to FailedClaimModel
+            if processable_claim_instance.processing_status in ["validation_failed", "ml_rejected", "ml_error", "validation_ml_error"]:
+                # No DB update call here. Status is set on processable_claim_instance.
+                # Duration will be set in finally block.
+                return processable_claim_instance
 
             # 3. Perform RVU Calculation (only if status is "ml_complete")
-            if final_status == "ml_complete":
+            if processable_claim_instance.processing_status == "ml_complete":
                  processable_claim_instance = await self._perform_rvu_calculation(processable_claim_instance, db_claim)
-                 final_status = processable_claim_instance.processing_status
+                 # Status updated within _perform_rvu_calculation
 
-            # 4. Final DB Update
-            current_duration_ms = (time.monotonic() - start_time) * 1000.0
-            processable_claim_instance.processing_duration_ms = current_duration_ms
-            await self._update_claim_and_lines_in_db(db_claim, processable_claim_instance, final_status, duration_ms=current_duration_ms)
-
-            return {"db_id": db_claim.id, "claim_id": processable_claim_instance.claim_id, "status": final_status,
-                    "ml_decision": processable_claim_instance.ml_derived_decision,
-                    "ml_model_version_used": processable_claim_instance.ml_model_version_used,
-                    "errors": None if final_status == "processing_complete" else ["Processing ended with status: " + final_status]}
+            # 4. Final state of processable_claim_instance is returned. No final DB update here.
+            # Duration will be set in finally block.
+            return processable_claim_instance
 
         except Exception as final_e:
-            final_status = "unknown_orchestration_error"
             logger.error("Unhandled error in orchestrating single claim processing (_process_single_claim_concurrently)",
                          claim_id=db_claim.claim_id, error=str(final_e), exc_info=True)
             if processable_claim_instance:
-                processable_claim_instance.processing_status = final_status
-                # Ensure ml_model_version_used is set even in error if it was determined
-                if not processable_claim_instance.ml_model_version_used:
+                processable_claim_instance.processing_status = "unknown_orchestration_error"
+                if not processable_claim_instance.ml_model_version_used: # Ensure this is set if possible
                     processable_claim_instance.ml_model_version_used = "unknown_due_to_error"
-            else: # If processable_claim_instance is None due to very early error
-                # We can't set ml_model_version_used on it. _store_failed_claim will handle None.
-                pass
-
-            await self._store_failed_claim(db_claim_to_update=db_claim,
-                                           processable_claim_instance=processable_claim_instance,
-                                           failed_stage="ORCHESTRATION_ERROR", reason=str(final_e))
-            current_duration_ms = (time.monotonic() - start_time) * 1000.0
-            if processable_claim_instance: processable_claim_instance.processing_duration_ms = current_duration_ms
-            await self._update_claim_and_lines_in_db(db_claim, processable_claim_instance, final_status,
-                                                     duration_ms=current_duration_ms)
-
-            return {"db_id": db_claim.id, "claim_id": db_claim.claim_id, "status": final_status,
-                    "ml_decision": processable_claim_instance.ml_derived_decision if processable_claim_instance else "N/A",
-                    "ml_model_version_used": processable_claim_instance.ml_model_version_used if processable_claim_instance else "unknown_due_to_error",
-                    "error_detail_str": str(final_e)}
+                await self._store_failed_claim(db_claim_to_update=db_claim,
+                                               processable_claim_instance=processable_claim_instance,
+                                               failed_stage="ORCHESTRATION_ERROR", reason=str(final_e))
+                # No _update_claim_and_lines_in_db call.
+                return processable_claim_instance
+            else:
+                # Very rare: error happened after Pydantic conversion but before processable_claim_instance was robustly set
+                # or if the error is in the return handling itself.
+                # The batch processor will need to create a FailedClaimModel for this.
+                return {
+                    "error": "unknown_orchestration_error",
+                    "original_db_id": db_claim.id,
+                    "claim_id": db_claim.claim_id,
+                    "reason": str(final_e),
+                    "processing_duration_ms": (time.monotonic() - start_time) * 1000.0
+                }
         finally:
-            final_duration_sec = time.monotonic() - start_time
-            self.metrics_collector.record_individual_claim_duration(final_duration_sec)
-            if processable_claim_instance and processable_claim_instance.processing_duration_ms is None:
-                 processable_claim_instance.processing_duration_ms = final_duration_sec * 1000.0
+            # This duration is for the individual claim processing attempt.
+            # It should be set on the ProcessableClaim if available.
+            final_duration_ms = (time.monotonic() - start_time) * 1000.0
+            if processable_claim_instance: # Check if it's a ProcessableClaim instance
+                if isinstance(processable_claim_instance, ProcessableClaim):
+                    processable_claim_instance.processing_duration_ms = final_duration_ms
+
+            # Metrics collector should still record the duration of the attempt.
+            self.metrics_collector.record_individual_claim_duration(final_duration_ms / 1000.0) # Expects seconds
 
     async def _store_failed_claim(
         self,
@@ -317,70 +311,181 @@ class ClaimProcessingService:
         logger.info("Starting batch processing of claims with concurrency", batch_size=effective_batch_size)
 
         fetched_db_claims = await self._fetch_pending_claims(effective_batch_size)
+        attempted_claims = len(fetched_db_claims)
 
         if not fetched_db_claims:
             logger.info("No pending claims to process.")
+            # Existing summary and metrics logic for no claims is fine.
             summary = {
                 "message": "No pending claims to process.", "attempted_claims": 0,
-                "conversion_errors":0, "validation_failures": 0,
-                "ml_approved_raw": 0, "ml_rejected_raw": 0, "ml_errors_raw": 0,
-                "stopped_by_ml_rejection": 0,
+                "conversion_errors":0, "validation_failures": 0, "ml_errors_raw":0,
+                "ml_approved_raw": 0, "ml_rejected_raw": 0,
                 "rvu_calculation_failures":0, "successfully_processed_count": 0,
-                "other_exceptions":0
+                "unhandled_orchestration_error":0, "db_commit_errors":0
             }
             self.metrics_collector.record_batch_processed(
-                batch_size=0,
-                duration_seconds=(time.monotonic() - batch_start_time),
-                claims_by_final_status={}
+                batch_size=0, duration_seconds=(time.monotonic() - batch_start_time), claims_by_final_status={}
             )
             logger.info("Concurrent batch processing summary (no claims).", **summary)
             return summary
 
-        logger.info(f"Fetched {len(fetched_db_claims)} claims for concurrent processing.")
+        logger.info(f"Fetched {attempted_claims} claims for concurrent processing.")
+        original_claims_map = {c.id: c for c in fetched_db_claims}
 
         tasks = [self._process_single_claim_concurrently(db_claim) for db_claim in fetched_db_claims]
         processing_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        attempted_claims = len(fetched_db_claims)
-        claims_by_final_status_for_metric: Dict[str, int] = {}
+        successful_claim_updates = []
+        successful_line_item_updates = []
+        # failed_claim_updates are for claims that failed pydantic conversion, need minimal update
+        failed_claim_updates_for_conversion_error = []
 
+        claims_by_final_status_for_metric: Dict[str, int] = {}
         ml_approved_raw_count = 0
         ml_rejected_raw_count = 0
         ml_errors_raw_count = 0
+        db_commit_errors_count = 0 # For final summary
 
-        for result in processing_results:
-            if isinstance(result, Exception):
-                status = "unhandled_orchestration_error"
-                claims_by_final_status_for_metric[status] = claims_by_final_status_for_metric.get(status, 0) + 1
-            elif isinstance(result, dict):
-                status = result.get("status", "unknown_processing_error")
+        for i, result in enumerate(processing_results):
+            original_db_claim_for_result = fetched_db_claims[i] # Assuming results are in order
+
+            if isinstance(result, dict) and result.get("error") == "conversion_error":
+                original_db_id = result["original_db_id"]
+                original_claim_for_failure = original_claims_map.get(original_db_id)
+                if original_claim_for_failure:
+                    await self._store_failed_claim(
+                        db_claim_to_update=original_claim_for_failure,
+                        processable_claim_instance=None,
+                        failed_stage="CONVERSION_ERROR",
+                        reason=result["reason"]
+                    )
+                    failed_claim_updates_for_conversion_error.append({
+                        'id': original_db_id,
+                        'processing_status': 'conversion_error',
+                        'processing_duration_ms': int(result["processing_duration_ms"]) if result["processing_duration_ms"] is not None else None,
+                        'updated_at': datetime.now(timezone.utc)
+                    })
+                claims_by_final_status_for_metric["conversion_error"] = claims_by_final_status_for_metric.get("conversion_error", 0) + 1
+
+            elif isinstance(result, ProcessableClaim):
+                processed_claim = result
+                status = processed_claim.processing_status
                 claims_by_final_status_for_metric[status] = claims_by_final_status_for_metric.get(status, 0) + 1
 
-                ml_decision_from_result = result.get("ml_decision", "N/A")
-                if ml_decision_from_result == "ML_APPROVED": ml_approved_raw_count += 1
-                elif ml_decision_from_result == "ML_REJECTED": ml_rejected_raw_count += 1
-                elif ml_decision_from_result.startswith("ML_ERROR"): ml_errors_raw_count +=1
+                if processed_claim.ml_derived_decision == "ML_APPROVED": ml_approved_raw_count +=1
+                elif processed_claim.ml_derived_decision == "ML_REJECTED": ml_rejected_raw_count +=1
+                elif processed_claim.ml_derived_decision and processed_claim.ml_derived_decision.startswith("ML_ERROR"): ml_errors_raw_count +=1
+
+                claim_update_dict = {
+                    'id': processed_claim.id, # This is original_db_claim.id
+                    'processing_status': status,
+                    'ml_score': processed_claim.ml_score,
+                    'ml_derived_decision': processed_claim.ml_derived_decision,
+                    'ml_model_version_used': processed_claim.ml_model_version_used,
+                    'processing_duration_ms': int(processed_claim.processing_duration_ms) if processed_claim.processing_duration_ms is not None else None,
+                    'processed_at': datetime.now(timezone.utc) if status == 'processing_complete' else None,
+                    'updated_at': datetime.now(timezone.utc)
+                }
+                successful_claim_updates.append(claim_update_dict)
+
+                if status == 'processing_complete' and processed_claim.line_items:
+                    for line_item in processed_claim.line_items:
+                        if line_item.rvu_total is not None and line_item.id is not None: # Ensure line_item has an ID
+                            line_item_update_dict = {
+                                'id': line_item.id,
+                                'rvu_total': line_item.rvu_total,
+                                'updated_at': datetime.now(timezone.utc)
+                            }
+                            successful_line_item_updates.append(line_item_update_dict)
+
+            elif isinstance(result, Exception):
+                logger.error("Unhandled exception from _process_single_claim_concurrently",
+                             claim_id=original_db_claim_for_result.claim_id, error=str(result), exc_info=result)
+                claims_by_final_status_for_metric["unhandled_orchestration_error"] = claims_by_final_status_for_metric.get("unhandled_orchestration_error", 0) + 1
+                # Optionally, create a FailedClaimModel for these as well, if the original_db_claim_for_result can be reliably determined
+                await self._store_failed_claim(
+                    db_claim_to_update=original_db_claim_for_result,
+                    processable_claim_instance=None, # No processable instance
+                    failed_stage="UNHANDLED_ORCHESTRATION_ERROR",
+                    reason=str(result)
+                )
+                # Update the original claim's status to reflect this error
+                failed_claim_updates_for_conversion_error.append({ # Reusing this list for simplicity for now
+                    'id': original_db_claim_for_result.id,
+                    'processing_status': 'unhandled_orchestration_error',
+                    'updated_at': datetime.now(timezone.utc)
+                })
+
+
+        # Perform Batch Database Operations
+        max_retries = 3
+        base_delay = 0.1
+        commit_successful = False
+        for attempt in range(max_retries):
+            try:
+                async with self.db.begin(): # Starts a transaction
+                    if failed_claim_updates_for_conversion_error: # Claims that failed Pydantic conversion
+                        await self.db.bulk_update_mappings(ClaimModel, failed_claim_updates_for_conversion_error)
+                        logger.info(f"Bulk updated {len(failed_claim_updates_for_conversion_error)} claims with conversion/orchestration errors.")
+
+                    if successful_claim_updates: # Claims that went through processing (successfully or failed later)
+                        await self.db.bulk_update_mappings(ClaimModel, successful_claim_updates)
+                        logger.info(f"Bulk updated {len(successful_claim_updates)} successfully processed claims.")
+
+                    if successful_line_item_updates:
+                        await self.db.bulk_update_mappings(ClaimLineItemModel, successful_line_item_updates)
+                        logger.info(f"Bulk updated {len(successful_line_item_updates)} line items.")
+
+                    # FailedClaimModel instances (added via _store_failed_claim) will be committed here.
+                    logger.info("Committing all staged changes (ClaimModel, ClaimLineItemModel, FailedClaimModel).")
+                commit_successful = True
+                break # Exit retry loop on success
+            except OperationalError as oe:
+                logger.warn(f"Attempt {attempt + 1} of {max_retries}: OperationalError during DB commit. Retrying...", error=str(oe))
+                if attempt + 1 == max_retries:
+                    logger.error(f"All {max_retries} retries failed for OperationalError during batch update.", exc_info=True)
+                    db_commit_errors_count = attempted_claims # Or be more specific if possible
+                    # Update status for all claims in this batch to a db_error status if commit fails ultimately
+                    for status_key in list(claims_by_final_status_for_metric.keys()): # Iterate over copy of keys
+                        count = claims_by_final_status_for_metric.pop(status_key)
+                        claims_by_final_status_for_metric["db_commit_error"] = \
+                            claims_by_final_status_for_metric.get("db_commit_error",0) + count
+                    break # Break from retry, error handled by summary
+            except Exception as e:
+                logger.error(f"Non-retryable error during batch DB update: {str(e)}", exc_info=True)
+                db_commit_errors_count = attempted_claims # Or be more specific
+                for status_key in list(claims_by_final_status_for_metric.keys()): # Iterate over copy of keys
+                    count = claims_by_final_status_for_metric.pop(status_key)
+                    claims_by_final_status_for_metric["db_commit_error"] = \
+                        claims_by_final_status_for_metric.get("db_commit_error",0) + count
+                break # Break from retry, error handled by summary
+
+        if not commit_successful:
+             logger.error("Batch processing failed to commit to database after retries or due to non-retryable error.")
+             # Summary will reflect failures based on claims_by_final_status_for_metric which was updated in except blocks.
+
 
         batch_duration_seconds = time.monotonic() - batch_start_time
-
         self.metrics_collector.record_batch_processed(
             batch_size=attempted_claims,
             duration_seconds=batch_duration_seconds,
             claims_by_final_status=claims_by_final_status_for_metric
         )
 
+        # Construct final summary using claims_by_final_status_for_metric
+        # This summary will now more accurately reflect outcomes including DB errors.
         final_summary = {
-            "message": "Concurrent batch processing finished.",
+            "message": "Batch processing finished.",
             "attempted_claims": attempted_claims,
             "by_status": claims_by_final_status_for_metric,
             "ml_approved_raw": ml_approved_raw_count,
             "ml_rejected_raw": ml_rejected_raw_count,
             "ml_errors_raw": ml_errors_raw_count,
+            "db_commit_errors": db_commit_errors_count, # From the loop
             "batch_duration_seconds": round(batch_duration_seconds, 2),
-            "throughput_claims_per_second": CLAIMS_THROUGHPUT_GAUGE._value.get()
+            "throughput_claims_per_second": CLAIMS_THROUGHPUT_GAUGE._value.get() if CLAIMS_THROUGHPUT_GAUGE._value else 0.0
         }
         logger.info("Concurrent batch processing summary.", **final_summary)
-
         return final_summary
 
     async def _fetch_pending_claims(self, effective_batch_size: int) -> list[ClaimModel]:
@@ -399,75 +504,5 @@ class ClaimProcessingService:
         else:
             logger.info("No pending claims found in the database.")
         return list(claims)
-
-    async def _update_claim_and_lines_in_db(self,
-                                         db_claim_to_update: ClaimModel,
-                                         processed_pydantic_claim: Optional[ProcessableClaim],
-                                         new_status: str,
-                                         duration_ms: Optional[float] = None,
-                                         validation_errors: List[str] = None,
-                                         ml_log_info: Optional[Dict] = None):
-        if db_claim_to_update is None:
-            logger.error("Cannot update claim in DB: SQLAlchemy model instance is None.")
-            return
-
-        logger.info("Updating claim and lines in DB", claim_db_id=db_claim_to_update.id, new_status=new_status, duration_ms=duration_ms)
-
-        db_claim_to_update.processing_status = new_status
-        if duration_ms is not None:
-            db_claim_to_update.processing_duration_ms = int(duration_ms)
-        if processed_pydantic_claim:
-            if processed_pydantic_claim.ml_score is not None:
-                db_claim_to_update.ml_score = Decimal(str(processed_pydantic_claim.ml_score))
-            if processed_pydantic_claim.ml_derived_decision is not None:
-                db_claim_to_update.ml_derived_decision = processed_pydantic_claim.ml_derived_decision
-            if processed_pydantic_claim.ml_model_version_used is not None: # Persist model version used
-                db_claim_to_update.ml_model_version_used = processed_pydantic_claim.ml_model_version_used
-
-            if new_status == "processing_complete" and processed_pydantic_claim.line_items:
-                map_pydantic_line_items = {line.id: line for line in processed_pydantic_claim.line_items}
-                for db_line_item in db_claim_to_update.line_items:
-                    if db_line_item.id in map_pydantic_line_items:
-                        pydantic_line = map_pydantic_line_items[db_line_item.id]
-                        if pydantic_line.rvu_total is not None:
-                            db_line_item.rvu_total = pydantic_line.rvu_total
-            db_claim_to_update.processed_at = datetime.now(timezone.utc)
-
-        max_retries = 3
-        base_delay = 0.1
-
-        for attempt in range(max_retries):
-            try:
-                self.db.add(db_claim_to_update)
-                await self.db.commit()
-
-                logger.info(f"Attempt {attempt + 1}: Claim and lines updated successfully in DB",
-                            claim_db_id=db_claim_to_update.id, new_status=db_claim_to_update.processing_status)
-
-                await self.db.refresh(db_claim_to_update)
-                if db_claim_to_update.line_items:
-                    for line_item_to_refresh in db_claim_to_update.line_items:
-                        await self.db.refresh(line_item_to_refresh)
-                return
-            except OperationalError as oe:
-                logger.warn(f"Attempt {attempt + 1} of {max_retries}: OperationalError during DB commit. Retrying...",
-                            claim_db_id=db_claim_to_update.id, error=str(oe))
-                await self.db.rollback()
-                if attempt + 1 == max_retries:
-                    logger.error(f"All {max_retries} retries failed for OperationalError.", claim_db_id=db_claim_to_update.id)
-                    raise
-
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
-            except Exception as e:
-                logger.error(f"Attempt {attempt + 1} (or non-retryable error): Failed to update claim and lines in DB.",
-                             claim_db_id=db_claim_to_update.id if db_claim_to_update else "Unknown ID",
-                             error=str(e), exc_info=True)
-                await self.db.rollback()
-                raise
-
-        logger.error("Fell through retry loop in _update_claim_and_lines_in_db without success or re-raising error.",
-                     claim_db_id=db_claim_to_update.id if db_claim_to_update else "Unknown ID")
-        raise Exception(f"Failed to update claim {db_claim_to_update.id if db_claim_to_update else 'Unknown ID'} after all retries, but no specific exception was propagated.")
 
 ```
