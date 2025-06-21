@@ -33,6 +33,30 @@ CLAIM_INDIVIDUAL_PROCESSING_DURATION_SECONDS = Histogram(
     buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, float('inf'))
 )
 
+# Default buckets for stage durations
+STAGE_DURATION_BUCKETS = (
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0,
+    2.5, 5.0, float('inf')
+)
+
+VALIDATION_STAGE_DURATION_SECONDS = Histogram(
+    'validation_stage_duration_seconds',
+    'Time spent in the validation stage for a single claim.',
+    buckets=STAGE_DURATION_BUCKETS
+)
+
+ML_STAGE_DURATION_SECONDS = Histogram(
+    'ml_stage_duration_seconds',
+    'Time spent in the ML feature extraction and prediction stage for a single claim.',
+    buckets=STAGE_DURATION_BUCKETS
+)
+
+RVU_STAGE_DURATION_SECONDS = Histogram(
+    'rvu_stage_duration_seconds',
+    'Time spent in the RVU calculation stage for a single claim.',
+    buckets=STAGE_DURATION_BUCKETS
+)
+
 # Renamed from CLAIMS_THROUGHPUT_CLAIMS_PER_SECOND
 CLAIMS_THROUGHPUT_GAUGE = Gauge(
     'claims_throughput_gauge', # Renamed
@@ -141,6 +165,18 @@ class MetricsCollector:
 
     def record_ml_inference_duration(self, duration_seconds: float):
         ML_INFERENCE_DURATION_SECONDS.observe(duration_seconds)
+
+    def record_validation_stage_duration(self, duration_seconds: float):
+        """Records the duration of the validation stage for a single claim."""
+        VALIDATION_STAGE_DURATION_SECONDS.observe(duration_seconds)
+
+    def record_ml_stage_duration(self, duration_seconds: float):
+        """Records the duration of the ML stage for a single claim."""
+        ML_STAGE_DURATION_SECONDS.observe(duration_seconds)
+
+    def record_rvu_stage_duration(self, duration_seconds: float):
+        """Records the duration of the RVU calculation stage for a single claim."""
+        RVU_STAGE_DURATION_SECONDS.observe(duration_seconds)
 
     # Timer class for timing database queries
     class _DatabaseTimer: # Renamed to avoid potential confusion if Timer is used elsewhere

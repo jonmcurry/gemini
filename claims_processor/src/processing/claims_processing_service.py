@@ -166,12 +166,12 @@ class ClaimProcessingService:
                                                    failed_stage="ML_ERROR", reason=error_reason_ml_err)
                     return processable_claim
             except Exception as e:
-                logger.error("Unhandled error during ML stage", claim_id=processable_claim.claim_id, error=str(e), exc_info=True) # Updated log
-                processable_claim.processing_status = "ml_error_internal" # Updated status
+                logger.error("Unhandled error during ML stage", claim_id=processable_claim.claim_id, error=str(e), exc_info=True)
+                processable_claim.processing_status = "ml_error_internal"
                 await self._store_failed_claim(
                     db_claim_to_update=db_claim_model_for_failed,
                     processable_claim_instance=processable_claim,
-                    failed_stage="ML_INTERNAL_ERROR", # Updated stage
+                    failed_stage="ML_INTERNAL_ERROR",
                     reason=str(e)
                 )
         return processable_claim
@@ -192,7 +192,7 @@ class ClaimProcessingService:
                                                failed_stage="RVU_CALCULATION_FAILED", reason=error_reason_rvu)
         return processable_claim
 
-    async def _process_single_claim_concurrently(self, db_claim: ClaimModel) -> Any: # Return type can be ProcessableClaim or Dict
+    async def _process_single_claim_concurrently(self, db_claim: ClaimModel) -> Any:
         start_time = time.monotonic()
         processable_claim_instance: Optional[ProcessableClaim] = None
 
@@ -236,14 +236,22 @@ class ClaimProcessingService:
 
             # --- Orchestration of Stages ---
             # 2. Perform Validation Stage
+            val_stage_start_time = time.perf_counter()
             processable_claim_instance = await self._perform_validation_stage(processable_claim_instance, db_claim)
+            val_stage_duration = time.perf_counter() - val_stage_start_time
+            self.metrics_collector.record_validation_stage_duration(val_stage_duration)
+
             if processable_claim_instance.processing_status != "validation_complete":
                 logger.info("Claim processing halted after validation stage.",
                             claim_id=processable_claim_instance.claim_id, status=processable_claim_instance.processing_status)
                 return processable_claim_instance
 
             # 3. Perform ML Stage (if validation succeeded)
+            ml_stage_start_time = time.perf_counter()
             processable_claim_instance = await self._perform_ml_stage(processable_claim_instance, db_claim)
+            ml_stage_duration = time.perf_counter() - ml_stage_start_time
+            self.metrics_collector.record_ml_stage_duration(ml_stage_duration)
+
             if processable_claim_instance.processing_status not in ["ml_complete"]:
                 logger.info("Claim processing halted after ML stage.",
                             claim_id=processable_claim_instance.claim_id, status=processable_claim_instance.processing_status)
@@ -251,7 +259,10 @@ class ClaimProcessingService:
 
             # 4. Perform RVU Calculation (if ML is complete)
             if processable_claim_instance.processing_status == "ml_complete":
+                 rvu_stage_start_time = time.perf_counter()
                  processable_claim_instance = await self._perform_rvu_calculation(processable_claim_instance, db_claim)
+                 rvu_stage_duration = time.perf_counter() - rvu_stage_start_time
+                 self.metrics_collector.record_rvu_stage_duration(rvu_stage_duration)
 
             # 5. Final state of processable_claim_instance is returned.
             return processable_claim_instance
@@ -561,7 +572,3 @@ class ClaimProcessingService:
         except Exception as e:
             logger.error("Unexpected error during _fetch_pending_claims", error=str(e), exc_info=True)
             raise
-
-```
-
-[end of claims_processor/src/processing/claims_processing_service.py]

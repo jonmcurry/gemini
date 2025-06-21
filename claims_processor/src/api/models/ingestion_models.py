@@ -59,4 +59,3 @@ class IngestionClaim(BaseModel):
     # Pydantic model config can be added if needed, e.g., for extra='forbid'
     # class Config:
     #     extra = "forbid"
-```

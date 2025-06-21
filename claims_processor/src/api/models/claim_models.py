@@ -52,6 +52,11 @@ class ProcessableClaimLineItem(BaseModel):
     #     orm_mode = True
 
 
+class BatchProcessResponse(BaseModel):
+    message: str
+    batch_size: int
+
+
 class ProcessableClaim(BaseModel):
     id: int # Primary Key from DB
     claim_id: str # Business claim ID

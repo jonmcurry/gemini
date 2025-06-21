@@ -194,4 +194,3 @@ class DataIngestionService:
             "failed_ingestion_claims": failed_ingestion_count, # Total claims that could not be staged
             "errors": errors_detail
         }
-```

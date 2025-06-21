@@ -97,7 +97,7 @@ from sqlalchemy import text, AsyncSession # Added AsyncSession for Depends
 from sqlalchemy.ext.asyncio import AsyncSession # Ensure this is the one used by get_db_session
 from typing import Dict, Any
 from .core.database.db_session import get_db_session # Added get_db_session for Depends
-from .core.cache.cache_manager import get_cache_service, CacheManager
+from .core.cache.cache_manager import get_cache_manager, CacheManager # Changed get_cache_service to get_cache_manager
 import uuid
 from .core.config.settings import get_settings, Settings # Add Settings for type hint and get_settings
 from pathlib import Path # For file path checking
@@ -106,7 +106,7 @@ from pathlib import Path # For file path checking
 @app.get("/ready", tags=["Monitoring"])
 async def readiness_check(
     db: AsyncSession = Depends(get_db_session),
-    cache: CacheManager = Depends(get_cache_service),
+    cache: CacheManager = Depends(get_cache_manager), # Changed get_cache_service to get_cache_manager
     # settings: Settings = Depends(get_settings) # Alternative: inject settings
     # audit_logger: AuditLogger = Depends(get_audit_logger) # Example if needed here
 ) -> Dict[str, Any]:

@@ -16,6 +16,7 @@ from claims_processor.src.core.config.settings import Settings
 from claims_processor.src.core.security.encryption_service import EncryptionService # Added
 from claims_processor.src.processing.ml_pipeline.optimized_predictor import OptimizedPredictor
 from sqlalchemy import update # Added for fetch logic tests if needed, though not directly in service tests usually
+import numpy as np # Added for np.array used in tests
 
 # Using a fixed UTC for tests
 try:
@@ -42,6 +43,10 @@ def mock_metrics_collector():
     collector = MagicMock(spec=MetricsCollector)
     collector.record_individual_claim_duration = MagicMock()
     collector.record_batch_processed = MagicMock()
+    # Add mocks for new stage duration metrics
+    collector.record_validation_stage_duration = MagicMock()
+    collector.record_ml_stage_duration = MagicMock()
+    collector.record_rvu_stage_duration = MagicMock()
     return collector
 
 @pytest.fixture
@@ -362,7 +367,8 @@ async def test_ab_routing_to_challenger_model(mock_sha256: MagicMock, claim_proc
 async def test_pii_decryption_and_ml_version_in_process_single_claim(
     claim_processing_service_instance: ClaimProcessingService,
     mock_settings: Settings,
-    mock_encryption_service: MagicMock # Added mock_encryption_service
+    mock_encryption_service: MagicMock,
+    mock_metrics_collector: MagicMock # Added to assert calls
 ):
     # Prepare a ClaimModel with encrypted PII
     raw_dob_str = "1995-05-15"
@@ -436,6 +442,13 @@ async def test_pii_decryption_and_ml_version_in_process_single_claim(
     mock_encryption_service.decrypt.assert_any_call(f"encrypted_{raw_dob_str}")
     mock_encryption_service.decrypt.assert_any_call(f"encrypted_{raw_mrn}")
     mock_encryption_service.decrypt.assert_any_call(f"encrypted_{raw_subscriber_id}")
+
+    # Assert that stage duration metrics were called
+    from unittest.mock import ANY
+    mock_metrics_collector.record_validation_stage_duration.assert_called_once_with(ANY)
+    mock_metrics_collector.record_ml_stage_duration.assert_called_once_with(ANY)
+    mock_metrics_collector.record_rvu_stage_duration.assert_called_once_with(ANY)
+    mock_metrics_collector.record_individual_claim_duration.assert_called_once_with(ANY)
 
 
 # --- Tests for _fetch_pending_claims ordering ---
@@ -775,8 +788,84 @@ async def test_process_pending_claims_batch_no_claims(
         claims_by_final_status={}
     )
 
+# Remove the first duplicated block of tests for fetch retries
+# The first duplicate of test_process_batch_fetch_retries_then_succeeds starts here
+# and test_process_batch_fetch_all_retries_fail follows it.
+# We will keep the second block which is identical and located further down.
 
 # --- Tests for Batch Fetch Retry Logic ---
+# @pytest.mark.asyncio
+# @patch('asyncio.sleep', new_callable=AsyncMock)
+# async def test_process_batch_fetch_retries_then_succeeds(
+#     mock_async_sleep: AsyncMock,
+#     claim_processing_service_instance: ClaimProcessingService,
+#     mock_metrics_collector: MagicMock,
+#     mock_db_session: MagicMock # To control commit success
+# ):
+#     batch_size = 5
+#     # Ensure settings reflect retry config for this test
+#     # These are already set in the mock_settings fixture to: MAX_FETCH_RETRIES = 2, FETCH_RETRY_DELAY_SECONDS = 0.01
+#     # claim_processing_service_instance.settings.MAX_FETCH_RETRIES = 2
+#     # claim_processing_service_instance.settings.FETCH_RETRY_DELAY_SECONDS = 0.01
+#
+#     mock_claims_to_return = [create_mock_db_claim("C1_retry_succ")]
+#
+#     # Mock _fetch_pending_claims to fail once, then succeed
+#     # Accessing the _fetch_pending_claims through the instance, as it's a method of the class
+#     claim_processing_service_instance._fetch_pending_claims = AsyncMock(side_effect=[
+#         OperationalError("Simulated DB error on fetch", {}, None),
+#         mock_claims_to_return # Successful fetch on 2nd attempt
+#     ])
+#
+#     # Mock _process_single_claim_concurrently to return a simple success
+#     mock_processed_claim = create_mock_processable_claim_from_db(mock_claims_to_return[0])
+#     mock_processed_claim.processing_status = "processing_complete"
+#     claim_processing_service_instance._process_single_claim_concurrently = AsyncMock(return_value=mock_processed_claim)
+#
+#     # Ensure commit is successful
+#     mock_db_session.begin.return_value.__aexit__ = AsyncMock(return_value=None)
+#
+#     summary = await claim_processing_service_instance.process_pending_claims_batch(batch_size_override=batch_size)
+#
+#     assert claim_processing_service_instance._fetch_pending_claims.call_count == 2
+#     mock_async_sleep.assert_called_once_with(claim_processing_service_instance.settings.FETCH_RETRY_DELAY_SECONDS)
+#
+#     assert summary["attempted_claims"] == 1
+#     assert summary["by_status"].get("processing_complete") == 1
+#     mock_metrics_collector.record_batch_processed.assert_called_once()
+#
+#
+# @pytest.mark.asyncio
+# @patch('asyncio.sleep', new_callable=AsyncMock)
+# async def test_process_batch_fetch_all_retries_fail(
+#     mock_async_sleep: AsyncMock,
+#     claim_processing_service_instance: ClaimProcessingService,
+#     mock_metrics_collector: MagicMock
+# ):
+#     batch_size = 5
+#     # Settings for retries are from mock_settings fixture (MAX_FETCH_RETRIES = 2)
+#     max_retries = claim_processing_service_instance.settings.MAX_FETCH_RETRIES
+#
+#     claim_processing_service_instance._fetch_pending_claims = AsyncMock(
+#         side_effect=OperationalError("Simulated DB error on fetch", {}, None)
+#     )
+#
+#     summary = await claim_processing_service_instance.process_pending_claims_batch(batch_size_override=batch_size)
+#
+#     assert claim_processing_service_instance._fetch_pending_claims.call_count == max_retries
+#     assert mock_async_sleep.call_count == max_retries -1
+#
+#     assert summary["attempted_claims"] == 0
+#     assert summary["message"] == "Batch processing aborted: Failed to fetch claims after multiple retries."
+#     # The effective_batch_size passed to _fetch_pending_claims is used in the summary when fetch fails
+#     assert summary["by_status"].get("fetch_error") == batch_size
+#
+#     mock_metrics_collector.record_batch_processed.assert_called_once()
+#     metrics_args_kwargs = mock_metrics_collector.record_batch_processed.call_args.kwargs
+#     assert metrics_args_kwargs["batch_size"] == 0
+#     assert metrics_args_kwargs["claims_by_final_status"] == {"fetch_error": batch_size}
+
+
 @pytest.mark.asyncio
 @patch('asyncio.sleep', new_callable=AsyncMock)
 async def test_process_batch_fetch_retries_then_succeeds(
