@@ -2,14 +2,46 @@ from fastapi import FastAPI, Request, Depends # Added Request, Depends
 from datetime import datetime, timezone
 from .api.routes import claims_routes, submission_routes # Import the new router
 from .monitoring.logging.logging_config import setup_logging
-from .core.monitoring.audit_logger import AuditLogger # Added AuditLogger
-from .api.dependencies import get_audit_logger # Added get_audit_logger
+from .core.monitoring.audit_logger import AuditLogger
+from .api.dependencies import get_audit_logger
 import structlog
+
+# Imports for DB warmup
+from sqlalchemy import text
+from .core.database.db_session import engine as async_engine # Use 'engine' as defined in db_session.py
+from .core.config.settings import get_settings
 
 setup_logging() # Initialize logging
 logger = structlog.get_logger(__name__)
 
 app = FastAPI()
+
+# --- DB Pool Warmup ---
+async def warmup_db_pool():
+    logger.info("Application startup: warming up database connection pool...")
+    app_settings = get_settings()
+    # Determine number of connections for warmup
+    warmup_count = 0
+    if app_settings.DB_POOL_SIZE > 0: # DB_POOL_SIZE should exist in Settings
+        warmup_count = min(app_settings.DB_POOL_SIZE, 3)
+
+    if warmup_count == 0:
+        logger.info("DB_POOL_SIZE is 0 or not configured for positive value. Skipping pool warmup.")
+        return
+
+    try:
+        for i in range(warmup_count):
+            async with async_engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+                # No commit needed for SELECT 1
+            logger.debug(f"DB warmup connection {i+1}/{warmup_count} successful.")
+        logger.info(f"Database connection pool warmed up with {warmup_count} connections.")
+    except Exception as e:
+        logger.error(f"Error during database connection pool warmup: {e}", exc_info=True)
+
+app.add_event_handler("startup", warmup_db_pool)
+# --- End DB Pool Warmup ---
+
 
 # Import for shutdown event
 from .core.cache.cache_manager import close_global_cache_manager
