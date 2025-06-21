@@ -11,11 +11,14 @@ from sqlalchemy import select
 from ..core.database.models.claims_db import ClaimModel
 from ..core.database.models.claims_production_db import ClaimsProductionModel
 from decimal import Decimal
-from sqlalchemy.sql import insert, update # Added update
-from datetime import datetime, timezone # Added datetime, timezone
-from sqlalchemy.dialects.postgresql import insert as pg_insert # Added for ON CONFLICT
-from typing import Optional # For Optional type hint
-from ..core.config.settings import get_settings # For batch size setting
+from sqlalchemy.sql import insert, update
+from sqlalchemy import text
+from datetime import datetime, timezone
+# from sqlalchemy.dialects.postgresql import insert as pg_insert # Removed as no longer used
+from typing import Optional
+from ..core.config.settings import get_settings
+from sqlalchemy.exc import OperationalError # Added for retry logic
+import asyncio # Added for asyncio.sleep
 
 logger = structlog.get_logger(__name__)
 
@@ -29,47 +32,96 @@ class DataTransferService:
         effective_limit = limit if limit is not None else self.settings.TRANSFER_BATCH_SIZE
         logger.info("Starting transfer of claims to production", record_limit=effective_limit)
 
-        staging_claims_to_transfer = await self._select_claims_from_staging(effective_limit)
+        # Define retry parameters (consider moving to settings if more widely used)
+        max_retries = self.settings.MAX_DB_RETRIES if hasattr(self.settings, 'MAX_DB_RETRIES') else 3
+        retry_delay = self.settings.DB_RETRY_DELAY if hasattr(self.settings, 'DB_RETRY_DELAY') else 1.0
 
-        if not staging_claims_to_transfer:
-            logger.info("No claims found in staging ready for transfer to production.")
-            return {"message": "No claims to transfer.", "transferred_count": 0, "selected_from_staging": 0}
+        staging_claims_to_transfer: List[ClaimModel] = []
+        production_claim_records: List[Dict[str, Any]] = []
+        successfully_inserted_count = 0
 
-        production_claim_records = self._map_staging_to_production_records(staging_claims_to_transfer)
+        for attempt in range(max_retries):
+            try:
+                async with self.db.begin(): # Single transaction for all operations in this attempt
+                    staging_claims_to_transfer = await self._select_claims_from_staging(effective_limit)
 
-        if not production_claim_records:
-            logger.warn("Mapping resulted in zero production records, though staging claims were selected.",
-                        num_staging_claims=len(staging_claims_to_transfer))
-            return {"message": "Mapping failed to produce records for transfer.",
+                    if not staging_claims_to_transfer:
+                        logger.info("No claims found in staging ready for transfer on attempt %d.", attempt + 1)
+                        # No need to break here, as the outer summary handles empty list.
+                        # The transaction will simply commit nothing.
+                        successfully_inserted_count = 0 # Ensure it's reset for this path
+                        production_claim_records = [] # Ensure it's reset
+                        break # Break retry loop, as no claims means nothing to retry for fetch.
+
+                    production_claim_records = self._map_staging_to_production_records(staging_claims_to_transfer)
+
+                    if not production_claim_records:
+                        logger.warn("Mapping resulted in zero production records on attempt %d.", attempt + 1,
+                                    num_staging_claims=len(staging_claims_to_transfer))
+                        successfully_inserted_count = 0 # Ensure reset
+                        break # Break retry loop, mapping failure is not a DB operational error.
+
+                    # Replace _bulk_insert_to_production with _upsert_to_production_with_copy
+                    successfully_inserted_count = await self._upsert_to_production_with_copy(production_claim_records)
+
+                    if successfully_inserted_count > 0:
+                        if successfully_inserted_count == len(production_claim_records):
+                            await self._update_staging_claims_after_transfer(staging_claims_to_transfer)
+                        else:
+                            logger.warn(
+                                f"Attempt {attempt + 1}: Mismatch in upserted count ({successfully_inserted_count}) vs "
+                                f"mapped count ({len(production_claim_records)}). "
+                                "Staging records not updated to prevent inconsistency. This may require manual review."
+                            )
+                            # This is a partial success, but the transaction will commit what was done.
+                            # Further partial inserts are complex to handle robustly without more info.
+                            # For now, we commit this partial success and log the warning.
+                    elif len(production_claim_records) > 0:
+                        logger.warn("Attempt %d: No records were upserted into production (upsert step returned 0). Staging records not updated.", attempt + 1)
+
+                logger.info(f"Attempt {attempt + 1}: Transaction successful.")
+                break # Success, exit retry loop
+
+            except OperationalError as oe:
+                logger.warn(f"Attempt {attempt + 1} of {max_retries}: OperationalError during data transfer transaction. Retrying in {retry_delay}s...", error=str(oe))
+                if attempt + 1 == max_retries:
+                    logger.error("All attempts failed for data transfer due to OperationalError.", exc_info=True)
+                    # Reset counts as the final transaction failed
+                    successfully_inserted_count = 0
+                    # staging_claims_to_transfer and production_claim_records will hold values from last failed attempt's try block
+                    # This is okay for final summary context.
+                    return {
+                        "message": "Data transfer process failed after multiple retries.",
+                        "selected_from_staging": len(staging_claims_to_transfer), # From last attempt
+                        "mapped_to_production_format": len(production_claim_records), # From last attempt
+                        "successfully_transferred": 0,
+                        "error": str(oe)
+                    }
+                await asyncio.sleep(retry_delay)
+            except Exception as e:
+                logger.error(f"Critical non-retryable error during data transfer transaction: {e}", exc_info=True)
+                successfully_inserted_count = 0
+                return {
+                    "message": "Data transfer process failed due to a non-retryable critical error.",
                     "selected_from_staging": len(staging_claims_to_transfer),
-                    "transferred_count": 0}
+                    "mapped_to_production_format": len(production_claim_records),
+                    "successfully_transferred": 0,
+                    "error": str(e)
+                }
 
-
-        successfully_inserted_count = await self._bulk_insert_to_production(production_claim_records)
-
-
-        if successfully_inserted_count > 0:
-            # Assuming successfully_inserted_count implies all records in production_claim_records were inserted
-            # due to the transactional nature of _bulk_insert_to_production.
-            if successfully_inserted_count == len(production_claim_records):
-                 await self._update_staging_claims_after_transfer(staging_claims_to_transfer)
-            else:
-                # This case suggests a mismatch or an issue if _bulk_insert_to_production logic changes
-                # to allow partial inserts (which it currently doesn't explicitly signal well).
-                logger.warn(f"Mismatch in inserted count ({successfully_inserted_count}) vs mapped count ({len(production_claim_records)}). Staging records not updated to prevent inconsistency.")
-        elif len(production_claim_records) > 0: # If we attempted to insert but got 0 success
-            logger.warn("No records were inserted into production table (insert step failed). Staging records not updated.")
-        # else: No records to map/insert, so no update needed.
+        # Final logging and return based on the outcome of the loop
+        if not staging_claims_to_transfer and successfully_inserted_count == 0: # Handles case where _select_claims_from_staging was empty
+             logger.info("No claims found in staging ready for transfer.")
+             return {"message": "No claims to transfer.", "transferred_count": 0, "selected_from_staging": 0}
 
         logger.info(
-            "Data transfer to production processing step finished.",
+            "Data transfer to production finished.",
             selected_from_staging=len(staging_claims_to_transfer),
             mapped_to_production_format=len(production_claim_records),
             successfully_transferred_to_prod_db=successfully_inserted_count
         )
-
         return {
-            "message": "Data transfer process step finished.",
+            "message": "Data transfer process finished.",
             "selected_from_staging": len(staging_claims_to_transfer),
             "mapped_to_production_format": len(production_claim_records),
             "successfully_transferred": successfully_inserted_count
@@ -154,60 +206,129 @@ class DataTransferService:
         logger.info(f"Successfully mapped {len(production_records)} claims.")
         return production_records
 
-    async def _bulk_insert_to_production(self, production_records: List[Dict[str, Any]]) -> int:
+    def _format_data_for_copy(
+        self,
+        production_records: List[Dict[str, Any]],
+        column_names: List[str]
+    ) -> List[tuple]:
         """
-        Bulk inserts records into the ClaimsProductionModel table.
-        Returns the count of successfully inserted records.
-        Uses SQLAlchemy Core insert for efficiency with the existing session.
+        Formats a list of dictionaries into a list of tuples for asyncpg's copy_records_to_table.
+        The order of values in each tuple must match the order of column_names.
         """
         if not production_records:
+            return []
+
+        formatted_records = []
+        for record_dict in production_records:
+            # Ensure all column_names are present in the dict, or handle missing ones (e.g. default to None)
+            # For robustness, get with default None if a key might be missing, though mapped records should be consistent.
+            record_tuple = tuple(record_dict.get(col_name) for col_name in column_names)
+            formatted_records.append(record_tuple)
+
+        # Log a sample for verification if needed, but be careful with PII if any
+        # if formatted_records:
+        #     logger.debug("Sample record formatted for COPY", sample_tuple=formatted_records[0], column_order=column_names)
+
+        return formatted_records
+
+    async def _upsert_to_production_with_copy(
+        self,
+        production_records: List[Dict[str, Any]]
+    ) -> int:
+        """
+        Upserts records into claims_production using a temporary table and COPY,
+        followed by an INSERT ... ON CONFLICT ... SELECT statement.
+        This method assumes it is called within an existing SQLAlchemy session transaction
+        started by the caller (e.g. process_pending_claims_batch's retry loop).
+        """
+        if not production_records:
+            logger.info("No production records to upsert with COPY.")
             return 0
 
-        logger.info(f"Attempting to bulk upsert {len(production_records)} records into claims_production.")
+        # Column order for COPY and INSERT...SELECT
+        # Must match ClaimsProductionModel and the output of _map_staging_to_production_records
+        column_names = [
+            "id", "claim_id", "facility_id", "patient_account_number",
+            "patient_first_name", "patient_last_name", "patient_date_of_birth",
+            "service_from_date", "service_to_date", "total_charges",
+            "ml_prediction_score", "risk_category", "processing_duration_ms",
+            "throughput_achieved", "ml_model_version_used"
+            # created_at and updated_at are handled by server_default or ON UPDATE triggers in ClaimsProductionModel
+        ]
+
+        temp_table_name = f"temp_claims_upsert_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+
 
         try:
-            insert_stmt = pg_insert(ClaimsProductionModel.__table__).values(production_records)
+            # Get raw asyncpg connection. The main transaction is managed by the caller.
+            async_sqla_conn = await self.db.get_bind() # get_bind() gives the Engine or Connection
+            raw_pg_conn = await async_sqla_conn.get_raw_connection()
 
-            # Define the columns to update on conflict, excluding 'id'
-            # These names must match the columns in ClaimsProductionModel and keys in production_records
-            update_columns = {
-                'claim_id': insert_stmt.excluded.claim_id,
-                'facility_id': insert_stmt.excluded.facility_id,
-                'patient_account_number': insert_stmt.excluded.patient_account_number,
-                'patient_first_name': insert_stmt.excluded.patient_first_name,
-                'patient_last_name': insert_stmt.excluded.patient_last_name,
-                'patient_date_of_birth': insert_stmt.excluded.patient_date_of_birth,
-                'service_from_date': insert_stmt.excluded.service_from_date,
-                'service_to_date': insert_stmt.excluded.service_to_date,
-                'total_charges': insert_stmt.excluded.total_charges,
-                'ml_prediction_score': insert_stmt.excluded.ml_prediction_score,
-                'ml_model_version_used': insert_stmt.excluded.ml_model_version_used, # Added new field
-                'processing_duration_ms': insert_stmt.excluded.processing_duration_ms,
-                'throughput_achieved': insert_stmt.excluded.throughput_achieved,
-                'risk_category': insert_stmt.excluded.risk_category,
-                # Ensure all other relevant fields from ClaimsProductionModel are here
-                # if they are present in production_records and should be updated.
-                # 'created_at' and 'updated_at' are usually handled by DB defaults or triggers
-                # and might not need to be in 'set_' unless explicitly managed here.
-            }
 
-            upsert_stmt = insert_stmt.on_conflict_do_update(
-                index_elements=['id'],  # The column that causes a conflict
-                set_=update_columns
+            create_temp_table_sql = f"""
+            CREATE TEMP TABLE {temp_table_name} (
+                LIKE claims_production INCLUDING DEFAULTS
+            ) ON COMMIT DROP;
+            """
+            await raw_pg_conn.execute(create_temp_table_sql)
+            logger.debug(f"Temporary table {temp_table_name} created for COPY operation.")
+
+            formatted_records_for_copy = self._format_data_for_copy(production_records, column_names)
+            if not formatted_records_for_copy:
+                logger.info("No records to COPY after formatting.")
+                # No need to close raw_pg_conn here, it's managed by SQLAlchemy session
+                return 0
+
+            await raw_pg_conn.copy_records_to_table(
+                temp_table_name,
+                records=formatted_records_for_copy,
+                columns=column_names,
+                timeout=60
             )
+            logger.debug(f"Successfully copied {len(formatted_records_for_copy)} records to {temp_table_name}.")
 
-            result = await self.db.execute(upsert_stmt)
-            await self.db.commit()
+            insert_cols_str = ", ".join(f'"{col}"' for col in column_names) # Quote column names
+            update_set_parts = []
+            for col in column_names:
+                if col != "id": # 'id' is the conflict target
+                    update_set_parts.append(f'"{col}" = EXCLUDED."{col}"')
 
-            # result.rowcount typically gives the number of rows affected (inserted or updated)
-            affected_rows = result.rowcount if result else 0
-            logger.info(f"Successfully bulk upserted records into claims_production. Rows affected: {affected_rows}.")
+            # Add explicit updated_at for ON CONFLICT case
+            update_set_parts.append('"updated_at" = NOW()')
+            update_set_str = ", ".join(update_set_parts)
+
+            upsert_sql = f"""
+            INSERT INTO claims_production ({insert_cols_str})
+            SELECT {insert_cols_str} FROM {temp_table_name}
+            ON CONFLICT (id) DO UPDATE
+            SET {update_set_str};
+            """
+            status_message = await raw_pg_conn.execute(upsert_sql)
+            logger.debug(f"Upsert from temp table completed. Status: {status_message}")
+
+            affected_rows = 0
+            if status_message:
+                parts = status_message.split()
+                if len(parts) > 0: # Typically "INSERT 0 N" or "UPDATE N"
+                    try:
+                        # For INSERT ... ON CONFLICT, status is "INSERT oid rows"
+                        # where rows is the count of rows inserted OR updated.
+                        affected_rows = int(parts[-1])
+                    except ValueError:
+                        logger.warn(f"Could not parse row count from status_message: {status_message}")
+
+            # Temporary table is dropped ON COMMIT.
+            # No need to close raw_pg_conn, SQLAlchemy session handles the underlying connection lifecycle.
             return affected_rows
 
         except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Failed to bulk upsert records into claims_production: {e}", exc_info=True)
-            return 0
+            logger.error(f"Error during COPY-based upsert to production: {e}", exc_info=True)
+            # No rollback here, as the method assumes it's part of a larger transaction
+            # managed by the caller (process_pending_claims_batch's retry loop)
+            raise
+
+    # _bulk_insert_to_production method removed as it's superseded by _upsert_to_production_with_copy
+    # and its only call site was updated.
 
     async def _update_staging_claims_after_transfer(self, transferred_staging_claims: List[ClaimModel]):
         """
@@ -237,10 +358,12 @@ class DataTransferService:
             )
 
             result = await self.db.execute(stmt)
-            await self.db.commit()
+            # await self.db.commit() # Removed: Commit managed by caller
 
-            logger.info(f"Successfully updated {result.rowcount if result else 'N/A'} staging claims. Claim IDs: {claim_ids_to_update}")
+            logger.info(f"Staging claims update statement executed. Rows matched: {result.rowcount if result else 'N/A'}. Claim IDs: {claim_ids_to_update}")
+            # The actual commit will happen in the calling method's transaction.
 
         except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Failed to update staging claims after transfer: {e}", exc_info=True)
+            # await self.db.rollback() # Removed: Rollback managed by caller
+            logger.error(f"Failed to execute update for staging claims after transfer: {e}", exc_info=True)
+            raise # Re-raise to trigger rollback in the calling transaction

@@ -15,11 +15,41 @@ def mock_db_session() -> MagicMock:
     session.execute = AsyncMock()
     session.commit = AsyncMock()
     session.rollback = AsyncMock()
-    session.add = MagicMock() # Added from my plan
-    session.add_all = MagicMock() # Added from my plan
+    session.add = MagicMock()
+    session.add_all = MagicMock()
+
     # For 'async with session.begin()'
-    async_cm = AsyncMock()
-    session.begin = MagicMock(return_value=async_cm)
+    mock_transaction_cm = AsyncMock() # Context manager for session.begin()
+    # __aenter__ on this CM should return the session itself if structure is `async with session.begin() as tx_session:`
+    # but DataTransferService uses `async with self.db.begin():` without `as...`, so __aenter__ doesn't need specific return.
+    # However, the operations are then on `self.db` (our `session` mock).
+    mock_transaction_cm.__aexit__ = AsyncMock(return_value=None) # Default success for commit
+    session.begin.return_value = mock_transaction_cm
+
+    # Setup for asyncpg raw connection mocking: session.get_bind().get_raw_connection()
+    mock_raw_pg_conn = AsyncMock()
+    mock_raw_pg_conn.execute = AsyncMock(return_value="INSERT 0 1") # Default success
+    mock_raw_pg_conn.copy_records_to_table = AsyncMock()
+    mock_raw_pg_conn.is_closed = MagicMock(return_value=False)
+    mock_raw_pg_conn.close = AsyncMock()
+
+    mock_sqla_connection = AsyncMock() # Mock for SQLAlchemy Connection object
+    mock_sqla_connection.get_raw_connection = AsyncMock(return_value=mock_raw_pg_conn)
+
+    # To mock `await self.db.get_bind()` returning an object that has `get_raw_connection`
+    # If `self.db` is directly the session, then `self.db.connection()` is the call.
+    # Let's assume `self.db` is the session, so `self.db.get_bind()` is not standard.
+    # `self.db.connection()` would return an `AsyncConnection` which then has `get_raw_connection()`
+    # For testing, we can mock `get_bind()` if the code was `await self.db.get_bind().get_raw_connection()`
+    # The actual code in _upsert_to_production_with_copy is `await self.db.get_bind()`
+    # which implies self.db is an Engine-like object or the Session has get_bind().
+    # Let's assume self.db (the session mock) should have get_bind() mocked.
+
+    mock_engine_or_conn_facade = AsyncMock() # This is what get_bind() might return
+    mock_engine_or_conn_facade.get_raw_connection = AsyncMock(return_value=mock_raw_pg_conn)
+    session.get_bind = AsyncMock(return_value=mock_engine_or_conn_facade)
+
+    session.mock_raw_pg_conn = mock_raw_pg_conn # Attach for easy access in tests
     return session
 
 @pytest.fixture
@@ -130,49 +160,156 @@ def test_map_staging_to_production_records_risk_categories( # Name kept from exi
         assert rec["risk_category"] == claims_data[i]["expected_risk"]
         assert rec["ml_model_version_used"] == f"v_test_{claims_data[i]['id']}" # Added
 
-# --- Test _bulk_insert_to_production ---
+# --- Tests for _format_data_for_copy ---
+def test_format_data_for_copy_empty(data_transfer_service: DataTransferService):
+    assert data_transfer_service._format_data_for_copy([], ["col1", "col2"]) == []
+
+def test_format_data_for_copy_basic(data_transfer_service: DataTransferService):
+    records = [
+        {"id": 1, "name": "Alice", "value": 100},
+        {"id": 2, "name": "Bob", "value": 200}
+    ]
+    column_names = ["id", "name", "value"]
+    expected = [
+        (1, "Alice", 100),
+        (2, "Bob", 200)
+    ]
+    assert data_transfer_service._format_data_for_copy(records, column_names) == expected
+
+def test_format_data_for_copy_missing_key(data_transfer_service: DataTransferService):
+    records = [
+        {"id": 1, "name": "Alice"}, # "value" is missing
+        {"id": 2, "value": 200}   # "name" is missing
+    ]
+    column_names = ["id", "name", "value"]
+    expected = [
+        (1, "Alice", None),
+        (2, None, 200)
+    ]
+    assert data_transfer_service._format_data_for_copy(records, column_names) == expected
+
+def test_format_data_for_copy_different_order(data_transfer_service: DataTransferService):
+    records = [{"id": 1, "name": "Alice", "value": 100}]
+    column_names = ["name", "value", "id"] # Different order
+    expected = [("Alice", 100, 1)]
+    assert data_transfer_service._format_data_for_copy(records, column_names) == expected
+
+
+# --- Tests for _upsert_to_production_with_copy ---
 @pytest.mark.asyncio
-async def test_bulk_insert_to_production_success(
+async def test_upsert_with_copy_success(
     data_transfer_service: DataTransferService,
-    mock_db_session: MagicMock
+    mock_db_session: MagicMock # mock_db_session is the SQLAlchemy AsyncSession mock
 ):
     test_records = [
-        {"claim_id": "B1", "ml_model_version_used": "control_v1"},
-        {"claim_id": "B2", "ml_model_version_used": "challenger_v1"}
+        {"id": 1, "claim_id": "B1", "ml_model_version_used": "control_v1"},
+        {"id": 2, "claim_id": "B2", "ml_model_version_used": "challenger_v1"}
     ]
+    # mock_db_session fixture is already enhanced with mock_raw_pg_conn
+    mock_raw_pg_conn = mock_db_session.mock_raw_pg_conn
+    mock_raw_pg_conn.execute.side_effect = [
+        AsyncMock(return_value=None), # For CREATE TEMP TABLE
+        AsyncMock(return_value="INSERT 0 2")  # For INSERT...SELECT, 2 rows affected
+    ]
+    mock_raw_pg_conn.copy_records_to_table = AsyncMock() # Reset for this test
 
-    count = await data_transfer_service._bulk_insert_to_production(test_records)
+    # Patch _format_data_for_copy to return a known value
+    formatted_tuples = [(r['id'], r['claim_id'], Ellipsis) for r in test_records] # Simplified for example
+    data_transfer_service._format_data_for_copy = MagicMock(return_value=formatted_tuples)
+
+    count = await data_transfer_service._upsert_to_production_with_copy(test_records)
 
     assert count == 2
-    mock_db_session.execute.assert_called_once()
-    # To check arguments of execute:
-    args, _ = mock_db_session.execute.call_args
-    # args[0] is the insert statement, args[1] is the list of dicts
-    assert str(args[0]).startswith("INSERT INTO claims_production") # Basic check
-    assert args[1] == test_records
-    mock_db_session.commit.assert_called_once()
-    mock_db_session.rollback.assert_not_called()
+    data_transfer_service._format_data_for_copy.assert_called_once()
+    # Check calls to asyncpg connection
+    assert mock_raw_pg_conn.execute.call_count == 2
+
+    # Call 1: CREATE TEMP TABLE
+    create_temp_table_call = mock_raw_pg_conn.execute.call_args_list[0]
+    assert "CREATE TEMP TABLE" in create_temp_table_call[0][0]
+    assert "ON COMMIT DROP" in create_temp_table_call[0][0]
+
+    # Call 2: INSERT ... SELECT
+    insert_select_call = mock_raw_pg_conn.execute.call_args_list[1]
+    assert "INSERT INTO claims_production" in insert_select_call[0][0]
+    assert "ON CONFLICT (id) DO UPDATE" in insert_select_call[0][0]
+    assert '"updated_at" = NOW()' in insert_select_call[0][0] # Check updated_at is set
+
+    mock_raw_pg_conn.copy_records_to_table.assert_called_once_with(
+        unittest.mock.ANY,
+        records=formatted_tuples,
+        columns=unittest.mock.ANY,
+        timeout=60
+    )
 
 @pytest.mark.asyncio
-async def test_bulk_insert_to_production_failure(
+async def test_upsert_with_copy_formatting_returns_empty(
     data_transfer_service: DataTransferService,
     mock_db_session: MagicMock
 ):
-    test_records = [{"claim_id": "B_FAIL", "ml_model_version_used": "control_v1"}]
-    mock_db_session.execute.side_effect = Exception("DB Insert Error")
+    test_records = [{"id": 1, "claim_id": "B1"}]
+    data_transfer_service._format_data_for_copy = MagicMock(return_value=[]) # Formatter returns empty
 
-    count = await data_transfer_service._bulk_insert_to_production(test_records)
+    mock_raw_pg_conn = mock_db_session.mock_raw_pg_conn # Get from enhanced fixture
+
+    count = await data_transfer_service._upsert_to_production_with_copy(test_records)
 
     assert count == 0
-    mock_db_session.execute.assert_called_once()
-    mock_db_session.rollback.assert_called_once()
-    mock_db_session.commit.assert_not_called()
+    # CREATE TEMP TABLE might still be called before format check, depending on implementation
+    # Based on current code, get_bind is called first, then format.
+    # If format returns empty, copy_records_to_table and subsequent execute are skipped.
+    mock_raw_pg_conn.execute.assert_called_once() # Only for CREATE TEMP TABLE
+    assert "CREATE TEMP TABLE" in mock_raw_pg_conn.execute.call_args[0][0]
+    mock_raw_pg_conn.copy_records_to_table.assert_not_called()
+
 
 @pytest.mark.asyncio
-async def test_bulk_insert_no_records(data_transfer_service: DataTransferService, mock_db_session: MagicMock):
-    count = await data_transfer_service._bulk_insert_to_production([])
+async def test_upsert_with_copy_copy_records_fails(
+    data_transfer_service: DataTransferService,
+    mock_db_session: MagicMock
+):
+    test_records = [{"id": 1, "claim_id": "B_FAIL_COPY"}]
+    mock_raw_pg_conn = mock_db_session.mock_raw_pg_conn
+
+    data_transfer_service._format_data_for_copy = MagicMock(return_value=[(1, "B_FAIL_COPY")])
+    mock_raw_pg_conn.execute = AsyncMock() # First execute for CREATE TEMP is fine
+    mock_raw_pg_conn.copy_records_to_table = AsyncMock(side_effect=RuntimeError("Asyncpg COPY failed"))
+
+    with pytest.raises(RuntimeError, match="Asyncpg COPY failed"):
+        await data_transfer_service._upsert_to_production_with_copy(test_records)
+
+    mock_raw_pg_conn.execute.assert_called_once() # CREATE TEMP
+    # close() might be called in the except block of the SUT
+    # mock_raw_pg_conn.close.assert_called_once() # This depends on exact SUT error handling for raw conn
+
+@pytest.mark.asyncio
+async def test_upsert_with_copy_insert_select_fails(
+    data_transfer_service: DataTransferService,
+    mock_db_session: MagicMock
+):
+    test_records = [{"id": 1, "claim_id": "B_FAIL_INSERT"}]
+    mock_raw_pg_conn = mock_db_session.mock_raw_pg_conn
+
+    data_transfer_service._format_data_for_copy = MagicMock(return_value=[(1, "B_FAIL_INSERT")])
+    mock_raw_pg_conn.copy_records_to_table = AsyncMock() # COPY is fine
+    # First execute for CREATE TEMP, second for INSERT...SELECT
+    mock_raw_pg_conn.execute.side_effect = [
+        AsyncMock(return_value=None), # CREATE TEMP
+        RuntimeError("Asyncpg INSERT...SELECT failed")
+    ]
+
+    with pytest.raises(RuntimeError, match="Asyncpg INSERT...SELECT failed"):
+        await data_transfer_service._upsert_to_production_with_copy(test_records)
+
+    assert mock_raw_pg_conn.execute.call_count == 2
+    # mock_raw_pg_conn.close.assert_called_once() # This depends on SUT error handling
+
+@pytest.mark.asyncio
+async def test_upsert_with_copy_no_records(data_transfer_service: DataTransferService, mock_db_session: MagicMock): # Test name kept
+    count = await data_transfer_service._upsert_to_production_with_copy([])
     assert count == 0
-    mock_db_session.execute.assert_not_called()
+    mock_db_session.get_bind.assert_not_called()
+
 
 # --- Test _update_staging_claims_after_transfer ---
 @pytest.mark.asyncio
@@ -214,11 +351,11 @@ async def test_update_staging_no_claims(data_transfer_service: DataTransferServi
 @pytest.mark.asyncio
 @patch.object(DataTransferService, '_select_claims_from_staging', new_callable=AsyncMock)
 @patch.object(DataTransferService, '_map_staging_to_production_records')
-@patch.object(DataTransferService, '_bulk_insert_to_production', new_callable=AsyncMock)
+@patch.object(DataTransferService, '_upsert_to_production_with_copy', new_callable=AsyncMock) # Changed target
 @patch.object(DataTransferService, '_update_staging_claims_after_transfer', new_callable=AsyncMock)
 async def test_transfer_claims_orchestration_success(
     mock_update_staging: MagicMock,
-    mock_bulk_insert: MagicMock,
+    mock_upsert_with_copy: MagicMock, # Changed name
     mock_map_records: MagicMock,
     mock_select_claims: MagicMock,
     data_transfer_service: DataTransferService
@@ -232,14 +369,20 @@ async def test_transfer_claims_orchestration_success(
 
     mock_select_claims.return_value = mock_staging_claims
     mock_map_records.return_value = mock_production_dicts
-    mock_bulk_insert.return_value = len(mock_production_dicts)
+    mock_upsert_with_copy.return_value = len(mock_production_dicts) # Changed name
+
+    # Mock the db.begin() context manager for the main transaction
+    mock_begin_cm = AsyncMock()
+    data_transfer_service.db.begin.return_value = mock_begin_cm
 
     result = await data_transfer_service.transfer_claims_to_production(limit=5)
 
     mock_select_claims.assert_called_once_with(5)
     mock_map_records.assert_called_once_with(mock_staging_claims)
-    mock_bulk_insert.assert_called_once_with(mock_production_dicts)
+    mock_upsert_with_copy.assert_called_once_with(mock_production_dicts) # Changed name
     mock_update_staging.assert_called_once_with(mock_staging_claims)
+    mock_begin_cm.__aenter__.assert_called_once() # Check transaction was started
+    mock_begin_cm.__aexit__.assert_called_once()  # Check transaction was finalized
 
     assert result["successfully_transferred"] == len(mock_production_dicts)
     assert result["selected_from_staging"] == len(mock_staging_claims)
@@ -263,11 +406,11 @@ async def test_transfer_claims_orchestration_no_claims_selected(
 @pytest.mark.asyncio
 @patch.object(DataTransferService, '_select_claims_from_staging', new_callable=AsyncMock)
 @patch.object(DataTransferService, '_map_staging_to_production_records')
-@patch.object(DataTransferService, '_bulk_insert_to_production', new_callable=AsyncMock)
+@patch.object(DataTransferService, '_upsert_to_production_with_copy', new_callable=AsyncMock) # Changed target
 @patch.object(DataTransferService, '_update_staging_claims_after_transfer', new_callable=AsyncMock)
 async def test_transfer_claims_orchestration_insert_fails(
     mock_update_staging: MagicMock,
-    mock_bulk_insert: MagicMock,
+    mock_upsert_with_copy: MagicMock, # Changed name
     mock_map_records: MagicMock,
     mock_select_claims: MagicMock,
     data_transfer_service: DataTransferService
@@ -281,13 +424,22 @@ async def test_transfer_claims_orchestration_insert_fails(
 
     mock_select_claims.return_value = mock_staging_claims
     mock_map_records.return_value = mock_production_dicts
-    mock_bulk_insert.return_value = 0 # Simulate insert failure
+    mock_upsert_with_copy.return_value = 0 # Simulate insert failure # Changed name
+
+    # Mock the db.begin() context manager
+    mock_begin_cm = AsyncMock()
+    data_transfer_service.db.begin.return_value = mock_begin_cm
 
     result = await data_transfer_service.transfer_claims_to_production(limit=5)
 
     mock_select_claims.assert_called_once()
     mock_map_records.assert_called_once()
-    mock_bulk_insert.assert_called_once()
+    mock_upsert_with_copy.assert_called_once() # Changed name
     mock_update_staging.assert_not_called()
+    mock_begin_cm.__aenter__.assert_called_once() # Transaction started
+    # __aexit__ is still called even if we log warnings and don't update staging.
+    # The transaction should still complete if the upsert itself didn't raise an error.
+    mock_begin_cm.__aexit__.assert_called_once()
+
 
     assert result["successfully_transferred"] == 0
