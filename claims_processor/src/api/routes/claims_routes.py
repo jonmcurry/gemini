@@ -13,8 +13,10 @@ from ..dependencies import get_audit_logger
 from ...core.monitoring.app_metrics import MetricsCollector
 from ..dependencies import get_metrics_collector
 from ...processing.claims_processing_service import ClaimProcessingService
-from ...core.concurrency_limiter import get_batch_processing_semaphore # Added
-from ...core.config.settings import get_settings # Added
+from ...core.security.encryption_service import EncryptionService # Added
+from ..dependencies import get_encryption_service # Added
+from ...core.concurrency_limiter import get_batch_processing_semaphore
+from ...core.config.settings import get_settings
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -100,7 +102,8 @@ async def run_batch_processing_background(
     user_agent_header: Optional[str],
     metrics_collector_instance: MetricsCollector,
     audit_logger_instance: AuditLogger,
-    processing_semaphore: asyncio.Semaphore # New argument
+    encryption_service_instance: EncryptionService, # New argument
+    processing_semaphore: asyncio.Semaphore
 ):
     logger.info("Background task started, using semaphore.", batch_size=batch_size, client_ip=client_ip)
 
@@ -112,7 +115,11 @@ async def run_batch_processing_background(
                 success=True, details={"message": "Background processing service initiated."}
             )
 
-            service = ClaimProcessingService(db_session=session, metrics_collector=metrics_collector_instance)
+            service = ClaimProcessingService(
+                db_session=session,
+                metrics_collector=metrics_collector_instance,
+                encryption_service=encryption_service_instance # New
+            )
             result = await service.process_pending_claims_batch(batch_size_override=batch_size)
             logger.info("Background task processing finished by service", batch_size=batch_size, result=result)
 
@@ -144,9 +151,10 @@ async def trigger_batch_processing_background_endpoint(
     background_tasks: BackgroundTasks,
     batch_size: int = Query(100, gt=0, le=10000),
     metrics: MetricsCollector = Depends(get_metrics_collector),
-    audit_logger: AuditLogger = Depends(get_audit_logger)
+    audit_logger: AuditLogger = Depends(get_audit_logger),
+    encryption_service: EncryptionService = Depends(get_encryption_service) # New
 ):
-    settings = get_settings() # Get settings for MAX_CONCURRENT_BATCHES
+    settings = get_settings()
     batch_semaphore = get_batch_processing_semaphore()
     client_ip = request.client.host if request.client else None
     user_agent_header = request.headers.get("user-agent")
@@ -183,9 +191,10 @@ async def trigger_batch_processing_background_endpoint(
             batch_size,
             client_ip,
             user_agent_header,
-            metrics, # Pass MetricsCollector instance
-            audit_logger, # Pass AuditLogger instance
-            processing_semaphore=batch_semaphore # Pass the acquired semaphore
+            metrics,
+            audit_logger,
+            encryption_service, # Pass EncryptionService instance
+            processing_semaphore=batch_semaphore
         )
         logger.info("Batch processing task added to background.", batch_size=batch_size)
         return BatchProcessResponse(message="Batch processing started in the background.", batch_size=batch_size)

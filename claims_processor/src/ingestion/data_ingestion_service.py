@@ -84,6 +84,13 @@ class DataIngestionService:
                         logger.error("Failed to encrypt medical record number", claim_id=claim_business_id)
                         raise ValueError("Medical record number encryption failed.")
 
+                encrypted_subscriber_id_str: Optional[str] = None
+                if ingestion_claim.subscriber_id:
+                    encrypted_subscriber_id_str = self.encryption_service.encrypt(ingestion_claim.subscriber_id)
+                    if not encrypted_subscriber_id_str:
+                        logger.error("Failed to encrypt subscriber_id", claim_id=claim_business_id)
+                        raise ValueError("Subscriber ID encryption failed.")
+
                 db_claim = ClaimModel(
                     # ClaimModel.id is auto-incrementing, not set here.
                     claim_id=ingestion_claim.claim_id,
@@ -92,16 +99,30 @@ class DataIngestionService:
 
                     medical_record_number=encrypted_mrn_str,
                     patient_first_name=ingestion_claim.patient_first_name,
+                    patient_middle_name=ingestion_claim.patient_middle_name, # New
                     patient_last_name=ingestion_claim.patient_last_name,
                     patient_date_of_birth=encrypted_dob_str, # Storing encrypted string
 
+                    admission_date=ingestion_claim.admission_date, # New
+                    discharge_date=ingestion_claim.discharge_date, # New
+
                     financial_class=ingestion_claim.financial_class,
+                    expected_reimbursement=ingestion_claim.expected_reimbursement, # New
                     insurance_type=ingestion_claim.insurance_type,
                     insurance_plan_id=ingestion_claim.insurance_plan_id,
+                    subscriber_id=encrypted_subscriber_id_str, # New, encrypted
 
                     service_from_date=ingestion_claim.service_from_date,
                     service_to_date=ingestion_claim.service_to_date,
                     total_charges=ingestion_claim.total_charges,
+
+                    billing_provider_npi=ingestion_claim.billing_provider_npi, # New
+                    billing_provider_name=ingestion_claim.billing_provider_name, # New
+                    attending_provider_npi=ingestion_claim.attending_provider_npi, # New
+                    attending_provider_name=ingestion_claim.attending_provider_name, # New
+
+                    primary_diagnosis_code=ingestion_claim.primary_diagnosis_code, # New
+                    diagnosis_codes=ingestion_claim.diagnosis_codes, # New (maps List[str] to JSONB)
 
                     processing_status='pending',
                     batch_id=ingestion_claim.ingestion_batch_id or current_ingestion_batch_id,

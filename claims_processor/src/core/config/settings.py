@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     TRANSFER_BATCH_SIZE: int = 5000     # Batch size for transferring data to production
     MAX_INGESTION_BATCH_SIZE: int = 10000 # Max claims allowed in a single ingestion API call
 
+    # Fetch Retry Settings (new)
+    MAX_FETCH_RETRIES: int = Field(3, description="Maximum number of retries for fetching claims in a batch.")
+    FETCH_RETRY_DELAY_SECONDS: float = Field(5.0, description="Delay in seconds between fetch retries.")
+
     # Add other settings as needed later
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_file_encoding='utf-8')

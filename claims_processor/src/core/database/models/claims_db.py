@@ -1,5 +1,6 @@
 from sqlalchemy import Column, Integer, String, Date, Numeric, ForeignKey, TIMESTAMP, func, PrimaryKeyConstraint, UniqueConstraint
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects import postgresql # Added for JSONB
 from ..db_session import Base
 
 class ClaimModel(Base):
@@ -12,19 +13,37 @@ class ClaimModel(Base):
 
     patient_first_name = Column(String(100), nullable=True)
     patient_last_name = Column(String(100), nullable=True)
+    patient_middle_name = Column(String(100), nullable=True) # New
     patient_date_of_birth = Column(String(255), nullable=True) # Changed for encryption
     medical_record_number = Column(String(150), nullable=True, index=True)
 
-    financial_class = Column(String(50), nullable=True, index=True)
-    insurance_type = Column(String(100), nullable=True, index=True)
-    insurance_plan_id = Column(String(100), nullable=True, index=True)
-
-    # service_from_date is part of composite PK and partition key
+    # Service Information
+    admission_date = Column(Date, nullable=True, index=True) # New
+    discharge_date = Column(Date, nullable=True, index=True) # New
     service_from_date = Column(Date, nullable=False, index=True)
     service_to_date = Column(Date, nullable=False, index=True)
 
+    # Financial Information
+    financial_class = Column(String(50), nullable=True, index=True)
+    expected_reimbursement = Column(Numeric(15, 2), nullable=True) # New
     total_charges = Column(Numeric(15, 2), nullable=False)
 
+    # Insurance Information
+    insurance_type = Column(String(100), nullable=True, index=True)
+    insurance_plan_id = Column(String(100), nullable=True, index=True)
+    subscriber_id = Column(String(100), nullable=True, index=True) # New
+
+    # Provider Information
+    billing_provider_npi = Column(String(20), nullable=True, index=True) # New
+    billing_provider_name = Column(String(200), nullable=True) # New
+    attending_provider_npi = Column(String(20), nullable=True, index=True) # New
+    attending_provider_name = Column(String(200), nullable=True) # New
+
+    # Diagnosis Information
+    primary_diagnosis_code = Column(String(20), nullable=True, index=True) # New
+    diagnosis_codes = Column(postgresql.JSONB, nullable=True) # New
+
+    # Processing Information
     processing_status = Column(String(50), default='pending', index=True)
     batch_id = Column(String(100), index=True, nullable=True)
     priority = Column(Integer, server_default='1', nullable=False, index=True) # New priority field
