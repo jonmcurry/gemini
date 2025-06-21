@@ -4,6 +4,12 @@ from tensorflow.keras import layers
 import numpy as np
 import shutil # For cleaning up saved model directory
 import os
+import mlflow # Added
+import mlflow.tensorflow # Added
+from datetime import datetime # Added
+import sys # Added
+import argparse # Added
+from typing import Optional, Dict # Added
 
 # Determine paths relative to the script's location
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,8 +53,15 @@ def define_model(num_features=NUM_FEATURES, num_classes=NUM_CLASSES) -> keras.Mo
     ])
     return model
 
-def train_and_save_model(model_base_save_path: str, model_version: str):
-    """Generates data, defines, trains, and saves the model to a versioned path."""
+def train_and_save_model(
+    model_base_save_path: str,
+    model_version: str,
+    mlflow_tracking_uri_arg: Optional[str] = None, # Renamed to avoid clash with local var
+    mlflow_model_name_arg: Optional[str] = None, # Renamed
+    mlflow_run_name_arg: Optional[str] = None, # Renamed
+    mlflow_model_tags_arg: Optional[Dict[str, str]] = None # Renamed
+):
+    """Generates data, defines, trains, and saves the model to a versioned path, with MLflow logging."""
     print("Generating mock data...")
     features, labels = generate_mock_data()
 
@@ -108,6 +121,55 @@ def train_and_save_model(model_base_save_path: str, model_version: str):
     model.save(versioned_model_path) # Creates a directory with assets, variables, and .pb
     print(f"Model saved successfully to {versioned_model_path}")
 
+    # --- MLflow Logging and Registration ---
+    # Prioritize CLI args, then environment variables, then defaults for some
+    effective_mlflow_tracking_uri = mlflow_tracking_uri_arg if mlflow_tracking_uri_arg is not None else os.environ.get("MLFLOW_TRACKING_URI")
+    effective_mlflow_model_name = mlflow_model_name_arg if mlflow_model_name_arg is not None else os.environ.get("MLFLOW_MODEL_NAME", "claims_model_from_training_script")
+
+    default_run_name = f"training_run_{model_version}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    effective_mlflow_run_name = mlflow_run_name_arg if mlflow_run_name_arg is not None else default_run_name
+
+    if effective_mlflow_tracking_uri and effective_mlflow_model_name:
+        print(f"MLflow: Configured to log to {effective_mlflow_tracking_uri} for model {effective_mlflow_model_name}")
+        mlflow.set_tracking_uri(effective_mlflow_tracking_uri)
+
+        try:
+            with mlflow.start_run(run_name=effective_mlflow_run_name) as run:
+                run_id = run.info.run_id
+                print(f"MLflow: Started run {run_id} with name {effective_mlflow_run_name}")
+
+                # Log parameters
+                if mlflow_model_tags_arg:
+                    mlflow.set_tags(mlflow_model_tags_arg)
+                    print(f"MLflow: Set run tags: {mlflow_model_tags_arg}")
+
+                mlflow.log_param("model_version_script", model_version)
+                mlflow.log_param("num_features", NUM_FEATURES)
+                mlflow.log_param("num_classes", NUM_CLASSES)
+                mlflow.log_param("epochs", 10) # Hardcoded in script
+                mlflow.log_param("batch_size", 32) # Hardcoded in script
+
+                # Log metrics
+                mlflow.log_metric("val_loss", val_loss)
+                mlflow.log_metric("val_accuracy", val_accuracy)
+                mlflow.log_metric("val_precision", val_precision)
+                mlflow.log_metric("val_recall", val_recall)
+
+                # Log the TensorFlow SavedModel
+                print(f"MLflow: Logging SavedModel from {versioned_model_path} to MLflow.")
+                mlflow.tensorflow.log_model(
+                    tf_saved_model_dir=versioned_model_path,
+                    artifact_path="saved_model",
+                    registered_model_name=effective_mlflow_model_name # Use effective name
+                )
+                print(f"MLflow: Model logged and registered as '{effective_mlflow_model_name}'.")
+
+        except Exception as mlflow_e:
+            print(f"MLflow: Error during MLflow operations: {mlflow_e}", file=sys.stderr)
+    else:
+        print("MLflow: MLFLOW_TRACKING_URI or MLFLOW_MODEL_NAME not effectively configured. Skipping MLflow logging.")
+    # --- End MLflow Logging and Registration ---
+
     # Placeholder comments for next MLOps steps
     print("\n--- MLOps Next Steps Placeholders ---")
     print(f"1. Convert the SavedModel to TensorFlow Lite (TFLite):")
@@ -130,5 +192,30 @@ if __name__ == '__main__':
         os.makedirs(MODEL_BASE_PATH)
         print(f"Created base model directory for '{MODEL_NAME}': {MODEL_BASE_PATH}")
 
-    train_and_save_model(MODEL_BASE_PATH, MODEL_VERSION)
+    parser = argparse.ArgumentParser(description="Train and save a claims processing model, with MLflow integration.")
+    parser.add_argument("--model-version", type=str, help="Version for the model being trained (e.g., '2', '3'). Overrides default.")
+    parser.add_argument("--mlflow-tracking-uri", type=str, help="MLflow tracking server URI. Overrides MLFLOW_TRACKING_URI env var.")
+    parser.add_argument("--mlflow-model-name", type=str, help="Name for the model in MLflow Model Registry. Overrides MLFLOW_MODEL_NAME env var.")
+    parser.add_argument("--mlflow-run-name", type=str, help="Name for this MLflow run.")
+    parser.add_argument("--mlflow-model-tags", type=str, help="Comma-separated key:value pairs for MLflow run tags (e.g., 'stage:dev,team:claims').")
+
+    args = parser.parse_args()
+
+    parsed_tags = None
+    if args.mlflow_model_tags:
+        try:
+            parsed_tags = dict(tag.split(':', 1) for tag in args.mlflow_model_tags.split(',') if ':' in tag)
+        except ValueError:
+            print("Warning: --mlflow-model-tags format is invalid. Expected 'key1:value1,key2:value2'. Tags will not be set.", file=sys.stderr)
+
+    effective_model_version = args.model_version if args.model_version else MODEL_VERSION
+
+    train_and_save_model(
+        MODEL_BASE_PATH,
+        effective_model_version,
+        mlflow_tracking_uri_arg=args.mlflow_tracking_uri,
+        mlflow_model_name_arg=args.mlflow_model_name,
+        mlflow_run_name_arg=args.mlflow_run_name,
+        mlflow_model_tags_arg=parsed_tags
+    )
 ```
