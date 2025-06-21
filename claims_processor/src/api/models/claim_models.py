@@ -60,17 +60,32 @@ class ProcessableClaim(BaseModel):
     medical_record_number: Optional[str] = None # Added MRN
 
     patient_first_name: Optional[str] = None
+    patient_middle_name: Optional[str] = None # New
     patient_last_name: Optional[str] = None
-    patient_date_of_birth: Optional[date] = None
+    patient_date_of_birth: Optional[date] = None # Assumed decrypted
+
+    subscriber_id: Optional[str] = None # New, assumed decrypted
+
+    admission_date: Optional[date] = None # New
+    discharge_date: Optional[date] = None # New
 
     insurance_type: Optional[str] = None
-    insurance_plan_id: Optional[str] = None # Added
+    insurance_plan_id: Optional[str] = None
     financial_class: Optional[str] = None
+    expected_reimbursement: Optional[condecimal(max_digits=15, decimal_places=2)] = None # New
 
     service_from_date: date
     service_to_date: date
 
     total_charges: condecimal(max_digits=15, decimal_places=2, gt=Decimal(0))
+
+    billing_provider_npi: Optional[str] = None # New
+    billing_provider_name: Optional[str] = None # New
+    attending_provider_npi: Optional[str] = None # New
+    attending_provider_name: Optional[str] = None # New
+
+    primary_diagnosis_code: Optional[str] = None # New
+    diagnosis_codes: Optional[List[str]] = None # New
 
     processing_status: str # This will reflect current DB status when fetched
     batch_id: Optional[str] = None
