@@ -6,7 +6,12 @@ settings = get_settings()
 
 DATABASE_URL = settings.DATABASE_URL
 
-engine = create_async_engine(DATABASE_URL, echo=True) # echo=True for dev, can be configured via settings later
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=True, # echo=True for dev, can be configured via settings later
+    pool_size=settings.DB_POOL_SIZE,
+    max_overflow=settings.DB_MAX_OVERFLOW
+)
 
 AsyncSessionLocal = sessionmaker(
     bind=engine,

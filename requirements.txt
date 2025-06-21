@@ -1,16 +1,19 @@
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-pydantic>=2.5.0
-structlog>=23.2.0
-sqlalchemy[asyncio]>=2.0.0
-asyncpg>=0.29.0
 alembic>=1.13.0
-psycopg2-binary
-pydantic-settings>=2.1.0
 aiomcache>=0.7.0
-numpy>=1.24.0
-pandas>=2.1.0
-tflite-runtime
-tensorflow>=2.15.0
-prometheus-client>=0.19.0
+asyncpg>=0.29.0 # Compatible with >=0.27.0
 cachetools>=4.0.0
+fastapi>=0.104.0
+numpy>=1.24.0
+pandas>=2.1.0 # Kept existing
+passlib[bcrypt]>=1.7.4 # Added
+prometheus-client>=0.19.0
+psycopg2-binary>=2.9.0 # Updated
+pydantic>=2.5.0 # Kept existing
+pydantic-settings>=2.1.0 # Compatible with >=2.0.0
+python-dateutil>=2.8.0 # Added
+python-jose[cryptography]>=3.3.0 # Added
+sqlalchemy[asyncio]>=2.0.0
+structlog>=23.2.0
+tensorflow>=2.15.0 # Kept existing
+tflite-runtime # Kept existing
+uvicorn[standard]>=0.24.0

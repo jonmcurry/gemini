@@ -7,6 +7,18 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+asyncpg://user:password@localhost:5432/claims_staging_db" # Made default more specific
     TEST_DATABASE_URL: Optional[str] = None
 
+    # Database Connection Pool Settings
+    DB_POOL_SIZE: int = Field(
+        5,
+        gt=0,
+        description="The number of connections to keep persistently in the pool."
+    )
+    DB_MAX_OVERFLOW: int = Field(
+        10,
+        ge=0,
+        description="The maximum number of connections that can be opened beyond DB_POOL_SIZE."
+    )
+
     # Memcached settings
     MEMCACHED_HOSTS: str = "localhost" # Comma-separated list of hosts, e.g., "host1,host2,host3"
     MEMCACHED_PORT: int = 11211 # Port used for all listed hosts

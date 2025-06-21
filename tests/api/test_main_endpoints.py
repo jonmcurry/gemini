@@ -140,3 +140,68 @@ def test_ready_all_unhealthy(
     assert data["database"]["status"] == "unhealthy"
     assert data["cache"]["status"] == "unhealthy"
     assert data["ml_service"]["status"] == "unhealthy"
+
+
+# --- Tests for DB Pool Warmup ---
+import asyncio # If not already there
+from sqlalchemy import text # For asserting execute content
+from claims_processor.src.main import warmup_db_pool
+# Settings is already imported: from claims_processor.src.core.config.settings import Settings
+
+@pytest.mark.asyncio
+async def test_warmup_db_pool_successful_warmup(): # Removed self
+    # Mock settings for this test
+    # Assuming Settings model can be instantiated with only relevant fields for testing
+    mock_settings_instance = Settings(DB_POOL_SIZE=2, DB_MAX_OVERFLOW=5, _env_file=None)
+
+    # Mock the global async_engine used by main.py's warmup_db_pool
+    mock_engine_connect_conn = AsyncMock()
+    mock_engine_connect_conn.execute = AsyncMock()
+
+    mock_engine_connect_cm = AsyncMock()
+    mock_engine_connect_cm.__aenter__.return_value = mock_engine_connect_conn
+    mock_engine_connect_cm.__aexit__ = AsyncMock(return_value=None)
+
+    mock_engine = AsyncMock()
+    mock_engine.connect.return_value = mock_engine_connect_cm
+
+    with patch("claims_processor.src.main.get_settings", return_value=mock_settings_instance):
+        with patch("claims_processor.src.main.async_engine", new=mock_engine): # Patch where engine is defined for main
+            with patch("claims_processor.src.main.logger") as mock_logger:
+                await warmup_db_pool()
+
+    assert mock_engine.connect.call_count == 2 # Called min(DB_POOL_SIZE, 3) times
+    assert mock_engine_connect_conn.execute.call_count == 2
+
+    execute_call_arg = mock_engine_connect_conn.execute.call_args_list[0][0][0]
+    assert str(execute_call_arg) == str(text("SELECT 1"))
+
+    assert any("Database connection pool warmed up with 2 connections." in str(call_item) for call_item in mock_logger.info.call_args_list)
+
+@pytest.mark.asyncio
+async def test_warmup_db_pool_zero_pool_size_skips_warmup(): # Removed self
+    mock_settings_instance = Settings(DB_POOL_SIZE=0, DB_MAX_OVERFLOW=5, _env_file=None)
+    mock_engine = AsyncMock()
+
+    with patch("claims_processor.src.main.get_settings", return_value=mock_settings_instance):
+        with patch("claims_processor.src.main.async_engine", new=mock_engine):
+            with patch("claims_processor.src.main.logger") as mock_logger:
+                await warmup_db_pool()
+
+    mock_engine.connect.assert_not_called()
+    assert any("DB_POOL_SIZE is 0 or not configured for positive value. Skipping pool warmup." in str(call_item) for call_item in mock_logger.info.call_args_list)
+
+@pytest.mark.asyncio
+async def test_warmup_db_pool_handles_connection_error(): # Removed self
+    mock_settings_instance = Settings(DB_POOL_SIZE=1, DB_MAX_OVERFLOW=5, _env_file=None)
+
+    mock_engine = AsyncMock()
+    mock_engine.connect.side_effect = Exception("DB Connection Error")
+
+    with patch("claims_processor.src.main.get_settings", return_value=mock_settings_instance):
+        with patch("claims_processor.src.main.async_engine", new=mock_engine):
+            with patch("claims_processor.src.main.logger") as mock_logger:
+                await warmup_db_pool()
+
+    mock_engine.connect.assert_called_once()
+    assert any("Error during database connection pool warmup" in str(call_item) for call_item in mock_logger.error.call_args_list)

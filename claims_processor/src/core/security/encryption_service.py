@@ -140,5 +140,3 @@ class EncryptionService:
         except Exception as e:
             logger.error(f"Decryption failed due to an unexpected error: {e}", exc_info=True)
             return None
-
-```
