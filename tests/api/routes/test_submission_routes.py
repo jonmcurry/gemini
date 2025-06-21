@@ -18,11 +18,12 @@ def mock_data_ingestion_service_instance(): # This will be the instance returned
     service_instance.ingest_claims_batch = AsyncMock()
     return service_instance
 
-@pytest.fixture
-def mock_temp_get_data_ingestion_service(mock_data_ingestion_service_instance):
-    # This patches the `temp_get_data_ingestion_service` function in submission_routes.py
-    with patch("claims_processor.src.api.routes.submission_routes.temp_get_data_ingestion_service", return_value=mock_data_ingestion_service_instance) as mock_factory:
-        yield mock_factory
+@pytest.fixture(autouse=True) # Ensure it's autouse if all tests in this file need it
+def patch_get_data_ingestion_service_for_submission(mock_data_ingestion_service_instance: MagicMock): # Renamed and updated target
+    # This patches the centralized `get_data_ingestion_service` function in dependencies.py
+    with patch("claims_processor.src.api.dependencies.get_data_ingestion_service",
+                 return_value=mock_data_ingestion_service_instance) as mock_getter:
+        yield mock_getter
 
 @pytest.fixture
 def mock_audit_logger_instance(): # This will be the instance returned by the patched factory
@@ -69,9 +70,9 @@ def create_valid_claim_data(count=1) -> list:
 @pytest.mark.asyncio
 async def test_submit_claims_batch_success(
     client: TestClient,
-    mock_temp_get_data_ingestion_service: MagicMock, # Patches factory
-    mock_data_ingestion_service_instance: MagicMock, # The actual instance to assert against
-    mock_get_audit_logger: MagicMock, # Patches factory
+    patch_get_data_ingestion_service_for_submission: MagicMock, # Use new fixture name
+    mock_data_ingestion_service_instance: MagicMock,
+    mock_get_audit_logger: MagicMock,
     mock_audit_logger_instance: MagicMock, # The actual instance
     mock_get_settings_for_submission: MagicMock
 ):
@@ -107,7 +108,7 @@ async def test_submit_claims_batch_success(
 
 def test_submit_claims_batch_empty_list(
     client: TestClient,
-    mock_temp_get_data_ingestion_service: MagicMock,
+    patch_get_data_ingestion_service_for_submission: MagicMock, # Use new fixture name
     mock_data_ingestion_service_instance: MagicMock,
     mock_get_audit_logger: MagicMock,
     mock_audit_logger_instance: MagicMock,
@@ -129,7 +130,7 @@ def test_submit_claims_batch_empty_list(
 
 def test_submit_claims_batch_payload_too_large(
     client: TestClient,
-    mock_temp_get_data_ingestion_service: MagicMock,
+    patch_get_data_ingestion_service_for_submission: MagicMock, # Use new fixture name
     mock_data_ingestion_service_instance: MagicMock,
     mock_get_audit_logger: MagicMock,
     mock_audit_logger_instance: MagicMock,
@@ -161,7 +162,7 @@ def test_submit_claims_batch_pydantic_validation_error(client: TestClient, mock_
 @pytest.mark.asyncio
 async def test_submit_claims_batch_service_exception(
     client: TestClient,
-    mock_temp_get_data_ingestion_service: MagicMock,
+    patch_get_data_ingestion_service_for_submission: MagicMock, # Use new fixture name
     mock_data_ingestion_service_instance: MagicMock,
     mock_get_audit_logger: MagicMock,
     mock_audit_logger_instance: MagicMock,

@@ -4,8 +4,9 @@ from sqlalchemy.ext.asyncio import AsyncSession # Import AsyncSession
 from claims_processor.src.core.monitoring.audit_logger import AuditLogger
 from claims_processor.src.core.database.db_session import AsyncSessionLocal
 from claims_processor.src.core.monitoring.app_metrics import MetricsCollector
-from claims_processor.src.core.security.encryption_service import EncryptionService # Added
-from claims_processor.src.core.config.settings import get_settings # Added
+from claims_processor.src.core.security.encryption_service import EncryptionService
+from claims_processor.src.core.config.settings import get_settings
+from claims_processor.src.ingestion.data_ingestion_service import DataIngestionService # Added
 from typing import Optional
 import structlog
 
@@ -17,7 +18,8 @@ logger = structlog.get_logger(__name__) # Logger for dependency related messages
 
 _audit_logger_instance: Optional[AuditLogger] = None
 _metrics_collector_instance: Optional[MetricsCollector] = None
-_encryption_service_instance: Optional[EncryptionService] = None # Added for EncryptionService singleton
+_encryption_service_instance: Optional[EncryptionService] = None
+_data_ingestion_service_instance: Optional[DataIngestionService] = None # Added
 
 def get_async_session_factory() -> Callable[[], AsyncSession]:
     """Returns the raw session factory callable."""
@@ -48,3 +50,15 @@ def get_encryption_service() -> EncryptionService:
         _encryption_service_instance = EncryptionService(key=app_settings.APP_ENCRYPTION_KEY)
         logger.info("Default EncryptionService instance created.")
     return _encryption_service_instance
+
+def get_data_ingestion_service() -> DataIngestionService:
+    global _data_ingestion_service_instance
+    if _data_ingestion_service_instance is None:
+        logger.info("Creating new DataIngestionService singleton instance.")
+        db_session_factory = get_async_session_factory()
+        encryption_service = get_encryption_service() # Use existing central provider
+        _data_ingestion_service_instance = DataIngestionService(
+            db_session_factory=db_session_factory,
+            encryption_service=encryption_service
+        )
+    return _data_ingestion_service_instance

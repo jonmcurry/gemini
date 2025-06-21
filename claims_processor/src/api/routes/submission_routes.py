@@ -7,8 +7,9 @@ from ....api.models.ingestion_models import IngestionClaim, IngestionResponse # 
 from ....ingestion.data_ingestion_service import DataIngestionService
 # from ....core.security.audit_logger_service import AuditLoggerService # Old logger
 from ....core.monitoring.audit_logger import AuditLogger # New AuditLogger
-from ....api.dependencies import get_audit_logger # New dependency getter
-from ....core.security.encryption_service import EncryptionService
+# Updated to include get_data_ingestion_service
+from ....api.dependencies import get_audit_logger, get_data_ingestion_service
+from ....core.security.encryption_service import EncryptionService # Keep for type hint if needed, though service comes from dependency
 from ....core.config.settings import get_settings
 
 
@@ -16,48 +17,19 @@ logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 # --- Start Temporary Dependency Setup for Route Definition ---
-# This would normally be in a central place like `main.py` or `core/dependencies.py`
-# and `app.dependency_overrides` used in tests if needed.
-# For this subtask, to make the route code runnable if tested in isolation by worker:
-from ....core.database.db_session import AsyncSessionLocal # Direct import for factory
+# Temporary dependency providers are now removed.
+# Centralized providers from ....api.dependencies will be used.
+# The import for AsyncSessionLocal might no longer be needed if it was only for temp_get_data_ingestion_service
 
 
-_encryption_service_instance: Optional[EncryptionService] = None
-# _audit_logger_service_instance: Optional[AuditLoggerService] = None # Old instance
-_data_ingestion_service_instance: Optional[DataIngestionService] = None
-
-def temp_get_encryption_service():
-    global _encryption_service_instance
-    if _encryption_service_instance is None:
-        _encryption_service_instance = EncryptionService(encryption_key=get_settings().APP_ENCRYPTION_KEY)
-    return _encryption_service_instance
-
-# def temp_get_audit_logger_service(): # Old temporary getter
-#     global _audit_logger_service_instance
-#     if _audit_logger_service_instance is None:
-#         # AsyncSessionLocal itself is the factory that creates sessions.
-#         _audit_logger_service_instance = AuditLoggerService(db_session_factory=AsyncSessionLocal)
-#     return _audit_logger_service_instance
-
-def temp_get_data_ingestion_service(): # Kept for DataIngestionService if it's still used temporarily
-    global _data_ingestion_service_instance
-    if _data_ingestion_service_instance is None:
-        _data_ingestion_service_instance = DataIngestionService(
-            db_session_factory=AsyncSessionLocal, # Pass the session factory
-            encryption_service=temp_get_encryption_service() # Use temp getter for encryption service
-        )
-    return _data_ingestion_service_instance
-# --- End Temporary Dependency Setup ---
-
-
-@router.post("/submissions/claims_batch", status_code=202, response_model=IngestionResponse) # Added response_model
+@router.post("/submissions/claims_batch", status_code=202, response_model=IngestionResponse)
 async def submit_claims_batch(
     request: Request,
     claims_batch: List[IngestionClaim],
     ingestion_batch_id: Optional[str] = None,
-    audit_logger: AuditLogger = Depends(get_audit_logger), # Use new AuditLogger
-    data_ingester: DataIngestionService = Depends(temp_get_data_ingestion_service) # Keep temp for this
-) -> IngestionResponse: # Return type is IngestionResponse
+    audit_logger: AuditLogger = Depends(get_audit_logger),
+    data_ingester: DataIngestionService = Depends(get_data_ingestion_service) # Use centralized provider
+) -> IngestionResponse:
     """
     API endpoint to submit a batch of claims for ingestion.
     The actual processing (validation, ML, RVU, transfer) is asynchronous.
