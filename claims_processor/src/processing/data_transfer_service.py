@@ -129,6 +129,7 @@ class DataTransferService:
                 "total_charges": stag_claim.total_charges,
 
                 "ml_prediction_score": stag_claim.ml_score,
+                "ml_model_version_used": stag_claim.ml_model_version_used, # New field
                 "processing_duration_ms": stag_claim.processing_duration_ms,
                 "throughput_achieved": None # Placeholder, typically a batch-level metric
             }
@@ -180,6 +181,7 @@ class DataTransferService:
                 'service_to_date': insert_stmt.excluded.service_to_date,
                 'total_charges': insert_stmt.excluded.total_charges,
                 'ml_prediction_score': insert_stmt.excluded.ml_prediction_score,
+                'ml_model_version_used': insert_stmt.excluded.ml_model_version_used, # Added new field
                 'processing_duration_ms': insert_stmt.excluded.processing_duration_ms,
                 'throughput_achieved': insert_stmt.excluded.throughput_achieved,
                 'risk_category': insert_stmt.excluded.risk_category,

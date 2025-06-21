@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 from decimal import Decimal
 import time
-# import asyncio # For asyncio.sleep # asyncio is already imported above
+import hashlib # For A/B testing consistent hashing
 from sqlalchemy.exc import OperationalError # For retry logic
 
 from ..core.config.settings import get_settings
@@ -18,9 +18,8 @@ from .rvu_service import RVUService
 from ..core.cache.cache_manager import get_cache_manager
 from .ml_pipeline.feature_extractor import FeatureExtractor
 from .ml_pipeline.optimized_predictor import OptimizedPredictor
-# Import MetricsCollector instead of individual metrics
 from ..core.monitoring.app_metrics import MetricsCollector
-from ..core.database.models.failed_claims_db import FailedClaimModel # Added FailedClaimModel
+from ..core.database.models.failed_claims_db import FailedClaimModel
 
 
 logger = structlog.get_logger(__name__)
@@ -38,18 +37,45 @@ class ClaimProcessingService:
         self.rvu_semaphore = asyncio.Semaphore(self.settings.RVU_CALCULATION_CONCURRENCY)
 
         self.feature_extractor = FeatureExtractor()
-        self.predictor = OptimizedPredictor(
+
+        # Primary Predictor
+        self.primary_predictor = OptimizedPredictor(
             model_path=self.settings.ML_MODEL_PATH,
             metrics_collector=self.metrics_collector,
             feature_count=self.settings.ML_FEATURE_COUNT
         )
+
+        # Challenger Predictor for A/B Testing
+        self.challenger_predictor: Optional[OptimizedPredictor] = None
+        if self.settings.ML_CHALLENGER_MODEL_PATH and \
+           self.settings.ML_AB_TEST_TRAFFIC_PERCENTAGE_TO_CHALLENGER > 0:
+            logger.info("Challenger model path configured for A/B testing.",
+                        path=self.settings.ML_CHALLENGER_MODEL_PATH,
+                        traffic_percentage=self.settings.ML_AB_TEST_TRAFFIC_PERCENTAGE_TO_CHALLENGER)
+            try:
+                # Ensure the challenger model file exists before attempting to load
+                # This check is simplified here; OptimizedPredictor itself logs if file not found.
+                self.challenger_predictor = OptimizedPredictor(
+                    model_path=self.settings.ML_CHALLENGER_MODEL_PATH,
+                    metrics_collector=self.metrics_collector,
+                    feature_count=self.settings.ML_FEATURE_COUNT # Assume same feature count
+                )
+                logger.info("Challenger OptimizedPredictor instantiated successfully.")
+            except Exception as e:
+                logger.error("Failed to instantiate Challenger OptimizedPredictor. A/B test will be inactive.",
+                             path=self.settings.ML_CHALLENGER_MODEL_PATH, error=str(e), exc_info=True)
+                self.challenger_predictor = None
+        else:
+            logger.info("No valid challenger model path or A/B traffic percentage configured. A/B testing inactive.")
+
         logger.info("ClaimProcessingService initialized",
                     db_session_id=id(db_session),
-                    cache_manager_id=id(cache_manager),
+                    cache_manager_id=id(cache_manager), # type: ignore
                     metrics_collector_id=id(self.metrics_collector),
                     validation_concurrency=self.settings.VALIDATION_CONCURRENCY,
                     rvu_concurrency=self.settings.RVU_CALCULATION_CONCURRENCY,
-                    ml_model_path=self.settings.ML_MODEL_PATH)
+                    primary_ml_model_path=self.settings.ML_MODEL_PATH,
+                    challenger_ml_model_path=self.settings.ML_CHALLENGER_MODEL_PATH if self.challenger_predictor else "N/A")
 
     async def _perform_validation_and_ml(self, processable_claim: ProcessableClaim, db_claim_model_for_failed: ClaimModel) -> ProcessableClaim:
         async with self.validation_ml_semaphore:
@@ -67,9 +93,30 @@ class ClaimProcessingService:
 
                 logger.info("Claim validation successful", claim_id=processable_claim.claim_id)
 
-                logger.debug("Performing ML prediction", claim_id=processable_claim.claim_id)
+                # ML Prediction Logic (with A/B test routing)
+                selected_predictor = self.primary_predictor
+                model_version_tag = f"control:{self.settings.ML_MODEL_PATH.split('/')[-1]}" if self.settings.ML_MODEL_PATH else "control:unknown"
+
+                if self.challenger_predictor and \
+                   self.settings.ML_CHALLENGER_MODEL_PATH and \
+                   self.settings.ML_AB_TEST_TRAFFIC_PERCENTAGE_TO_CHALLENGER > 0:
+
+                    combined_id_salt = f"{processable_claim.claim_id}-{self.settings.ML_AB_TEST_CLAIM_ID_SALT}"
+                    hashed_string = hashlib.sha256(combined_id_salt.encode('utf-8')).hexdigest()
+                    hash_val_percent = int(hashed_string[:4], 16) % 100
+
+                    if hash_val_percent < (self.settings.ML_AB_TEST_TRAFFIC_PERCENTAGE_TO_CHALLENGER * 100):
+                        selected_predictor = self.challenger_predictor
+                        model_version_tag = f"challenger:{self.settings.ML_CHALLENGER_MODEL_PATH.split('/')[-1]}"
+                        logger.debug("Routing claim to challenger model for A/B test", claim_id=processable_claim.claim_id, percentage_hash_val=hash_val_percent)
+                    else:
+                        logger.debug("Routing claim to primary model for A/B test", claim_id=processable_claim.claim_id, percentage_hash_val=hash_val_percent)
+
+                processable_claim.ml_model_version_used = model_version_tag
+
+                logger.debug("Performing ML prediction", claim_id=processable_claim.claim_id, model_used=model_version_tag)
                 features = self.feature_extractor.extract_features(processable_claim)
-                prediction_result_list = await self.predictor.predict_batch([features])
+                prediction_result_list = await selected_predictor.predict_batch([features])
 
                 ml_score = None
                 ml_decision = "ML_ERROR"
@@ -164,8 +211,13 @@ class ClaimProcessingService:
                 current_duration_ms = (time.monotonic() - start_time) * 1000.0
                 processable_claim_instance.processing_duration_ms = current_duration_ms
                 await self._update_claim_and_lines_in_db(db_claim, processable_claim_instance, final_status, duration_ms=current_duration_ms)
+                # Extract validation errors if any from the ProcessableClaim if the validator adds them there.
+                # For now, assuming error details are in FailedClaimModel.
+                # errors_list = getattr(processable_claim_instance, 'validation_errors_list', None)
                 return {"db_id": db_claim.id, "claim_id": processable_claim_instance.claim_id, "status": final_status,
-                        "ml_decision": processable_claim_instance.ml_derived_decision, "errors": getattr(processable_claim_instance, 'validation_errors', None)}
+                        "ml_decision": processable_claim_instance.ml_derived_decision,
+                        "ml_model_version_used": processable_claim_instance.ml_model_version_used,
+                        "errors": None} # Errors logged to FailedClaimModel
 
             # 3. Perform RVU Calculation (only if status is "ml_complete")
             if final_status == "ml_complete":
@@ -179,6 +231,7 @@ class ClaimProcessingService:
 
             return {"db_id": db_claim.id, "claim_id": processable_claim_instance.claim_id, "status": final_status,
                     "ml_decision": processable_claim_instance.ml_derived_decision,
+                    "ml_model_version_used": processable_claim_instance.ml_model_version_used,
                     "errors": None if final_status == "processing_complete" else ["Processing ended with status: " + final_status]}
 
         except Exception as final_e:
@@ -187,6 +240,13 @@ class ClaimProcessingService:
                          claim_id=db_claim.claim_id, error=str(final_e), exc_info=True)
             if processable_claim_instance:
                 processable_claim_instance.processing_status = final_status
+                # Ensure ml_model_version_used is set even in error if it was determined
+                if not processable_claim_instance.ml_model_version_used:
+                    processable_claim_instance.ml_model_version_used = "unknown_due_to_error"
+            else: # If processable_claim_instance is None due to very early error
+                # We can't set ml_model_version_used on it. _store_failed_claim will handle None.
+                pass
+
             await self._store_failed_claim(db_claim_to_update=db_claim,
                                            processable_claim_instance=processable_claim_instance,
                                            failed_stage="ORCHESTRATION_ERROR", reason=str(final_e))
@@ -197,6 +257,7 @@ class ClaimProcessingService:
 
             return {"db_id": db_claim.id, "claim_id": db_claim.claim_id, "status": final_status,
                     "ml_decision": processable_claim_instance.ml_derived_decision if processable_claim_instance else "N/A",
+                    "ml_model_version_used": processable_claim_instance.ml_model_version_used if processable_claim_instance else "unknown_due_to_error",
                     "error_detail_str": str(final_e)}
         finally:
             final_duration_sec = time.monotonic() - start_time
@@ -206,8 +267,8 @@ class ClaimProcessingService:
 
     async def _store_failed_claim(
         self,
-        db_claim_to_update: Optional[ClaimModel],
-        processable_claim_instance: Optional[ProcessableClaim],
+        db_claim_to_update: Optional[ClaimModel], # Original ClaimModel from DB
+        processable_claim_instance: Optional[ProcessableClaim], # Pydantic model, potentially partially updated
         failed_stage: str,
         reason: str,
     ):
@@ -215,14 +276,20 @@ class ClaimProcessingService:
                     claim_id=db_claim_to_update.claim_id if db_claim_to_update else (processable_claim_instance.claim_id if processable_claim_instance else "N/A"))
 
         original_data_json = None
+        # Prioritize data from processable_claim_instance if available, as it's the "working copy"
         if processable_claim_instance:
-            original_data_json = processable_claim_instance.model_dump(mode='json')
-        elif db_claim_to_update:
+            # Ensure ml_model_version_used is in the dump if set
+            dump_data = processable_claim_instance.model_dump(mode='json')
+            if not dump_data.get("ml_model_version_used") and processable_claim_instance.ml_model_version_used:
+                dump_data["ml_model_version_used"] = processable_claim_instance.ml_model_version_used
+            original_data_json = dump_data
+        elif db_claim_to_update: # Fallback to basic info from db_claim if pydantic model failed early
             original_data_json = {
                 "claim_id": db_claim_to_update.claim_id,
                 "facility_id": db_claim_to_update.facility_id,
                 "patient_account_number": db_claim_to_update.patient_account_number,
                 "total_charges": float(db_claim_to_update.total_charges) if db_claim_to_update.total_charges is not None else None,
+                # Add other key fields that might be useful for context
             }
 
         failed_claim_entry = FailedClaimModel(
@@ -283,8 +350,6 @@ class ClaimProcessingService:
 
         for result in processing_results:
             if isinstance(result, Exception):
-                # This status is for claims that had an unhandled exception within _process_single_claim_concurrently's orchestration
-                # or during asyncio.gather itself.
                 status = "unhandled_orchestration_error"
                 claims_by_final_status_for_metric[status] = claims_by_final_status_for_metric.get(status, 0) + 1
             elif isinstance(result, dict):
@@ -307,7 +372,7 @@ class ClaimProcessingService:
         final_summary = {
             "message": "Concurrent batch processing finished.",
             "attempted_claims": attempted_claims,
-            "by_status": claims_by_final_status_for_metric, # Direct map of statuses
+            "by_status": claims_by_final_status_for_metric,
             "ml_approved_raw": ml_approved_raw_count,
             "ml_rejected_raw": ml_rejected_raw_count,
             "ml_errors_raw": ml_errors_raw_count,
@@ -340,8 +405,8 @@ class ClaimProcessingService:
                                          processed_pydantic_claim: Optional[ProcessableClaim],
                                          new_status: str,
                                          duration_ms: Optional[float] = None,
-                                         validation_errors: List[str] = None, # No longer used here directly for db field
-                                         ml_log_info: Optional[Dict] = None): # No longer used here directly for db field
+                                         validation_errors: List[str] = None,
+                                         ml_log_info: Optional[Dict] = None):
         if db_claim_to_update is None:
             logger.error("Cannot update claim in DB: SQLAlchemy model instance is None.")
             return
@@ -351,18 +416,15 @@ class ClaimProcessingService:
         db_claim_to_update.processing_status = new_status
         if duration_ms is not None:
             db_claim_to_update.processing_duration_ms = int(duration_ms)
-        if processed_pydantic_claim: # This implies conversion was successful
+        if processed_pydantic_claim:
             if processed_pydantic_claim.ml_score is not None:
                 db_claim_to_update.ml_score = Decimal(str(processed_pydantic_claim.ml_score))
             if processed_pydantic_claim.ml_derived_decision is not None:
                 db_claim_to_update.ml_derived_decision = processed_pydantic_claim.ml_derived_decision
+            if processed_pydantic_claim.ml_model_version_used is not None: # Persist model version used
+                db_claim_to_update.ml_model_version_used = processed_pydantic_claim.ml_model_version_used
 
-            # If validation_errors were passed, it implies they were recorded by _store_failed_claim.
-            # No specific error field on ClaimModel itself for now.
-            # if validation_errors:
-            # logger.warn("Storing/logging errors for claim", claim_id=db_claim_to_update.claim_id, errors=validation_errors)
-
-            if new_status == "processing_complete" and processed_pydantic_claim.line_items: # Ensure line_items exist
+            if new_status == "processing_complete" and processed_pydantic_claim.line_items:
                 map_pydantic_line_items = {line.id: line for line in processed_pydantic_claim.line_items}
                 for db_line_item in db_claim_to_update.line_items:
                     if db_line_item.id in map_pydantic_line_items:

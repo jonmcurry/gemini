@@ -35,6 +35,7 @@ class ClaimsProductionModel(Base):
     risk_category = Column(String(50), nullable=True) # Increased length from 20 in reqs for flexibility
     processing_duration_ms = Column(Integer, nullable=True)
     throughput_achieved = Column(Numeric(10, 2), nullable=True) # e.g., claims/sec during its batch
+    ml_model_version_used = Column(String(50), nullable=True, index=True) # New column
 
     # Timestamps for the production record itself
     created_at_prod = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False, comment="Timestamp of insertion into production table")

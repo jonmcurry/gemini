@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field # Ensure Field is imported
 from functools import lru_cache
 from typing import Optional
 
@@ -21,6 +22,19 @@ class Settings(BaseSettings):
     # ML Prediction Cache Settings
     ML_PREDICTION_CACHE_MAXSIZE: int = 10000 # Max number of entries in the prediction cache
     ML_PREDICTION_CACHE_TTL: int = 3600      # TTL for prediction cache entries in seconds (1 hour)
+
+    # ML A/B Testing Settings
+    ML_CHALLENGER_MODEL_PATH: Optional[str] = Field(None, description="Optional path to a challenger ML model for A/B testing.")
+    ML_AB_TEST_TRAFFIC_PERCENTAGE_TO_CHALLENGER: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Percentage of traffic (0.0 to 1.0) to route to the challenger model. Default 0.0 (off)."
+    )
+    ML_AB_TEST_CLAIM_ID_SALT: str = Field(
+        "default_ab_salt",
+        description="A salt for hashing claim IDs for consistent A/B test routing."
+    )
 
     # Application Security Settings
     APP_ENCRYPTION_KEY: str = "must_be_32_bytes_long_for_aes256_key!"

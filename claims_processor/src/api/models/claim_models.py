@@ -84,6 +84,7 @@ class ProcessableClaim(BaseModel):
     # New fields for ML results
     ml_score: Optional[float] = None
     ml_derived_decision: Optional[str] = None # e.g., "ML_APPROVED", "ML_REJECTED"
+    ml_model_version_used: Optional[str] = None # New field: e.g., "control", "challenger_model_v1.2"
 
     # New field for processing duration
     processing_duration_ms: Optional[float] = None # Duration in milliseconds
