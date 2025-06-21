@@ -774,4 +774,68 @@ async def test_process_pending_claims_batch_no_claims(
         duration_seconds=pytest.approx(0, abs=0.1), # Duration should be very small
         claims_by_final_status={}
     )
+
+
+# --- Tests for Batch Fetch Retry Logic ---
+@pytest.mark.asyncio
+@patch('asyncio.sleep', new_callable=AsyncMock)
+async def test_process_batch_fetch_retries_then_succeeds(
+    mock_async_sleep: AsyncMock,
+    claim_processing_service_instance: ClaimProcessingService,
+    mock_metrics_collector: MagicMock,
+    mock_db_session: MagicMock # To control commit success
+):
+    batch_size = 5
+    # Settings for retries are from mock_settings fixture (MAX_FETCH_RETRIES = 2, FETCH_RETRY_DELAY_SECONDS = 0.01)
+
+    mock_claims_to_return = [create_mock_db_claim("C1_retry_succ")]
+
+    claim_processing_service_instance._fetch_pending_claims = AsyncMock(side_effect=[
+        OperationalError("Simulated DB error on fetch", {}, None),
+        mock_claims_to_return
+    ])
+
+    mock_processed_claim = create_mock_processable_claim_from_db(mock_claims_to_return[0])
+    mock_processed_claim.processing_status = "processing_complete"
+    claim_processing_service_instance._process_single_claim_concurrently = AsyncMock(return_value=mock_processed_claim)
+
+    mock_db_session.begin.return_value.__aexit__ = AsyncMock(return_value=None) # Successful commit
+
+    summary = await claim_processing_service_instance.process_pending_claims_batch(batch_size_override=batch_size)
+
+    assert claim_processing_service_instance._fetch_pending_claims.call_count == 2
+    mock_async_sleep.assert_called_once_with(claim_processing_service_instance.settings.FETCH_RETRY_DELAY_SECONDS)
+
+    assert summary["attempted_claims"] == 1
+    assert summary["by_status"].get("processing_complete") == 1
+    mock_metrics_collector.record_batch_processed.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch('asyncio.sleep', new_callable=AsyncMock)
+async def test_process_batch_fetch_all_retries_fail(
+    mock_async_sleep: AsyncMock,
+    claim_processing_service_instance: ClaimProcessingService,
+    mock_metrics_collector: MagicMock
+):
+    batch_size = 5
+    max_retries = claim_processing_service_instance.settings.MAX_FETCH_RETRIES # Should be 2 from mock_settings
+
+    claim_processing_service_instance._fetch_pending_claims = AsyncMock(
+        side_effect=OperationalError("Simulated DB error on fetch", {}, None)
+    )
+
+    summary = await claim_processing_service_instance.process_pending_claims_batch(batch_size_override=batch_size)
+
+    assert claim_processing_service_instance._fetch_pending_claims.call_count == max_retries
+    assert mock_async_sleep.call_count == max_retries -1
+
+    assert summary["attempted_claims"] == 0
+    assert summary["message"] == "Batch processing aborted: Failed to fetch claims after multiple retries."
+    assert summary["by_status"].get("fetch_error") == batch_size
+
+    mock_metrics_collector.record_batch_processed.assert_called_once()
+    metrics_args_kwargs = mock_metrics_collector.record_batch_processed.call_args.kwargs
+    assert metrics_args_kwargs["batch_size"] == 0
+    assert metrics_args_kwargs["claims_by_final_status"] == {"fetch_error": batch_size}
 ```
