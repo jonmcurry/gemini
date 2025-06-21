@@ -38,6 +38,7 @@ class ClaimModel(Base):
     processing_duration_ms = Column(Integer, nullable=True)
     ml_score = Column(Numeric(5, 4), nullable=True)
     ml_derived_decision = Column(String(50), nullable=True)
+    ml_model_version_used = Column(String(50), nullable=True, index=True) # New column
 
     line_items = relationship("ClaimLineItemModel", back_populates="claim", cascade="all, delete-orphan")
 

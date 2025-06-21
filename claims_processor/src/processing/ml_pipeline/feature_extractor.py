@@ -4,6 +4,12 @@ from claims_processor.src.api.models.claim_models import ProcessableClaim, Proce
 import structlog
 import numpy as np
 from decimal import Decimal # Import Decimal for type consistency if needed, though helpers return float
+from cachetools import TTLCache
+import hashlib
+
+from ....core.config.settings import get_settings
+from ....core.monitoring.app_metrics import MetricsCollector
+
 
 logger = structlog.get_logger(__name__)
 
@@ -57,11 +63,17 @@ class FeatureExtractor:
     Extracts ML features from claims data.
     """
 
-    def __init__(self):
-        # In a real scenario, settings might provide feature_count, normalization params, etc.
-        # For this implementation, it produces a fixed set of 7 features.
-        # self.feature_count = 7 # Or get from settings if padding/truncation logic is re-added.
-        logger.info("FeatureExtractor initialized.")
+    def __init__(self, metrics_collector: MetricsCollector):
+        self.metrics_collector = metrics_collector
+        app_settings = get_settings()
+
+        self.feature_cache = TTLCache(
+            maxsize=app_settings.ML_FEATURE_CACHE_MAXSIZE,
+            ttl=app_settings.ML_FEATURE_CACHE_TTL
+        )
+        logger.info("FeatureExtractor initialized with feature cache.",
+                    maxsize=app_settings.ML_FEATURE_CACHE_MAXSIZE,
+                    ttl=app_settings.ML_FEATURE_CACHE_TTL)
 
     def _calculate_patient_age(self, patient_date_of_birth: Optional[date], reference_date: Optional[date] = None) -> Optional[float]:
         if not patient_date_of_birth:
@@ -168,27 +180,38 @@ class FeatureExtractor:
 
 
     def extract_features(self, claim: ProcessableClaim) -> Optional[np.ndarray]:
-        logger.debug("Extracting features for claim", claim_id=claim.claim_id)
+        # Cache Key Generation
         try:
-            patient_age_val = self._calculate_patient_age(claim.patient_date_of_birth, reference_date=claim.service_from_date)
+            # Using model_dump_json for Pydantic v2
+            claim_json_for_key = claim.model_dump_json(exclude={'processing_status', 'validation_errors', 'rvu_adjustments_details', 'ml_model_version_used'})
+        except AttributeError:
+            # Fallback for Pydantic v1 if needed, though ProcessableClaim should be v2
+            claim_json_for_key = claim.json(exclude={'processing_status', 'validation_errors', 'rvu_adjustments_details', 'ml_model_version_used'})
 
-            # Use the new insurance_type field from ProcessableClaim
-            insurance_type_encoded_val = self._encode_insurance_type(claim.insurance_type)
+        cache_key = hashlib.sha256(claim_json_for_key.encode('utf-8')).hexdigest()
 
-            features = [
-                self._normalize_total_charges(claim.total_charges),
-                float(len(claim.line_items)) if claim.line_items else 0.0,
-                patient_age_val if patient_age_val is not None else -1.0,
-                self._calculate_service_duration(claim),
-                insurance_type_encoded_val,
-                self._detect_surgery_codes(claim.line_items),
-                self._calculate_complexity_score(claim.line_items)
-            ]
+        # Cache Check
+        if cache_key in self.feature_cache:
+            cached_features = self.feature_cache[cache_key]
+            logger.debug("Feature cache hit", claim_id=claim.claim_id, cache_key=cache_key)
+            if self.metrics_collector:
+                self.metrics_collector.record_cache_operation(
+                    cache_type='ml_feature_cache', operation_type='get', outcome='hit'
+                )
+            return cached_features
 
+        if self.metrics_collector:
+            self.metrics_collector.record_cache_operation(
+                cache_type='ml_feature_cache', operation_type='get', outcome='miss'
+            )
+        logger.debug("Feature cache miss. Extracting features for claim", claim_id=claim.claim_id, cache_key=cache_key)
+
+        try:
+            # Corrected feature extraction logic (removed duplicated block)
             patient_age_val = self._calculate_patient_age(claim.patient_date_of_birth, reference_date=claim.service_from_date)
             insurance_type_encoded_val = self._encode_insurance_type(claim.insurance_type)
             surgery_detected_flag = self._detect_surgery_codes(claim.line_items)
-            complexity_score_val = self._calculate_complexity_score(claim, surgery_detected_flag) # Pass full claim
+            complexity_score_val = self._calculate_complexity_score(claim, surgery_detected_flag)
 
             features = [
                 self._normalize_total_charges(claim.total_charges),
@@ -222,6 +245,10 @@ class FeatureExtractor:
                               claim_id=claim.claim_id)
                  return None
 
+            # Cache Storage
+            if features_array is not None: # Should always be true if no error by now
+                self.feature_cache[cache_key] = features_array
+                logger.debug("Stored features in cache", claim_id=claim.claim_id, cache_key=cache_key)
 
             logger.info(
                 "Features extracted for claim",

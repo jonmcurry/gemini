@@ -32,6 +32,7 @@ class ClaimResponse(ClaimBase):
 # These will be populated from SQLAlchemy objects
 from pydantic import constr, condecimal # Import constr and condecimal
 from typing import List # Import List
+from decimal import Decimal # Added for condecimal constraints
 
 class ProcessableClaimLineItem(BaseModel):
     id: int
@@ -69,7 +70,7 @@ class ProcessableClaim(BaseModel):
     service_from_date: date
     service_to_date: date
 
-    total_charges: condecimal(max_digits=15, decimal_places=2)
+    total_charges: condecimal(max_digits=15, decimal_places=2, gt=Decimal(0))
 
     processing_status: str # This will reflect current DB status when fetched
     batch_id: Optional[str] = None
@@ -83,6 +84,7 @@ class ProcessableClaim(BaseModel):
     # New fields for ML results
     ml_score: Optional[float] = None
     ml_derived_decision: Optional[str] = None # e.g., "ML_APPROVED", "ML_REJECTED"
+    ml_model_version_used: Optional[str] = None # New field: e.g., "control", "challenger_model_v1.2"
 
     # New field for processing duration
     processing_duration_ms: Optional[float] = None # Duration in milliseconds

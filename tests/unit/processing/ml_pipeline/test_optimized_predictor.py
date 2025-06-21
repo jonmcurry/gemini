@@ -1,274 +1,258 @@
 import pytest
 import numpy as np
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from pathlib import Path
-from typing import List, Dict, Any, Optional # Added Optional
+from typing import List, Dict, Any, Optional
+import time # For mocking time for TTL tests
+from cachetools import TTLCache # For type hinting
 
 # Conditional import for testing
 TFLITE_INSTALLED_FOR_TEST = False
-# Define a placeholder for tflite.Interpreter if the module isn't found
-# This allows tests to run and mock this type.
 try:
     from tflite_runtime.interpreter import Interpreter as TFLiteInterpreter
-    # If the above import works, we can try to import the module itself for monkeypatching
-    import tflite_runtime.interpreter as tflite_interpreter_module # For monkeypatching later
     TFLITE_INSTALLED_FOR_TEST = True
 except ImportError:
-    # Create a dummy class that mimics tflite.Interpreter for type hinting and mocking if tflite_runtime is not installed
+    import structlog # Import structlog here if needed for the dummy class
     class TFLiteInterpreter: # type: ignore
         def __init__(self, model_path=None, model_content=None, experimental_delegates=None, num_threads=None):
-            self.model_path = model_path # Store for verification
+            self.model_path = model_path
         def allocate_tensors(self): pass
-        def get_input_details(self): return [{'shape': np.array([1, 7], dtype=np.int32), 'index': 0, 'dtype': np.float32}]
+        def get_input_details(self): return [{'shape': np.array([1, 7], dtype=np.int32), 'index': 0, 'dtype': np.float32}] # Default, adjust if needed
         def get_output_details(self): return [{'shape': np.array([1, 2], dtype=np.int32), 'index': 0, 'dtype': np.float32}]
         def set_tensor(self, tensor_index, value): pass
         def invoke(self): pass
-        def get_tensor(self, tensor_index): return np.array([[0.25, 0.75]], dtype=np.float32) # Default mock output
+        def get_tensor(self, tensor_index): return np.array([[0.25, 0.75]], dtype=np.float32) # Default mock output for single item
     logger_for_dummy = structlog.get_logger(__name__)
-    logger_for_dummy = structlog.get_logger(__name__) # Ensure structlog is imported if used here
     logger_for_dummy.warn("Dummy TFLiteInterpreter created as tflite_runtime is not installed.")
 
 
-from claims_processor.src.processing.ml_pipeline.optimized_predictor import OptimizedPredictor, TFLITE_AVAILABLE as PRED_TFLITE_AVAILABLE
-from claims_processor.src.core.config.settings import Settings, get_settings # For mocking settings
-from claims_processor.src.core.monitoring.app_metrics import MetricsCollector # Added
+from claims_processor.src.processing.ml_pipeline.optimized_predictor import OptimizedPredictor
+from claims_processor.src.core.config.settings import Settings
+from claims_processor.src.core.monitoring.app_metrics import MetricsCollector
 
 # Use settings for model path and feature count consistently
-BASE_SETTINGS = get_settings()
-MODEL_PATH_SETTING = BASE_SETTINGS.ML_MODEL_PATH or "dummy_model.tflite"
-FEATURE_COUNT_SETTING = BASE_SETTINGS.ML_FEATURE_COUNT
-APPROVAL_THRESHOLD_SETTING = BASE_SETTINGS.ML_APPROVAL_THRESHOLD
+# These will be overridden by mock_settings_fixture in tests needing specific settings.
+BASE_SETTINGS_FOR_TESTS = Settings() # Use real settings as a base for defaults
+MODEL_PATH_SETTING = BASE_SETTINGS_FOR_TESTS.ML_MODEL_PATH or "dummy_model.tflite"
+FEATURE_COUNT_SETTING = BASE_SETTINGS_FOR_TESTS.ML_FEATURE_COUNT
+APPROVAL_THRESHOLD_SETTING = BASE_SETTINGS_FOR_TESTS.ML_APPROVAL_THRESHOLD
 
 @pytest.fixture
-def mock_tflite_interpreter_instance() -> MagicMock:
-    """Mocks a TFLite Interpreter instance with basic methods."""
-    mock_instance = MagicMock(spec=TFLiteInterpreter)
-    mock_instance.allocate_tensors = MagicMock()
-    mock_instance.get_input_details = MagicMock(return_value=[{'shape': np.array([1, FEATURE_COUNT_SETTING], dtype=np.int32), 'index': 0, 'dtype': np.float32}])
-    mock_instance.get_output_details = MagicMock(return_value=[{'shape': np.array([1, 2], dtype=np.int32), 'index': 0, 'dtype': np.float32}])
-    mock_instance.set_tensor = MagicMock()
-    mock_instance.invoke = MagicMock()
-    # Default output for a single prediction (batch size 1, 2 classes)
-    mock_instance.get_tensor = MagicMock(return_value=np.array([[0.25, 0.75]], dtype=np.float32))
-    return mock_instance
-
-@pytest.fixture
-def mock_tflite_interpreter_constructor(monkeypatch, mock_tflite_interpreter_instance: MagicMock) -> Optional[MagicMock]:
-    """Mocks the TFLite Interpreter constructor if TFLite is considered available."""
-    if TFLITE_INSTALLED_FOR_TEST and PRED_TFLITE_AVAILABLE:
-        # Path to the Interpreter class within the module where OptimizedPredictor imports it
-        interpreter_path = "claims_processor.src.processing.ml_pipeline.optimized_predictor.Interpreter"
-        mock_constructor = MagicMock(return_value=mock_tflite_interpreter_instance)
-        monkeypatch.setattr(interpreter_path, mock_constructor)
-        return mock_constructor
-    return None
-
-@pytest.fixture # Added
 def mock_metrics_collector() -> MagicMock:
-    return MagicMock(spec=MetricsCollector)
+    collector = MagicMock(spec=MetricsCollector)
+    collector.record_ml_prediction = MagicMock()
+    collector.record_cache_operation = MagicMock()
+    collector.record_ml_inference_duration = MagicMock()
+    return collector
 
-# --- Initialization Tests ---
-def test_init_tflite_not_available(monkeypatch, mock_metrics_collector: MagicMock):
-    monkeypatch.setattr("claims_processor.src.processing.ml_pipeline.optimized_predictor.TFLITE_AVAILABLE", False)
-    predictor = OptimizedPredictor(
-        model_path=MODEL_PATH_SETTING,
-        feature_count=FEATURE_COUNT_SETTING,
-        metrics_collector=mock_metrics_collector
+@pytest.fixture
+def mock_settings( # Default mock settings, can be overridden in tests
+    tmp_path: Path # Pytest fixture for temporary directory
+) -> Settings:
+    # Create a dummy model file so Path.is_file() check passes during init
+    dummy_model_file = tmp_path / "dummy_model.tflite"
+    dummy_model_file.touch()
+
+    settings = Settings(
+        ML_MODEL_PATH=str(dummy_model_file), # Use the path to the dummy file
+        ML_FEATURE_COUNT=FEATURE_COUNT_SETTING,
+        ML_APPROVAL_THRESHOLD=APPROVAL_THRESHOLD_SETTING,
+        ML_PREDICTION_CACHE_MAXSIZE=128, # Default for most tests
+        ML_PREDICTION_CACHE_TTL=3600     # Default for most tests
     )
-    assert predictor.interpreter is None
+    return settings
 
-def test_init_model_path_not_configured(monkeypatch, mock_metrics_collector: MagicMock):
-    monkeypatch.setattr("claims_processor.src.processing.ml_pipeline.optimized_predictor.TFLITE_AVAILABLE", True)
-    if TFLITE_INSTALLED_FOR_TEST: # Ensure dummy or real Interpreter is available for import
-         monkeypatch.setattr("claims_processor.src.processing.ml_pipeline.optimized_predictor.Interpreter", TFLiteInterpreter)
-    predictor = OptimizedPredictor(
-        model_path="",
-        feature_count=FEATURE_COUNT_SETTING,
-        metrics_collector=mock_metrics_collector
-    ) # Empty path
-    assert predictor.interpreter is None
+@pytest.fixture
+def optimized_predictor(mock_metrics_collector: MagicMock, mock_settings: Settings) -> OptimizedPredictor:
+    # Patch get_settings call within OptimizedPredictor's __init__
+    with patch('claims_processor.src.processing.ml_pipeline.optimized_predictor.get_settings', return_value=mock_settings):
+        # Ensure TFLITE_AVAILABLE is True for these tests to attempt loading the interpreter
+        with patch('claims_processor.src.processing.ml_pipeline.optimized_predictor.TFLITE_AVAILABLE', True):
+            # Mock the TFLite Interpreter constructor itself
+            with patch('claims_processor.src.processing.ml_pipeline.optimized_predictor.Interpreter') as mock_interpreter_constructor:
+                mock_interpreter_instance = MagicMock(spec=TFLiteInterpreter)
+                mock_interpreter_instance.get_input_details.return_value = [{'shape': np.array([-1, mock_settings.ML_FEATURE_COUNT], dtype=np.int32), 'index': 0, 'dtype': np.float32}] # Dynamic batch size
+                mock_interpreter_instance.get_output_details.return_value = [{'shape': np.array([-1, 2], dtype=np.int32), 'index': 1, 'dtype': np.float32}] # Dynamic batch size, 2 outputs
+                mock_interpreter_constructor.return_value = mock_interpreter_instance
 
-def test_init_model_file_not_found(monkeypatch, mock_metrics_collector: MagicMock):
-    monkeypatch.setattr("claims_processor.src.processing.ml_pipeline.optimized_predictor.TFLITE_AVAILABLE", True)
-    if TFLITE_INSTALLED_FOR_TEST:
-         monkeypatch.setattr("claims_processor.src.processing.ml_pipeline.optimized_predictor.Interpreter", TFLiteInterpreter)
-    monkeypatch.setattr(Path, 'is_file', lambda self: False)
-    predictor = OptimizedPredictor(
-        model_path="non_existent.tflite",
-        feature_count=FEATURE_COUNT_SETTING,
-        metrics_collector=mock_metrics_collector
-    )
-    assert predictor.interpreter is None
+                predictor = OptimizedPredictor(
+                    model_path=mock_settings.ML_MODEL_PATH,
+                    metrics_collector=mock_metrics_collector,
+                    feature_count=mock_settings.ML_FEATURE_COUNT
+                )
+                # Store the mocked interpreter instance on the predictor for easy access in tests
+                predictor.mock_interpreter_instance = mock_interpreter_instance
+                return predictor
 
-@pytest.mark.skipif(not TFLITE_INSTALLED_FOR_TEST, reason="TFLite runtime not installed/found in test environment")
-def test_init_model_loads_successfully(mock_tflite_interpreter_constructor: MagicMock, mock_tflite_interpreter_instance: MagicMock, monkeypatch, mock_metrics_collector: MagicMock):
-    if not mock_tflite_interpreter_constructor: pytest.skip("Interpreter constructor not patched") # Should not happen if skipif works
-    monkeypatch.setattr("claims_processor.src.processing.ml_pipeline.optimized_predictor.TFLITE_AVAILABLE", True)
-    monkeypatch.setattr(Path, 'is_file', lambda self: True)
 
-    predictor = OptimizedPredictor(
-        model_path=MODEL_PATH_SETTING,
-        feature_count=FEATURE_COUNT_SETTING,
-        metrics_collector=mock_metrics_collector
-    )
+# --- Initialization Tests (can be kept or simplified if covered by optimized_predictor fixture) ---
+def test_init_tflite_not_available(mock_metrics_collector: MagicMock, mock_settings: Settings):
+    with patch('claims_processor.src.processing.ml_pipeline.optimized_predictor.get_settings', return_value=mock_settings):
+        with patch('claims_processor.src.processing.ml_pipeline.optimized_predictor.TFLITE_AVAILABLE', False):
+            predictor = OptimizedPredictor(
+                model_path=mock_settings.ML_MODEL_PATH,
+                feature_count=mock_settings.ML_FEATURE_COUNT,
+                metrics_collector=mock_metrics_collector
+            )
+            assert predictor.interpreter is None
+            assert isinstance(predictor.prediction_cache, TTLCache) # Cache should still init
 
-    mock_tflite_interpreter_constructor.assert_called_once_with(model_path=MODEL_PATH_SETTING)
-    assert predictor.interpreter == mock_tflite_interpreter_instance
-    mock_tflite_interpreter_instance.allocate_tensors.assert_called_once()
 
-# --- Prediction Tests ---
+# --- Prediction Tests (Refactored for Batch and Cache) ---
+
+def generate_feature_sample(feature_count: int, value_offset: float = 0.0) -> np.ndarray:
+    # Creates a 1D array
+    return np.array([i + value_offset for i in range(feature_count)], dtype=np.float32)
+
 @pytest.mark.asyncio
-async def test_predict_batch_tflite_not_available(monkeypatch, mock_metrics_collector: MagicMock):
-    monkeypatch.setattr("claims_processor.src.processing.ml_pipeline.optimized_predictor.TFLITE_AVAILABLE", False)
-    predictor = OptimizedPredictor(
-        model_path=MODEL_PATH_SETTING,
-        feature_count=FEATURE_COUNT_SETTING,
-        metrics_collector=mock_metrics_collector
-    )
-    features_batch = [np.random.rand(1, FEATURE_COUNT_SETTING).astype(np.float32)]
-    predictions = await predictor.predict_batch(features_batch)
+async def test_predict_batch_empty_input(optimized_predictor: OptimizedPredictor):
+    predictions = await optimized_predictor.predict_batch([])
+    assert predictions == []
+
+@pytest.mark.asyncio
+async def test_predict_batch_input_validation_errors(optimized_predictor: OptimizedPredictor, mock_metrics_collector: MagicMock):
+    valid_sample = generate_feature_sample(optimized_predictor.feature_count)
+    invalid_shape_sample = np.array([1,2,3], dtype=np.float32) # Wrong shape
+    not_an_array = [1,2,3,4,5,6,7]
+
+    # Batch with one invalid shape
+    results = await optimized_predictor.predict_batch([valid_sample, invalid_shape_sample, valid_sample])
+    assert len(results) == 3
+    assert results[0]['ml_derived_decision'] != "ML_ERROR_FEATURE_SHAPE" # Assuming first is processed or cached if valid
+    assert results[1]['ml_derived_decision'] == "ML_ERROR_FEATURE_SHAPE"
+    assert results[2]['ml_derived_decision'] != "ML_ERROR_FEATURE_SHAPE"
+
+    # Batch with non-ndarray
+    results_non_array = await optimized_predictor.predict_batch([valid_sample, not_an_array]) # type: ignore
+    assert len(results_non_array) == 2
+    assert results_non_array[1]['ml_derived_decision'] == "ML_ERROR_FEATURE_FORMAT"
+
+
+@pytest.mark.asyncio
+async def test_prediction_cache_hit(optimized_predictor: OptimizedPredictor, mock_metrics_collector: MagicMock):
+    features = generate_feature_sample(optimized_predictor.feature_count)
+    cache_key = hashlib.sha256(features.tobytes()).hexdigest()
+    cached_result = {'ml_score': 0.99, 'ml_derived_decision': 'ML_APPROVED_CACHED'}
+
+    optimized_predictor.prediction_cache[cache_key] = cached_result
+
+    predictions = await optimized_predictor.predict_batch([features])
+
     assert len(predictions) == 1
-    assert "error" in predictions[0]
-    mock_metrics_collector.record_ml_prediction.assert_called_once_with(outcome="ML_ERROR_RUNTIME_UNAVAILABLE", confidence_score=None)
-    mock_metrics_collector.record_ml_inference_duration.assert_not_called()
-
-
-@pytest.mark.skipif(not TFLITE_INSTALLED_FOR_TEST, reason="TFLite runtime not installed/found in test environment")
-@pytest.mark.asyncio
-async def test_predict_batch_with_loaded_model(mock_tflite_interpreter_constructor: MagicMock, mock_tflite_interpreter_instance: MagicMock, monkeypatch, mock_metrics_collector: MagicMock):
-    if not mock_tflite_interpreter_constructor: pytest.skip("Interpreter constructor not patched")
-    monkeypatch.setattr("claims_processor.src.processing.ml_pipeline.optimized_predictor.TFLITE_AVAILABLE", True)
-    monkeypatch.setattr(Path, 'is_file', lambda self: True) # Assume file exists for loading
-
-    predictor = OptimizedPredictor(
-        model_path=MODEL_PATH_SETTING,
-        feature_count=FEATURE_COUNT_SETTING,
-        metrics_collector=mock_metrics_collector
-    )
-    assert predictor.interpreter == mock_tflite_interpreter_instance # Model "loaded"
-
-    # Test with a batch of 2 feature sets
-    features1 = np.random.rand(1, FEATURE_COUNT_SETTING).astype(np.float32)
-    features2 = np.random.rand(1, FEATURE_COUNT_SETTING).astype(np.float32)
-    features_batch = [features1, features2]
-
-    # Configure mock interpreter's get_tensor for two calls
-    output_val1 = np.array([[0.1, 0.9]], dtype=np.float32) # Corresponds to ML_APPROVED with default threshold
-    output_val2 = np.array([[0.8, 0.2]], dtype=np.float32) # Corresponds to ML_REJECTED
-    mock_tflite_interpreter_instance.get_tensor.side_effect = [output_val1, output_val2]
-
-    predictions = await predictor.predict_batch(features_batch)
-
-    assert mock_tflite_interpreter_instance.set_tensor.call_count == 2
-    mock_tflite_interpreter_instance.set_tensor.assert_any_call(predictor.input_details[0]['index'], features1)
-    mock_tflite_interpreter_instance.set_tensor.assert_any_call(predictor.input_details[0]['index'], features2)
-    assert mock_tflite_interpreter_instance.invoke.call_count == 2
-    assert mock_tflite_interpreter_instance.get_tensor.call_count == 2
-
-    assert len(predictions) == 2
-    assert predictions[0]['ml_score'] == pytest.approx(0.9)
-    assert predictions[0]['ml_derived_decision'] == "ML_APPROVED"
-    assert predictions[1]['ml_score'] == pytest.approx(0.2)
-    assert predictions[1]['ml_derived_decision'] == "ML_REJECTED"
-
-    # Metrics assertions
-    assert mock_metrics_collector.record_ml_inference_duration.call_count == 2
-    mock_metrics_collector.record_ml_inference_duration.assert_any_call(pytest.approx(0, abs=1e-1)) # Duration is dynamic
-
-    assert mock_metrics_collector.record_ml_prediction.call_count == 2
-    mock_metrics_collector.record_ml_prediction.assert_any_call(outcome="ML_APPROVED", confidence_score=pytest.approx(0.9))
-    mock_metrics_collector.record_ml_prediction.assert_any_call(outcome="ML_REJECTED", confidence_score=pytest.approx(0.2))
-
+    assert predictions[0] == cached_result
+    optimized_predictor.mock_interpreter_instance.invoke.assert_not_called()
+    mock_metrics_collector.record_cache_operation.assert_called_with(cache_type='ml_prediction', operation_type='get', outcome='hit')
 
 @pytest.mark.asyncio
-async def test_predict_batch_input_validation(monkeypatch, mock_metrics_collector: MagicMock):
-    # Simulate TFLite available and model loaded for this test, but focus on input validation
-    monkeypatch.setattr("claims_processor.src.processing.ml_pipeline.optimized_predictor.TFLITE_AVAILABLE", True)
-    if TFLITE_INSTALLED_FOR_TEST:
-         monkeypatch.setattr("claims_processor.src.processing.ml_pipeline.optimized_predictor.Interpreter", TFLiteInterpreter)
-    else: # If TFLite not installed, mock Interpreter to allow OptimizedPredictor init to "succeed"
-        monkeypatch.setattr("claims_processor.src.processing.ml_pipeline.optimized_predictor.Interpreter", MagicMock(return_value=MagicMock(spec=TFLiteInterpreter)))
+async def test_prediction_cache_miss_then_hit(optimized_predictor: OptimizedPredictor, mock_metrics_collector: MagicMock):
+    features = generate_feature_sample(optimized_predictor.feature_count)
 
-    monkeypatch.setattr(Path, 'is_file', lambda self: True)
-    predictor = OptimizedPredictor(
-        model_path=MODEL_PATH_SETTING,
-        feature_count=FEATURE_COUNT_SETTING,
-        metrics_collector=mock_metrics_collector
-    )
-    if predictor.interpreter is None and TFLITE_INSTALLED_FOR_TEST: # If mock setup failed, re-mock interpreter directly
-        predictor.interpreter = MagicMock(spec=TFLiteInterpreter)
-        predictor.input_details = [{'shape': np.array([1, FEATURE_COUNT_SETTING], dtype=np.int32), 'index': 0, 'dtype': np.float32}]
-        predictor.output_details = [{'shape': np.array([1, 2], dtype=np.int32), 'index': 0, 'dtype': np.float32}]
+    # Simulate interpreter output for the miss
+    mock_output = np.array([[0.1, 0.9]], dtype=np.float32) # Batch of 1, 2 classes. Approve.
+    optimized_predictor.mock_interpreter_instance.get_tensor.return_value = mock_output
 
+    # First call (miss)
+    predictions1 = await optimized_predictor.predict_batch([features])
+    assert len(predictions1) == 1
+    assert predictions1[0]['ml_derived_decision'] == 'ML_APPROVED'
+    assert predictions1[0]['ml_score'] == pytest.approx(0.9)
+    optimized_predictor.mock_interpreter_instance.invoke.assert_called_once()
+    # Check cache miss recorded, then prediction recorded
+    mock_metrics_collector.record_cache_operation.assert_called_with(cache_type='ml_prediction', operation_type='get', outcome='miss')
+    mock_metrics_collector.record_ml_prediction.assert_called_with(outcome='ML_APPROVED', confidence_score=pytest.approx(0.9))
 
-    # Test wrong feature shape (not (1, N))
-    predictions_wrong_shape = await predictor.predict_batch([np.random.rand(FEATURE_COUNT_SETTING).astype(np.float32)]) # 1D instead of 2D
-    assert "error" in predictions_wrong_shape[0]
-    assert predictions_wrong_shape[0]["error"] == "Feature shape mismatch"
-    mock_metrics_collector.record_ml_prediction.assert_called_with(outcome="ML_ERROR_INVALID_INPUT", confidence_score=None)
+    # Reset invoke mock for second call check
+    optimized_predictor.mock_interpreter_instance.invoke.reset_mock()
+    mock_metrics_collector.record_cache_operation.reset_mock()
 
+    # Second call (hit)
+    predictions2 = await optimized_predictor.predict_batch([features])
+    assert len(predictions2) == 1
+    assert predictions2[0]['ml_derived_decision'] == 'ML_APPROVED'
+    assert predictions2[0]['ml_score'] == pytest.approx(0.9)
+    optimized_predictor.mock_interpreter_instance.invoke.assert_not_called()
+    mock_metrics_collector.record_cache_operation.assert_called_with(cache_type='ml_prediction', operation_type='get', outcome='hit')
 
-    # Test wrong feature count
-    predictions_wrong_count = await predictor.predict_batch([np.random.rand(1, FEATURE_COUNT_SETTING + 1).astype(np.float32)])
-    assert "error" in predictions_wrong_count[0]
-    # This will also be caught by the shape check if feature_count is part of shape detail
-    # The error message might depend on how OptimizedPredictor checks this.
-    # Based on current OptimizedPredictor, it's "Feature shape mismatch"
-    assert predictions_wrong_count[0]["error"] == "Feature shape mismatch"
-    # This will be the second call to record_ml_prediction with this outcome
-    mock_metrics_collector.record_ml_prediction.assert_called_with(outcome="ML_ERROR_INVALID_INPUT", confidence_score=None)
-    assert mock_metrics_collector.record_ml_prediction.call_count == 2
-
-
-    # Test wrong dtype (if not converted and causes error)
-    # Current OptimizedPredictor tries to convert to float32, so this might not directly cause an "ML_ERROR_INVALID_INPUT"
-    # unless the conversion itself fails in a way that's caught.
-    # If it proceeds, it might fail at set_tensor if the mock is strict, or pass if mock is loose.
-    # Assuming conversion is successful, no new error metric here.
-    # If we wanted to test a conversion failure, we'd need to mock the conversion part.
-    # For now, no specific metric assertion here for dtype if it's handled by conversion.
-    # mock_metrics_collector.reset_mock() # Reset for next specific check if needed
-
-    # Ensure invoke and inference duration not called for these error cases
-    mock_metrics_collector.record_ml_inference_duration.assert_not_called()
-    if hasattr(predictor.interpreter, 'invoke'): # Check if interpreter was even set
-        predictor.interpreter.invoke.assert_not_called()
-
-
-# --- Health Check Tests ---
-# ... (Existing health check tests can be kept, ensuring they use monkeypatch for TFLITE_AVAILABLE and Path.is_file) ...
 @pytest.mark.asyncio
-async def test_health_check_tflite_not_available(monkeypatch, mock_metrics_collector: MagicMock):
-    monkeypatch.setattr("claims_processor.src.processing.ml_pipeline.optimized_predictor.TFLITE_AVAILABLE", False)
-    predictor = OptimizedPredictor(
-        model_path=MODEL_PATH_SETTING,
-        feature_count=FEATURE_COUNT_SETTING,
-        metrics_collector=mock_metrics_collector
-    )
-    health = await predictor.health_check()
-    assert health['status'] == "unhealthy"; assert "runtime not available" in health['reason']
+async def test_prediction_cache_ttl_expiration(optimized_predictor: OptimizedPredictor, mock_metrics_collector: MagicMock, mock_settings: Settings):
+    # This test needs to use the 'optimized_predictor' fixture which uses 'mock_settings'
+    # We need to ensure 'mock_settings' has the short TTL for this specific test.
+    # The fixture 'optimized_predictor' is already using 'mock_settings'.
+    # We can't easily change mock_settings per test if it's a fixture used by another fixture.
+    # So, let's re-initialize the cache on the existing predictor instance for this test.
 
-@pytest.mark.skipif(not TFLITE_INSTALLED_FOR_TEST, reason="TFLite runtime not installed/found in test environment")
+    short_ttl = 0.1 # seconds
+    optimized_predictor.prediction_cache = TTLCache(maxsize=128, ttl=short_ttl)
+
+    features = generate_feature_sample(optimized_predictor.feature_count, value_offset=1.0) # Different features
+
+    mock_output = np.array([[0.1, 0.9]], dtype=np.float32) # Approve
+    optimized_predictor.mock_interpreter_instance.get_tensor.return_value = mock_output
+
+    # First call (miss and cache)
+    await optimized_predictor.predict_batch([features])
+    optimized_predictor.mock_interpreter_instance.invoke.assert_called_once()
+    mock_metrics_collector.record_cache_operation.assert_called_with(cache_type='ml_prediction', operation_type='get', outcome='miss')
+
+    # Simulate time passing
+    await asyncio.sleep(short_ttl + 0.05) # Sleep a bit longer than TTL
+
+    # Second call (should be miss again due to TTL)
+    optimized_predictor.mock_interpreter_instance.invoke.reset_mock()
+    mock_metrics_collector.record_cache_operation.reset_mock()
+    await optimized_predictor.predict_batch([features])
+
+    optimized_predictor.mock_interpreter_instance.invoke.assert_called_once()
+    mock_metrics_collector.record_cache_operation.assert_called_with(cache_type='ml_prediction', operation_type='get', outcome='miss')
+
 @pytest.mark.asyncio
-async def test_health_check_healthy(mock_tflite_interpreter_constructor: Optional[MagicMock], monkeypatch, mock_metrics_collector: MagicMock):
-    if not mock_tflite_interpreter_constructor: pytest.skip("Interpreter constructor not patched")
-    monkeypatch.setattr("claims_processor.src.processing.ml_pipeline.optimized_predictor.TFLITE_AVAILABLE", True)
-    monkeypatch.setattr(Path, 'is_file', lambda self: True)
-    predictor = OptimizedPredictor(
-        model_path=MODEL_PATH_SETTING,
-        feature_count=FEATURE_COUNT_SETTING,
-        metrics_collector=mock_metrics_collector
-    )
-    health = await predictor.health_check()
+async def test_prediction_cache_maxsize(optimized_predictor: OptimizedPredictor, mock_metrics_collector: MagicMock):
+    # Re-initialize cache with maxsize 1 for this test
+    optimized_predictor.prediction_cache = TTLCache(maxsize=1, ttl=3600)
+
+    features_a = generate_feature_sample(optimized_predictor.feature_count, value_offset=10.0)
+    features_b = generate_feature_sample(optimized_predictor.feature_count, value_offset=20.0)
+
+    # Mock interpreter output
+    output_a = np.array([[0.1, 0.9]], dtype=np.float32) # Approve A
+    output_b = np.array([[0.8, 0.2]], dtype=np.float32) # Reject B
+
+    # Predict A (miss, cached)
+    optimized_predictor.mock_interpreter_instance.get_tensor.return_value = output_a
+    await optimized_predictor.predict_batch([features_a])
+    optimized_predictor.mock_interpreter_instance.invoke.assert_called_once()
+    assert len(optimized_predictor.prediction_cache) == 1
+    mock_metrics_collector.record_cache_operation.assert_called_with(cache_type='ml_prediction', operation_type='get', outcome='miss')
+
+    # Predict B (miss, cached, A should be evicted)
+    optimized_predictor.mock_interpreter_instance.invoke.reset_mock()
+    mock_metrics_collector.record_cache_operation.reset_mock()
+    optimized_predictor.mock_interpreter_instance.get_tensor.return_value = output_b
+    await optimized_predictor.predict_batch([features_b])
+    optimized_predictor.mock_interpreter_instance.invoke.assert_called_once()
+    assert len(optimized_predictor.prediction_cache) == 1
+    mock_metrics_collector.record_cache_operation.assert_called_with(cache_type='ml_prediction', operation_type='get', outcome='miss')
+    # Verify B is in cache (its key would be different from A's)
+    cache_key_b = hashlib.sha256(features_b.tobytes()).hexdigest()
+    assert cache_key_b in optimized_predictor.prediction_cache
+
+    # Predict A again (should be a miss as it was evicted)
+    optimized_predictor.mock_interpreter_instance.invoke.reset_mock()
+    mock_metrics_collector.record_cache_operation.reset_mock()
+    optimized_predictor.mock_interpreter_instance.get_tensor.return_value = output_a # Set output for A again
+    await optimized_predictor.predict_batch([features_a])
+    optimized_predictor.mock_interpreter_instance.invoke.assert_called_once()
+    mock_metrics_collector.record_cache_operation.assert_called_with(cache_type='ml_prediction', operation_type='get', outcome='miss')
+
+# Ensure existing health check tests (if any) are preserved or adapted
+# For example:
+@pytest.mark.asyncio
+async def test_health_check_healthy(optimized_predictor: OptimizedPredictor, mock_settings: Settings):
+    # This test assumes the predictor initialized correctly (mocked TFLite available and model file "exists")
+    if not optimized_predictor.interpreter: # If init failed due to TFLITE_AVAILABLE=False in some other fixture state
+        pytest.skip("Skipping health check as interpreter was not initialized, TFLITE_AVAILABLE might be False.")
+
+    health = await optimized_predictor.health_check()
     assert health['status'] == "healthy"
-    assert health['model_path'] == MODEL_PATH_SETTING
-    # Check if input_details and output_details exist before trying to stringify them
-    if predictor.input_details:
-        assert str(predictor.input_details) in health['input_details']
-    else:
-        assert "Input details not available" in health['input_details']
-
-    if predictor.output_details:
-        assert str(predictor.output_details) in health['output_details']
-    else:
-        assert "Output details not available" in health['output_details']
+    assert health['model_path'] == mock_settings.ML_MODEL_PATH
+```

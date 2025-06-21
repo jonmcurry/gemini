@@ -76,6 +76,7 @@ def test_map_staging_to_production_records_maps_correctly(
         service_from_date=date(2023,1,1), service_to_date=date(2023,1,5),
         total_charges=Decimal("120.50"),
         ml_score=Decimal("0.95"), ml_derived_decision="ML_APPROVED",
+        ml_model_version_used="control:model_v1.2", # Added
         processing_duration_ms=550,
         created_at=datetime.now(timezone.utc), # Required by model
         updated_at=datetime.now(timezone.utc)  # Required by model
@@ -88,6 +89,7 @@ def test_map_staging_to_production_records_maps_correctly(
     assert prod_rec["id"] == staging_claim.id
     assert prod_rec["claim_id"] == staging_claim.claim_id
     assert prod_rec["ml_prediction_score"] == staging_claim.ml_score
+    assert prod_rec["ml_model_version_used"] == staging_claim.ml_model_version_used # Added
     assert prod_rec["risk_category"] == "LOW" # Based on 0.95
     assert prod_rec["processing_duration_ms"] == staging_claim.processing_duration_ms
     assert prod_rec["throughput_achieved"] is None
@@ -116,6 +118,7 @@ def test_map_staging_to_production_records_risk_categories( # Name kept from exi
     now = datetime.now(timezone.utc)
     staging_claims = [
         ClaimModel(id=d["id"], claim_id=f"C{d['id']}", ml_score=d["ml_score"],
+                   ml_model_version_used=f"v_test_{d['id']}", # Added
                    facility_id="F", patient_account_number="P",
                    service_from_date=date.today(), service_to_date=date.today(),
                    total_charges=Decimal(1), processing_status="processing_complete",
@@ -125,6 +128,7 @@ def test_map_staging_to_production_records_risk_categories( # Name kept from exi
     mapped_records = data_transfer_service._map_staging_to_production_records(staging_claims)
     for i, rec in enumerate(mapped_records):
         assert rec["risk_category"] == claims_data[i]["expected_risk"]
+        assert rec["ml_model_version_used"] == f"v_test_{claims_data[i]['id']}" # Added
 
 # --- Test _bulk_insert_to_production ---
 @pytest.mark.asyncio
@@ -132,7 +136,10 @@ async def test_bulk_insert_to_production_success(
     data_transfer_service: DataTransferService,
     mock_db_session: MagicMock
 ):
-    test_records = [{"claim_id": "B1"}, {"claim_id": "B2"}]
+    test_records = [
+        {"claim_id": "B1", "ml_model_version_used": "control_v1"},
+        {"claim_id": "B2", "ml_model_version_used": "challenger_v1"}
+    ]
 
     count = await data_transfer_service._bulk_insert_to_production(test_records)
 
@@ -151,7 +158,7 @@ async def test_bulk_insert_to_production_failure(
     data_transfer_service: DataTransferService,
     mock_db_session: MagicMock
 ):
-    test_records = [{"claim_id": "B_FAIL"}]
+    test_records = [{"claim_id": "B_FAIL", "ml_model_version_used": "control_v1"}]
     mock_db_session.execute.side_effect = Exception("DB Insert Error")
 
     count = await data_transfer_service._bulk_insert_to_production(test_records)
@@ -216,8 +223,12 @@ async def test_transfer_claims_orchestration_success(
     mock_select_claims: MagicMock,
     data_transfer_service: DataTransferService
 ):
-    mock_staging_claims = [ClaimModel(id=1, claim_id="C1_FULL")]
-    mock_production_dicts = [{"claim_id": "C1_FULL_PROD"}]
+    mock_staging_claims = [
+        ClaimModel(id=1, claim_id="C1_FULL", ml_model_version_used="control:model_v1.0")
+    ]
+    mock_production_dicts = [
+        {"claim_id": "C1_FULL_PROD", "id":1, "ml_model_version_used": "control:model_v1.0"}
+    ]
 
     mock_select_claims.return_value = mock_staging_claims
     mock_map_records.return_value = mock_production_dicts
@@ -261,8 +272,12 @@ async def test_transfer_claims_orchestration_insert_fails(
     mock_select_claims: MagicMock,
     data_transfer_service: DataTransferService
 ):
-    mock_staging_claims = [ClaimModel(id=1)]
-    mock_production_dicts = [{"id":1}]
+    mock_staging_claims = [
+        ClaimModel(id=1, claim_id="C1_FAIL", ml_model_version_used="control:model_v1.1")
+    ]
+    mock_production_dicts = [
+        {"id":1, "claim_id": "C1_FAIL", "ml_model_version_used": "control:model_v1.1"}
+    ]
 
     mock_select_claims.return_value = mock_staging_claims
     mock_map_records.return_value = mock_production_dicts

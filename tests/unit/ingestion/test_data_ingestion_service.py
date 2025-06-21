@@ -207,4 +207,58 @@ async def test_ingest_claims_batch_generates_batch_id_if_none_provided(
     mock_session.add_all.assert_called_once()
     added_models = mock_session.add_all.call_args[0][0]
     assert added_models[0].batch_id == generated_batch_id
+
+@pytest.mark.asyncio
+async def test_ingest_claims_partial_encryption_failure(
+    data_ingestion_service: DataIngestionService,
+    mock_db_session_factory_and_session: Tuple[MagicMock, AsyncMock],
+    mock_encryption_service: MagicMock
+):
+    _, mock_session = mock_db_session_factory_and_session
+
+    claim_ok = create_ingestion_claim_data("claim_ok", mrn="MRN_OK", patient_dob_str="2000-01-01")
+    claim_fail_mrn = create_ingestion_claim_data("claim_fail_mrn", mrn="MRN_TO_FAIL", patient_dob_str="2001-01-01")
+    claim_fail_dob = create_ingestion_claim_data("claim_fail_dob", mrn="MRN_OK_2", patient_dob_str="DOB_TO_FAIL") # DOB format will cause date.fromisoformat error before encryption
+
+    raw_claims = [claim_ok, claim_fail_mrn, claim_fail_dob]
+
+    def encryption_side_effect(value_to_encrypt: str):
+        if value_to_encrypt == "MRN_TO_FAIL":
+            return None # Simulate encryption failure for this MRN
+        if value_to_encrypt == "DOB_TO_FAIL": # This case won't be hit due to earlier Pydantic/conversion error
+            return None
+        if value_to_encrypt is None:
+            return None
+        return f"encrypted_{value_to_encrypt}"
+
+    mock_encryption_service.encrypt.side_effect = encryption_side_effect
+
+    summary = await data_ingestion_service.ingest_claims_batch(raw_claims, "batch_partial_fail")
+
+    assert summary["received_claims"] == 3
+    assert summary["successfully_staged_claims"] == 1
+    assert summary["failed_ingestion_claims"] == 2
+    assert len(summary["errors"]) == 2
+
+    # Check successful claim was added
+    mock_session.add_all.assert_called_once()
+    added_models = mock_session.add_all.call_args[0][0]
+    assert len(added_models) == 1
+    assert added_models[0].claim_id == "claim_ok"
+    assert added_models[0].medical_record_number == "encrypted_MRN_OK"
+    assert added_models[0].patient_date_of_birth == "encrypted_2000-01-01"
+
+    # Check error details
+    error_claim_ids = {err["claim_id"] for err in summary["errors"]}
+    assert "claim_fail_mrn" in error_claim_ids
+    assert "claim_fail_dob" in error_claim_ids
+
+    for err in summary["errors"]:
+        if err["claim_id"] == "claim_fail_mrn":
+            assert "Medical record number encryption failed" in err["error"]
+        if err["claim_id"] == "claim_fail_dob":
+            # This error will be caught by Pydantic during IngestionClaim model creation if dob_val is not a valid date string
+            # or during the _map_to_db_model if date.fromisoformat fails.
+            # DataIngestionService's _map_to_db_model catches general Exception.
+            assert "Error mapping IngestionClaim to ClaimModel" in err["error"] or "Invalid isoformat string" in err["error"]
 ```
