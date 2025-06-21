@@ -119,12 +119,52 @@ Regular monitoring is essential to ensure the partitioning strategy remains effe
 *   **Query Performance:** Periodically run `EXPLAIN` on common queries against the partitioned tables to ensure the query planner is effectively using partition pruning (i.e., only scanning relevant partitions).
 *   **Ingestion Logs:** Monitor application and database logs for any errors related to data insertion, particularly "no partition found" errors, which would indicate a failure in the proactive partition creation process.
 
-### 5. Automation
+### 5. Automation using Python Scripts
 
-*   **Partition Creation:** The creation of new partitions **must be automated**. Manual creation is prone to human error and can be easily forgotten, leading to data ingestion failures.
-    *   Use cron jobs (for Linux/macOS) or Task Scheduler (for Windows) to execute the Python scripts detailed in Section 7 (`manage_claim_line_item_partitions.py` and `manage_claims_production_partitions.py`) to create the necessary partitions based on the schedules defined above.
-    *   Database-native schedulers (like `pg_cron` for PostgreSQL, or similar features in other databases) can also be used.
-*   **Archival/Dropping (Optional Automation):** While archival and dropping can also be automated, it often involves more complex decision-making and verification steps. Initial implementations might involve semi-automated scripts with manual checks before final execution.
+The creation of new partitions **must be automated** to prevent data ingestion failures due to missing partitions. The provided Python scripts in `claims_processor/scripts/database/` are designed for this purpose.
+
+#### 5.1. General Cron Job Setup Guidance
+
+When setting up cron jobs to execute these Python scripts, consider the following:
+
+*   **User:** Run cron jobs as a dedicated application user with appropriate permissions, not root if possible.
+*   **Absolute Paths:** Always use absolute paths for the Python interpreter, the script itself, and change directory (`cd`) commands. This ensures scripts run from the correct project root context.
+*   **Python Environment:** If using a virtual environment (recommended), activate it or use the Python interpreter directly from the virtual environment's `bin/` directory (e.g., `/path/to/project/venv/bin/python`).
+*   **Environment Variables (`.env`):** The scripts rely on `get_settings()` which reads a `.env` file from the project root. Ensure your cron command first `cd`s to the project root so the `.env` file can be found. Alternatively, ensure all necessary environment variables (like `DATABASE_URL`) are explicitly available to the cron execution environment.
+*   **Permissions:** The script files must be executable by the cron user. The database user configured in `DATABASE_URL` needs privileges to create tables (partitions).
+*   **Output Redirection:** Redirect script output (stdout and stderr) to a log file for monitoring and troubleshooting (e.g., `>> /var/log/claims_processor/partition_management.log 2>&1`). The `--setup-logging` flag in the scripts enables console-formatted logs suitable for this.
+*   **`date` Command:** The `$(date ...)` examples use Linux `date` syntax. Ensure this is compatible with your cron environment or adapt as needed. Remember to escape `%` characters as `\%` in cron.
+*   **Testing:** Always test your cron commands manually as the intended cron user before scheduling.
+*   **Idempotency:** The scripts check if partitions exist and use `CREATE TABLE IF NOT EXISTS ... PARTITION OF ...`, making them safe for re-running.
+
+#### 5.2. Automating `manage_claim_line_item_partitions.py` (Monthly)
+
+This script creates monthly partitions for the `claim_line_items` table.
+
+*   **Recommended Schedule:** Run monthly, creating partitions for 1-2 months ahead. For example, run on the 15th of each month to create the partition for the month after the next (M+2).
+*   **Example Cron Job (creates partition for M+2, e.g., on Jan 15th, creates for March):**
+    ```cron
+    # Runs on the 15th of every month at 2:00 AM.
+    # Adjust paths to your project and virtual environment.
+    0 2 15 * * cd /srv/claims_processor_project && /srv/claims_processor_project/venv/bin/python claims_processor/scripts/database/manage_claim_line_item_partitions.py --year $(date +\%Y --date='2 months') --month $(date +\%m --date='2 months') --execute --setup-logging >> /var/log/claims_processor/partition_management.log 2>&1
+    ```
+*   **Alternative (creates partition for next month M+1):**
+    ```cron
+    # Runs on the 1st of every month at 2:00 AM.
+    # 0 2 1 * * cd /srv/claims_processor_project && /srv/claims_processor_project/venv/bin/python claims_processor/scripts/database/manage_claim_line_item_partitions.py --year $(date +\%Y --date='next month') --month $(date +\%m --date='next month') --execute --setup-logging >> /var/log/claims_processor/partition_management.log 2>&1
+    ```
+
+#### 5.3. Automating `manage_claims_production_partitions.py` (Yearly)
+
+This script creates yearly partitions for the `claims_production` table.
+
+*   **Recommended Schedule:** Run once a year, well in advance (e.g., Q4 - October or November) to create the partition for the next calendar year.
+*   **Example Cron Job (creates partition for next year, run on Oct 1st):**
+    ```cron
+    # Runs on October 1st at 3:00 AM.
+    # Adjust paths to your project and virtual environment.
+    0 3 1 10 * cd /srv/claims_processor_project && /srv/claims_processor_project/venv/bin/python claims_processor/scripts/database/manage_claims_production_partitions.py --year $(date +\%Y --date='next year') --execute --setup-logging >> /var/log/claims_processor/partition_management.log 2>&1
+    ```
 
 ### 6. Error Handling for Ingestion
 
