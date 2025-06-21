@@ -13,7 +13,9 @@ from claims_processor.src.core.database.models.claims_db import ClaimModel, Clai
 from claims_processor.src.api.models.claim_models import ProcessableClaim, ProcessableClaimLineItem
 from claims_processor.src.core.monitoring.app_metrics import MetricsCollector
 from claims_processor.src.core.config.settings import Settings
-from claims_processor.src.processing.ml_pipeline.optimized_predictor import OptimizedPredictor # For patching
+from claims_processor.src.core.security.encryption_service import EncryptionService # Added
+from claims_processor.src.processing.ml_pipeline.optimized_predictor import OptimizedPredictor
+from sqlalchemy import update # Added for fetch logic tests if needed, though not directly in service tests usually
 
 # Using a fixed UTC for tests
 try:
@@ -63,13 +65,24 @@ def mock_settings(tmp_path: Path) -> Settings: # Renamed from mock_settings_fixt
         ML_PREDICTION_CACHE_MAXSIZE=10,
         ML_PREDICTION_CACHE_TTL=60,
         # A/B Test defaults (can be overridden in specific tests)
-        ML_CHALLENGER_MODEL_PATH=str(dummy_challenger_model_file), # Default to having a path
-        ML_AB_TEST_TRAFFIC_PERCENTAGE_TO_CHALLENGER=0.0, # Default to A/B off
-        ML_AB_TEST_CLAIM_ID_SALT="test_salt"
+        ML_CHALLENGER_MODEL_PATH=str(dummy_challenger_model_file),
+        ML_AB_TEST_TRAFFIC_PERCENTAGE_TO_CHALLENGER=0.0,
+        ML_AB_TEST_CLAIM_ID_SALT="test_salt",
+        # For fetch retry tests
+        MAX_FETCH_RETRIES = 2,
+        FETCH_RETRY_DELAY_SECONDS = 0.01
     )
 
 @pytest.fixture
-def claim_processing_service(mock_db_session, mock_metrics_collector, mock_settings):
+def mock_encryption_service():
+    service = MagicMock(spec=EncryptionService)
+    service.encrypt = MagicMock(side_effect=lambda x: f"encrypted_{x}" if x else None)
+    # Decrypt needs to handle potentially None or already non-encrypted data if tests pass it
+    service.decrypt = MagicMock(side_effect=lambda x: x.replace("encrypted_", "") if isinstance(x, str) and x.startswith("encrypted_") else x)
+    return service
+
+@pytest.fixture
+def claim_processing_service(mock_db_session, mock_metrics_collector, mock_settings, mock_encryption_service): # Added mock_encryption_service
     # This fixture provides a service instance where get_settings is patched globally for all modules
     # that might import it during the service's __init__ chain.
     with patch('claims_processor.src.processing.claims_processing_service.get_settings', return_value=mock_settings), \
@@ -90,7 +103,11 @@ def claim_processing_service(mock_db_session, mock_metrics_collector, mock_setti
                 # Side effect for constructor: return primary, then challenger if called again
                 MockOptPredictor.side_effect = [mock_primary_predictor_inst, mock_challenger_predictor_inst]
 
-                service = ClaimProcessingService(db_session=mock_db_session, metrics_collector=mock_metrics_collector)
+                service = ClaimProcessingService(
+                    db_session=mock_db_session,
+                    metrics_collector=mock_metrics_collector,
+                    encryption_service=mock_encryption_service # Added
+                )
 
                 # Attach mocks to service instance for easy access in tests
                 service.primary_predictor_mock = mock_primary_predictor_inst # type: ignore
@@ -136,6 +153,91 @@ def create_mock_processable_claim_from_db(db_claim: ClaimModel) -> ProcessableCl
         ml_score=db_claim.ml_score, ml_derived_decision=db_claim.ml_derived_decision,
         processing_duration_ms=db_claim.processing_duration_ms
     )
+
+# --- Tests for _fetch_pending_claims ---
+@pytest.mark.asyncio
+async def test_fetch_pending_claims_success(claim_processing_service_instance: ClaimProcessingService, mock_db_session: MagicMock):
+    batch_size = 5
+    batch_id = "test_batch_fetch_1"
+
+    # Setup mock return values for db_session.execute
+    # 1. SELECT ids FOR UPDATE
+    mock_ids_result = AsyncMock()
+    mock_ids_result.fetchall.return_value = [(1,), (2,), (3,)] # Simulate 3 IDs found
+
+    # 2. UPDATE claims SET status...
+    mock_update_result = AsyncMock()
+    mock_update_result.rowcount = 3 # Assume 3 rows updated
+
+    # 3. SELECT * FROM claims WHERE id IN ...
+    # Create mock ClaimModel instances that would be returned
+    mock_claim_models = [
+        create_mock_db_claim(id_val=1, claim_id_str="C1", status="processing", priority=1), # Status now 'processing'
+        create_mock_db_claim(id_val=2, claim_id_str="C2", status="processing", priority=1),
+        create_mock_db_claim(id_val=3, claim_id_str="C3", status="processing", priority=2)
+    ]
+    mock_full_claims_result = AsyncMock()
+    mock_full_claims_result.scalars.return_value.all.return_value = mock_claim_models
+
+    mock_db_session.execute.side_effect = [
+        mock_ids_result,
+        mock_update_result,
+        mock_full_claims_result
+    ]
+
+    fetched_claims = await claim_processing_service_instance._fetch_pending_claims(batch_size, batch_id)
+
+    assert len(fetched_claims) == 3
+    assert fetched_claims[0].id == 1
+    assert fetched_claims[1].id == 2
+    assert fetched_claims[2].id == 3
+
+    assert mock_db_session.execute.call_count == 3
+
+    # Call 1: SELECT IDs
+    args1, _ = mock_db_session.execute.call_args_list[0]
+    stmt1_str = str(args1[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "SELECT claims.id" in stmt1_str
+    assert "WHERE claims.processing_status = 'pending'" in stmt1_str
+    assert "ORDER BY claims.priority DESC, claims.created_at ASC" in stmt1_str
+    assert f"LIMIT {batch_size}" in stmt1_str
+    assert "FOR UPDATE SKIP LOCKED" in stmt1_str # Check for locking
+
+    # Call 2: UPDATE status
+    args2, _ = mock_db_session.execute.call_args_list[1]
+    stmt2_str = str(args2[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "UPDATE claims SET processing_status='processing', batch_id='test_batch_fetch_1'" in stmt2_str
+    assert "WHERE claims.id IN (1, 2, 3)" in stmt2_str # Check IDs from first call
+
+    # Call 3: SELECT full claims
+    args3, _ = mock_db_session.execute.call_args_list[2]
+    stmt3_str = str(args3[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "SELECT claims.id, claims.claim_id" in stmt3_str # Check some columns
+    assert "WHERE claims.id IN (1, 2, 3)" in stmt3_str
+    assert "ORDER BY claims.priority DESC, claims.created_at ASC" in stmt3_str
+
+
+@pytest.mark.asyncio
+async def test_fetch_pending_claims_no_claims_found(claim_processing_service_instance: ClaimProcessingService, mock_db_session: MagicMock):
+    mock_ids_result = AsyncMock()
+    mock_ids_result.fetchall.return_value = [] # No IDs found
+    mock_db_session.execute.side_effect = [mock_ids_result]
+
+    fetched_claims = await claim_processing_service_instance._fetch_pending_claims(5, "test_batch_empty_fetch")
+
+    assert len(fetched_claims) == 0
+    mock_db_session.execute.assert_called_once() # Only the SELECT IDs call should happen
+
+
+@pytest.mark.asyncio
+async def test_fetch_pending_claims_db_error_propagates(claim_processing_service_instance: ClaimProcessingService, mock_db_session: MagicMock):
+    mock_db_session.execute.side_effect = OperationalError("DB error during fetch", {}, None)
+
+    with pytest.raises(OperationalError):
+        await claim_processing_service_instance._fetch_pending_claims(5, "test_batch_db_error")
+
+    mock_db_session.execute.assert_called_once() # Should fail on the first execute
+
 
 # --- Test __init__ for A/B Predictor Setup ---
 def test_init_ab_testing_no_challenger_path(mock_db_session, mock_metrics_collector, mock_settings):
@@ -255,49 +357,86 @@ async def test_ab_routing_to_challenger_model(mock_sha256: MagicMock, claim_proc
     claim_processing_service_instance.primary_predictor_mock.predict_batch.assert_not_called()
     assert "challenger" in processable_claim.ml_model_version_used
 
-# --- Test for persistence of ml_model_version_used ---
+# --- Test for PII Decryption and persistence of ml_model_version_used ---
 @pytest.mark.asyncio
-async def test_orchestrator_persists_ml_model_version(claim_processing_service_instance: ClaimProcessingService, mock_settings: Settings):
-    mock_db_claim = create_mock_db_claim()
+async def test_pii_decryption_and_ml_version_in_process_single_claim(
+    claim_processing_service_instance: ClaimProcessingService,
+    mock_settings: Settings,
+    mock_encryption_service: MagicMock # Added mock_encryption_service
+):
+    # Prepare a ClaimModel with encrypted PII
+    raw_dob_str = "1995-05-15"
+    raw_mrn = "MRN_RAW_123"
+    raw_subscriber_id = "SUB_RAW_789"
+
+    mock_db_claim = create_mock_db_claim(
+        claim_id_str="claim_pii_test",
+        # Store "encrypted" versions in the mock DB claim model
+        patient_date_of_birth=f"encrypted_{raw_dob_str}",
+        medical_record_number=f"encrypted_{raw_mrn}",
+    )
+    # Add subscriber_id to the mock_db_claim as it's a new field
+    mock_db_claim.subscriber_id = f"encrypted_{raw_subscriber_id}"
+
+
+    # Configure encryption_service.decrypt mock
+    def decrypt_side_effect(encrypted_text: Optional[str]):
+        if encrypted_text == f"encrypted_{raw_dob_str}": return raw_dob_str
+        if encrypted_text == f"encrypted_{raw_mrn}": return raw_mrn
+        if encrypted_text == f"encrypted_{raw_subscriber_id}": return raw_subscriber_id
+        return None
+    mock_encryption_service.decrypt.side_effect = decrypt_side_effect
 
     # Ensure A/B testing is active for this test to make ml_model_version_used more interesting
-    mock_settings.ML_CHALLENGER_MODEL_PATH = "challenger.tflite"
+    mock_settings.ML_CHALLENGER_MODEL_PATH = "challenger.tflite" # Path to a dummy file
     mock_settings.ML_AB_TEST_TRAFFIC_PERCENTAGE_TO_CHALLENGER = 1.0 # Force challenger
     claim_processing_service_instance.settings = mock_settings
-    # Re-initialize challenger predictor if it was None due to default fixture settings
-    if not claim_processing_service_instance.challenger_predictor: # Ensure it's mocked if settings enable it
+
+    # Ensure challenger_predictor is mocked if settings would cause it to be used
+    if not claim_processing_service_instance.challenger_predictor:
         claim_processing_service_instance.challenger_predictor = MagicMock(spec=OptimizedPredictor)
         claim_processing_service_instance.challenger_predictor.predict_batch = AsyncMock()
-    elif hasattr(claim_processing_service_instance, 'challenger_predictor_mock'): # If fixture created it
+    elif hasattr(claim_processing_service_instance, 'challenger_predictor_mock'):
          claim_processing_service_instance.challenger_predictor = claim_processing_service_instance.challenger_predictor_mock
 
 
-    # Mock _perform_validation_and_ml to set ml_model_version_used and other relevant fields
-    async def mock_val_ml_side_effect(claim_arg, db_claim_arg): # Renamed args to avoid clash
-        claim_arg.ml_model_version_used = "challenger:test_version_from_val_ml"
-        claim_arg.processing_status = "ml_complete" # Assume validation and ML were successful
+    # Mock downstream processing stages (_perform_validation_and_ml, _perform_rvu_calculation)
+    # to focus on the output of _process_single_claim_concurrently before these stages modify it further,
+    # or mock their side effects to control the ProcessableClaim state.
+    async def mock_val_ml_side_effect(claim_arg: ProcessableClaim, db_claim_arg: ClaimModel):
+        # Simulate that _perform_validation_and_ml uses the decrypted PII if needed for its logic
+        # For this test, we mostly care that PII made it into `claim_arg` decrypted.
+        # It also sets ml_model_version_used.
+        claim_arg.ml_model_version_used = "challenger:test_version_from_val_ml" # Example
+        claim_arg.processing_status = "ml_complete"
         claim_arg.ml_derived_decision = "ML_APPROVED"
         claim_arg.ml_score = Decimal("0.95")
-        return claim_arg # Return the modified ProcessableClaim
+        return claim_arg
     claim_processing_service_instance._perform_validation_and_ml = AsyncMock(side_effect=mock_val_ml_side_effect)
 
-    # Mock _perform_rvu_calculation to set final status
-    async def mock_rvu_side_effect(claim_arg, db_claim_arg): # Renamed args
-        claim_arg.processing_status = "processing_complete" # Assume RVU calculation successful
-        return claim_arg # Return the modified ProcessableClaim
+    async def mock_rvu_side_effect(claim_arg: ProcessableClaim, db_claim_arg: ClaimModel):
+        claim_arg.processing_status = "processing_complete"
+        return claim_arg
     claim_processing_service_instance._perform_rvu_calculation = AsyncMock(side_effect=mock_rvu_side_effect)
 
     # Call the orchestrator
     result = await claim_processing_service_instance._process_single_claim_concurrently(mock_db_claim)
 
-    # Assert that the returned ProcessableClaim instance has the ml_model_version_used set
+    # Assert PII decryption
     assert isinstance(result, ProcessableClaim)
-    assert result.ml_model_version_used == "challenger:test_version_from_val_ml"
-    assert result.processing_status == "processing_complete" # Check final status from RVU mock
+    assert result.patient_date_of_birth == date.fromisoformat(raw_dob_str)
+    assert result.medical_record_number == raw_mrn
+    assert result.subscriber_id == raw_subscriber_id # New PII field
 
-    # Further checks on what _process_single_claim_concurrently returns can be added here.
-    # The main point is that _update_claim_and_lines_in_db is no longer called from it.
-    # The state is carried on the ProcessableClaim instance.
+    # Assert other fields set by mocks
+    assert result.ml_model_version_used == "challenger:test_version_from_val_ml"
+    assert result.processing_status == "processing_complete"
+
+    # Verify decrypt was called for each PII field that had a value
+    mock_encryption_service.decrypt.assert_any_call(f"encrypted_{raw_dob_str}")
+    mock_encryption_service.decrypt.assert_any_call(f"encrypted_{raw_mrn}")
+    mock_encryption_service.decrypt.assert_any_call(f"encrypted_{raw_subscriber_id}")
+
 
 # --- Tests for _fetch_pending_claims ordering ---
 @pytest.mark.asyncio
@@ -439,6 +578,79 @@ async def test_batch_processing_handles_mixed_results_and_commits_successfully(
     metrics_call_kwargs = mock_metrics_collector.record_batch_processed.call_args.kwargs
     assert metrics_call_kwargs['batch_size'] == num_total_claims
     assert metrics_call_kwargs['claims_by_final_status'] == summary["by_status"]
+
+
+# --- Tests for Batch Fetch Retry Logic ---
+@pytest.mark.asyncio
+@patch('asyncio.sleep', new_callable=AsyncMock)
+async def test_process_batch_fetch_retries_then_succeeds(
+    mock_async_sleep: AsyncMock,
+    claim_processing_service_instance: ClaimProcessingService,
+    mock_metrics_collector: MagicMock,
+    mock_db_session: MagicMock # To control commit success
+):
+    batch_size = 5
+    # Ensure settings reflect retry config for this test
+    # These are already set in the mock_settings fixture to: MAX_FETCH_RETRIES = 2, FETCH_RETRY_DELAY_SECONDS = 0.01
+    # claim_processing_service_instance.settings.MAX_FETCH_RETRIES = 2
+    # claim_processing_service_instance.settings.FETCH_RETRY_DELAY_SECONDS = 0.01
+
+    mock_claims_to_return = [create_mock_db_claim("C1_retry_succ")]
+
+    # Mock _fetch_pending_claims to fail once, then succeed
+    # Accessing the _fetch_pending_claims through the instance, as it's a method of the class
+    claim_processing_service_instance._fetch_pending_claims = AsyncMock(side_effect=[
+        OperationalError("Simulated DB error on fetch", {}, None),
+        mock_claims_to_return # Successful fetch on 2nd attempt
+    ])
+
+    # Mock _process_single_claim_concurrently to return a simple success
+    mock_processed_claim = create_mock_processable_claim_from_db(mock_claims_to_return[0])
+    mock_processed_claim.processing_status = "processing_complete"
+    claim_processing_service_instance._process_single_claim_concurrently = AsyncMock(return_value=mock_processed_claim)
+
+    # Ensure commit is successful
+    mock_db_session.begin.return_value.__aexit__ = AsyncMock(return_value=None)
+
+    summary = await claim_processing_service_instance.process_pending_claims_batch(batch_size_override=batch_size)
+
+    assert claim_processing_service_instance._fetch_pending_claims.call_count == 2
+    mock_async_sleep.assert_called_once_with(claim_processing_service_instance.settings.FETCH_RETRY_DELAY_SECONDS)
+
+    assert summary["attempted_claims"] == 1
+    assert summary["by_status"].get("processing_complete") == 1
+    mock_metrics_collector.record_batch_processed.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch('asyncio.sleep', new_callable=AsyncMock)
+async def test_process_batch_fetch_all_retries_fail(
+    mock_async_sleep: AsyncMock,
+    claim_processing_service_instance: ClaimProcessingService,
+    mock_metrics_collector: MagicMock
+):
+    batch_size = 5
+    # Settings for retries are from mock_settings fixture (MAX_FETCH_RETRIES = 2)
+    max_retries = claim_processing_service_instance.settings.MAX_FETCH_RETRIES
+
+    claim_processing_service_instance._fetch_pending_claims = AsyncMock(
+        side_effect=OperationalError("Simulated DB error on fetch", {}, None)
+    )
+
+    summary = await claim_processing_service_instance.process_pending_claims_batch(batch_size_override=batch_size)
+
+    assert claim_processing_service_instance._fetch_pending_claims.call_count == max_retries
+    assert mock_async_sleep.call_count == max_retries -1
+
+    assert summary["attempted_claims"] == 0
+    assert summary["message"] == "Batch processing aborted: Failed to fetch claims after multiple retries."
+    # The effective_batch_size passed to _fetch_pending_claims is used in the summary when fetch fails
+    assert summary["by_status"].get("fetch_error") == batch_size
+
+    mock_metrics_collector.record_batch_processed.assert_called_once()
+    metrics_args_kwargs = mock_metrics_collector.record_batch_processed.call_args.kwargs
+    assert metrics_args_kwargs["batch_size"] == 0
+    assert metrics_args_kwargs["claims_by_final_status"] == {"fetch_error": batch_size}
 
 
 @pytest.mark.asyncio

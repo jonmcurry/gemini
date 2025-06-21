@@ -1,6 +1,6 @@
 import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update # Added update
 from sqlalchemy.orm import joinedload
 import structlog
 from typing import List, Dict, Any, Optional
@@ -20,14 +20,16 @@ from .ml_pipeline.feature_extractor import FeatureExtractor
 from .ml_pipeline.optimized_predictor import OptimizedPredictor
 from ..core.monitoring.app_metrics import MetricsCollector
 from ..core.database.models.failed_claims_db import FailedClaimModel
+from ..core.security.encryption_service import EncryptionService # Added
 
 
 logger = structlog.get_logger(__name__)
 
 class ClaimProcessingService:
-    def __init__(self, db_session: AsyncSession, metrics_collector: MetricsCollector):
+    def __init__(self, db_session: AsyncSession, metrics_collector: MetricsCollector, encryption_service: EncryptionService):
         self.db = db_session
         self.metrics_collector = metrics_collector
+        self.encryption_service = encryption_service # Added
         self.settings = get_settings()
         self.validator = ClaimValidator()
         cache_manager = get_cache_manager()
@@ -70,8 +72,9 @@ class ClaimProcessingService:
 
         logger.info("ClaimProcessingService initialized",
                     db_session_id=id(db_session),
-                    cache_manager_id=id(cache_manager), # type: ignore
+                    cache_manager_id=id(cache_manager),
                     metrics_collector_id=id(self.metrics_collector),
+                    encryption_service_id=id(self.encryption_service), # Added
                     validation_concurrency=self.settings.VALIDATION_CONCURRENCY,
                     rvu_concurrency=self.settings.RVU_CALCULATION_CONCURRENCY,
                     primary_ml_model_path=self.settings.ML_MODEL_PATH,
@@ -182,20 +185,49 @@ class ClaimProcessingService:
     async def _process_single_claim_concurrently(self, db_claim: ClaimModel) -> Any: # Return type can be ProcessableClaim or Dict
         start_time = time.monotonic()
         processable_claim_instance: Optional[ProcessableClaim] = None
-        # final_status will be tracked on processable_claim_instance.processing_status directly
 
         try:
             logger.debug("Orchestrating single claim processing", claim_id=db_claim.claim_id, db_id=db_claim.id)
 
-            # 1. Pydantic Conversion
+            # 1. PII Decryption and Pydantic Conversion
             try:
-                processable_claim_instance = ProcessableClaim.model_validate(db_claim)
-                if processable_claim_instance.processing_status == 'pending': # Default status from model_validate
+                # Create a dictionary from the SQLAlchemy model instance
+                claim_data_for_pydantic = {c.name: getattr(db_claim, c.name) for c in db_claim.__table__.columns}
+
+                # Decrypt PII fields before Pydantic validation
+                if db_claim.patient_date_of_birth: # This is an encrypted string from DB
+                    dec_dob_str = self.encryption_service.decrypt(db_claim.patient_date_of_birth)
+                    claim_data_for_pydantic['patient_date_of_birth'] = date.fromisoformat(dec_dob_str) if dec_dob_str else None
+                else:
+                    claim_data_for_pydantic['patient_date_of_birth'] = None
+
+                if db_claim.medical_record_number: # Encrypted string from DB
+                    claim_data_for_pydantic['medical_record_number'] = self.encryption_service.decrypt(db_claim.medical_record_number)
+
+                # hasattr check is good practice if 'subscriber_id' might not be on all ClaimModel versions (e.g. during migration)
+                # However, since we added it, it should be there.
+                if getattr(db_claim, 'subscriber_id', None): # Encrypted string from DB
+                    claim_data_for_pydantic['subscriber_id'] = self.encryption_service.decrypt(db_claim.subscriber_id)
+                else:
+                    claim_data_for_pydantic['subscriber_id'] = None
+
+                # Handle line items: Convert ClaimLineItemModel to ProcessableClaimLineItem
+                line_items_pydantic = []
+                if db_claim.line_items: # Assuming line_items are already loaded
+                    for li_db in db_claim.line_items:
+                        # No PII in ClaimLineItemModel as per current definition, so direct validation
+                        line_items_pydantic.append(ProcessableClaimLineItem.model_validate(li_db))
+                claim_data_for_pydantic['line_items'] = line_items_pydantic
+
+                # Now, create the ProcessableClaim instance from the dictionary containing decrypted PII
+                processable_claim_instance = ProcessableClaim(**claim_data_for_pydantic)
+
+                if processable_claim_instance.processing_status == 'pending': # Default from Pydantic model if not set by claim_data_for_pydantic
                     processable_claim_instance.processing_status = "converted_to_pydantic"
-            except Exception as e:
-                error_reason = f"Pydantic conversion error: {str(e)}"
+
+            except Exception as e: # Catches decryption errors, date.fromisoformat errors, or Pydantic validation errors
+                error_reason = f"Data conversion/decryption error: {str(e)}"
                 logger.error(error_reason, claim_db_id=db_claim.id, claim_id=db_claim.claim_id, exc_info=True)
-                # Do not call _store_failed_claim here directly as it needs a session.
                 # The batch processor will handle storing this failure.
                 # No _update_claim_and_lines_in_db call.
                 return {
@@ -329,7 +361,66 @@ class ClaimProcessingService:
             logger.info("Concurrent batch processing summary (no claims).", **summary)
             return summary
 
-        logger.info(f"Fetched {attempted_claims} claims for concurrent processing.")
+        # Generate a unique batch ID for this processing run to mark claims
+        current_batch_id_for_update = str(asyncio.current_task().get_name()) + "_" + str(time.time_ns())
+
+
+        # Outer retry loop for fetching claims
+        # MAX_BATCH_RETRIES = 3 # Defined in requirements, consider making it a class/instance variable from settings
+        # BATCH_RETRY_DELAY_SECONDS = 5
+        # For this subtask, using hardcoded values as per simplified plan.
+        # These should ideally come from self.settings
+        max_fetch_retries = self.settings.MAX_FETCH_RETRIES if hasattr(self.settings, 'MAX_FETCH_RETRIES') else 3
+        fetch_retry_delay = self.settings.FETCH_RETRY_DELAY if hasattr(self.settings, 'FETCH_RETRY_DELAY') else 5
+
+
+        fetched_db_claims = []
+        for attempt in range(max_fetch_retries):
+            try:
+                fetched_db_claims = await self._fetch_pending_claims(effective_batch_size, current_batch_id_for_update)
+                break # Success
+            except OperationalError as oe:
+                logger.warn(f"Fetch attempt {attempt + 1} failed with OperationalError: {oe}. Retrying after {fetch_retry_delay}s...")
+                if attempt + 1 == max_fetch_retries:
+                    logger.error("All fetch attempts failed due to OperationalError. Aborting batch.", exc_info=True)
+                    # Log this critical failure and return an error summary
+                    # This error is before any claims are processed, so it's a batch-level failure.
+                    self.metrics_collector.record_batch_processed( # Record as a fully failed batch
+                        batch_size=0, # No claims successfully fetched for processing
+                        duration_seconds=(time.monotonic() - batch_start_time),
+                        claims_by_final_status={"fetch_error": effective_batch_size} # Indicate all attempts failed
+                    )
+                    return {
+                        "message": "Batch processing aborted: Failed to fetch claims after multiple retries.",
+                        "attempted_claims": 0, "successfully_processed_count": 0, "db_commit_errors": 0,
+                        "by_status": {"fetch_error": effective_batch_size}, # Custom status for summary
+                         "error_detail": str(oe)
+                    }
+                await asyncio.sleep(fetch_retry_delay)
+
+        if not fetched_db_claims: # If loop finished due to retries exhausted or first attempt returned empty
+            logger.info("No pending claims to process after fetch attempts.")
+            # ... (rest of the no claims logic remains similar)
+            # This part is already handled by the existing "if not fetched_db_claims:" block that follows.
+            # The existing block for "if not fetched_db_claims:" will handle this.
+            # Ensure that the attempted_claims count is accurate.
+            attempted_claims = 0 # Since no claims were successfully fetched for processing
+            summary = {
+                "message": "No pending claims to process.", "attempted_claims": attempted_claims,
+                 "conversion_errors":0, "validation_failures": 0, "ml_errors_raw":0,
+                 "ml_approved_raw": 0, "ml_rejected_raw": 0,
+                 "rvu_calculation_failures":0, "successfully_processed_count": 0,
+                 "unhandled_orchestration_error":0, "db_commit_errors":0
+            }
+            self.metrics_collector.record_batch_processed(
+                batch_size=attempted_claims, duration_seconds=(time.monotonic() - batch_start_time), claims_by_final_status={}
+            )
+            logger.info("Concurrent batch processing summary (no claims fetched).", **summary)
+            return summary
+
+
+        attempted_claims = len(fetched_db_claims) # Update attempted_claims with actual fetched count
+        logger.info(f"Fetched {attempted_claims} claims for concurrent processing with batch_id {current_batch_id_for_update}.")
         original_claims_map = {c.id: c for c in fetched_db_claims}
 
         tasks = [self._process_single_claim_concurrently(db_claim) for db_claim in fetched_db_claims]
@@ -488,21 +579,69 @@ class ClaimProcessingService:
         logger.info("Concurrent batch processing summary.", **final_summary)
         return final_summary
 
-    async def _fetch_pending_claims(self, effective_batch_size: int) -> list[ClaimModel]:
-        logger.info("Fetching pending claims from database", batch_size=effective_batch_size)
-        stmt = (
-            select(ClaimModel)
-            .where(ClaimModel.processing_status == 'pending')
-            .order_by(ClaimModel.priority.desc(), ClaimModel.created_at.asc())
-            .limit(effective_batch_size)
-            .options(joinedload(ClaimModel.line_items))
-        )
-        result = await self.db.execute(stmt)
-        claims = result.scalars().all()
-        if claims:
-            logger.info(f"Fetched {len(claims)} pending claims from the database.")
-        else:
-            logger.info("No pending claims found in the database.")
-        return list(claims)
+    async def _fetch_pending_claims(self, effective_batch_size: int, current_batch_id_for_update: str) -> List[ClaimModel]:
+        logger.info("Fetching pending claims with SELECT FOR UPDATE SKIP LOCKED",
+                    limit=effective_batch_size, batch_id_to_set=current_batch_id_for_update)
+
+        # Phase 1: Select IDs and mark them as 'processing'
+        # Note: self.db is the session passed to ClaimProcessingService instance
+        try:
+            # This entire block should ideally be part of the transaction started by process_pending_claims_batch
+            # However, process_pending_claims_batch starts its transaction *after* this fetch.
+            # For `SELECT FOR UPDATE SKIP LOCKED` to work correctly with a subsequent update and then fetch,
+            # it typically needs to be within a single transaction.
+            # The current structure might lead to race conditions if the transaction in process_pending_claims_batch
+            # is separate. Assuming for now this fetch operates in its own implicit transaction or the session
+            # from process_pending_claims_batch is consistently used.
+            # The `self.db.begin()` in the main batch method will handle the overall transaction.
+            # These individual `await self.db.execute` calls will participate in that transaction.
+
+            select_ids_stmt = (
+                select(ClaimModel.id)
+                .where(ClaimModel.processing_status == 'pending')
+                .order_by(ClaimModel.priority.desc(), ClaimModel.created_at.asc())
+                .limit(effective_batch_size)
+                .with_for_update(skip_locked=True)
+            )
+            claim_db_ids_result = await self.db.execute(select_ids_stmt)
+            claim_db_ids = [row[0] for row in claim_db_ids_result.fetchall()]
+
+            if not claim_db_ids:
+                logger.info("No pending claims found to fetch with SKIP LOCKED.")
+                return []
+
+            update_stmt = (
+                update(ClaimModel) # Use update from sqlalchemy
+                .where(ClaimModel.id.in_(claim_db_ids))
+                .values(processing_status='processing', batch_id=current_batch_id_for_update)
+                .execution_options(synchronize_session=False)
+            )
+            await self.db.execute(update_stmt)
+
+            logger.info(f"Marked {len(claim_db_ids)} claims as 'processing' with batch_id {current_batch_id_for_update}.")
+
+            stmt = (
+                select(ClaimModel)
+                .where(ClaimModel.id.in_(claim_db_ids))
+                .options(joinedload(ClaimModel.line_items))
+                .order_by(ClaimModel.priority.desc(), ClaimModel.created_at.asc())
+            )
+            result = await self.db.execute(stmt)
+            fetched_db_claims = list(result.scalars().all())
+
+            if fetched_db_claims:
+                logger.info(f"Fetched {len(fetched_db_claims)} full claim objects for processing.")
+            else:
+                logger.warn("Fetched 0 full claim objects after marking IDs as processing.", count_ids_marked=len(claim_db_ids))
+
+            return fetched_db_claims
+
+        except OperationalError: # Specifically catch OperationalError for retry by caller
+            logger.error("Database OperationalError during _fetch_pending_claims", exc_info=True)
+            raise
+        except Exception as e:
+            logger.error("Unexpected error during _fetch_pending_claims", error=str(e), exc_info=True)
+            # Non-OperationalErrors are not typically retried at this level by the batch processor's fetch loop
+            raise # Re-raise to be handled by the general exception handler in process_pending_claims_batch
 
 ```
