@@ -26,8 +26,25 @@ class Settings(BaseSettings):
     # Concurrency settings
     MAX_CONCURRENT_CLAIM_PROCESSING: int = 10 # Default value
 
+    # MLflow Configuration Settings
+    MLFLOW_TRACKING_URI: Optional[str] = Field(
+        None,
+        description="MLflow tracking server URI. If set, models will be loaded from MLflow Model Registry."
+    )
+    ML_MODEL_NAME_IN_REGISTRY: Optional[str] = Field(
+        "claims_processor_model",
+        description="Name of the model in the MLflow Model Registry. Used if MLFLOW_TRACKING_URI is set."
+    )
+    ML_MODEL_VERSION_OR_STAGE: Optional[str] = Field(
+        "Production",
+        description="Version string (e.g., '5') or stage (e.g., 'Production', 'Staging') of the model in the registry. Used if MLFLOW_TRACKING_URI is set."
+    )
+
     # ML Model settings
-    ML_MODEL_PATH: Optional[str] = "models/dummy_claim_model.tflite"
+    ML_MODEL_PATH: Optional[str] = Field(
+        "models/dummy_claim_model.tflite",
+        description="Path to the TFLite model file. Used as a fallback if MLflow is not configured or fails." # Updated description
+    )
     ML_FEATURE_COUNT: int = 7
     ML_APPROVAL_THRESHOLD: float = 0.8
 

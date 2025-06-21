@@ -22,64 +22,133 @@ except Exception as e:
     Interpreter = None
     logger.error("An unexpected error occurred during tflite_runtime import.", error=str(e), exc_info=True)
 
-from ....core.config.settings import get_settings
-from ....core.monitoring.app_metrics import MetricsCollector # Import MetricsCollector
+import mlflow
+import tempfile # For managing temporary download path
+
+from ...core.config.settings import get_settings # Corrected relative import
+from ...core.monitoring.app_metrics import MetricsCollector # Corrected relative import
 
 class OptimizedPredictor:
-    def __init__(self, model_path: str, metrics_collector: MetricsCollector, feature_count: int = 7):
-        self.model_path = model_path
-        self.feature_count = feature_count
+    def __init__(self, metrics_collector: MetricsCollector): # Removed model_path and feature_count from args
         self.metrics_collector = metrics_collector
         self.interpreter: Optional[Interpreter] = None
         self.input_details: Optional[List[Dict[str, Any]]] = None
         self.output_details: Optional[List[Dict[str, Any]]] = None
+        self.model_path: Optional[str] = None # Will be set by loading logic
+        self.temp_model_dir: Optional[tempfile.TemporaryDirectory] = None # For MLflow downloaded models
 
         app_settings = get_settings()
+        self.feature_count = app_settings.ML_FEATURE_COUNT # Get from settings
         self.approval_threshold = app_settings.ML_APPROVAL_THRESHOLD
 
         self.prediction_cache = TTLCache(
             maxsize=app_settings.ML_PREDICTION_CACHE_MAXSIZE,
             ttl=app_settings.ML_PREDICTION_CACHE_TTL
         )
-        logger.info("OptimizedPredictor initializing...", model_path=self.model_path,
+        logger.info("OptimizedPredictor initializing...",
                     tflite_available=TFLITE_AVAILABLE,
                     cache_maxsize=app_settings.ML_PREDICTION_CACHE_MAXSIZE,
                     cache_ttl=app_settings.ML_PREDICTION_CACHE_TTL)
 
+        model_uri_to_load = None
+        using_mlflow = False
+
+        if app_settings.MLFLOW_TRACKING_URI and \
+           app_settings.ML_MODEL_NAME_IN_REGISTRY and \
+           app_settings.ML_MODEL_VERSION_OR_STAGE:
+
+            logger.info("MLflow configuration found. Attempting to load model from registry.",
+                        tracking_uri=app_settings.MLFLOW_TRACKING_URI,
+                        model_name=app_settings.ML_MODEL_NAME_IN_REGISTRY,
+                        version_stage=app_settings.ML_MODEL_VERSION_OR_STAGE)
+            try:
+                mlflow.set_tracking_uri(app_settings.MLFLOW_TRACKING_URI)
+
+                self.temp_model_dir = tempfile.TemporaryDirectory()
+                # model_download_path = self.temp_model_dir.name # Not used directly, download_artifacts creates structure
+
+                download_root = mlflow.artifacts.download_artifacts(
+                    artifact_uri=f"models:/{app_settings.ML_MODEL_NAME_IN_REGISTRY}/{app_settings.ML_MODEL_VERSION_OR_STAGE}",
+                    dst_path=self.temp_model_dir.name # Ensure artifacts are downloaded into the temp dir
+                )
+
+                tflite_files = list(Path(download_root).rglob("*.tflite"))
+                if not tflite_files:
+                    # Sometimes download_artifacts returns the path to a specific file if only one,
+                    # or a directory. If download_root itself is the .tflite file:
+                    if Path(download_root).is_file() and Path(download_root).name.endswith(".tflite"):
+                        tflite_files = [Path(download_root)]
+                    else:
+                        raise FileNotFoundError(f"No .tflite file found in downloaded MLflow artifacts from {download_root}. Searched for *.tflite.")
+
+                if len(tflite_files) > 1:
+                    logger.warn(f"Multiple .tflite files found: {tflite_files}. Using the first one: {tflite_files[0]}")
+
+                model_uri_to_load = str(tflite_files[0])
+                self.model_path = model_uri_to_load # Update self.model_path to the downloaded one
+                using_mlflow = True
+                logger.info(f"Model artifact will be loaded from MLflow download: {self.model_path}")
+
+            except Exception as e:
+                logger.error("Failed to load model from MLflow Model Registry. Falling back to ML_MODEL_PATH if available.",
+                             model_name=app_settings.ML_MODEL_NAME_IN_REGISTRY,
+                             version_stage=app_settings.ML_MODEL_VERSION_OR_STAGE,
+                             error=str(e), exc_info=True)
+                if self.temp_model_dir: # Cleanup if temp_model_dir was created
+                    self.temp_model_dir.cleanup()
+                    self.temp_model_dir = None # Reset
+                model_uri_to_load = app_settings.ML_MODEL_PATH # Fallback
+                using_mlflow = False
+        else:
+            logger.info("MLflow configuration not fully provided. Using local ML_MODEL_PATH.")
+            model_uri_to_load = app_settings.ML_MODEL_PATH
+
+        # --- Start of TFLite Interpreter Loading ---
         if not TFLITE_AVAILABLE:
             logger.error("TensorFlow Lite runtime is not available. Model loading skipped.")
             return
-        if not self.model_path:
-            logger.error("Model path is not configured. Predictor will not work.")
+
+        if not model_uri_to_load:
+            logger.error("No model path configured (neither MLflow nor local ML_MODEL_PATH). Predictor will not work.")
             return
+
+        self.model_path = str(model_uri_to_load) # Ensure it's a string for Path object
         model_file = Path(self.model_path)
+
         if not model_file.is_file():
-            logger.error(f"ML model file not found at {self.model_path}. Predictor will not work.")
+            logger.error(f"ML model file not found at resolved path: {self.model_path}. Predictor will not work.")
+            if using_mlflow and self.temp_model_dir:
+                self.temp_model_dir.cleanup()
+                self.temp_model_dir = None
             return
         try:
-            logger.info(f"Loading TFLite model from: {self.model_path}")
+            logger.info(f"Loading TFLite model from final path: {self.model_path}")
             self.interpreter = Interpreter(model_path=self.model_path)
             self.interpreter.allocate_tensors()
             self.input_details = self.interpreter.get_input_details()
             self.output_details = self.interpreter.get_output_details()
 
-            app_settings = get_settings()
-            self.approval_threshold = app_settings.ML_APPROVAL_THRESHOLD
+            # app_settings already fetched, self.approval_threshold already set
             logger.info(f"Approval threshold set to: {self.approval_threshold}")
 
             if self.input_details:
                 expected_shape = list(self.input_details[0]['shape'])
+                # self.feature_count is now set from app_settings
                 if len(expected_shape) > 1 and expected_shape[-1] != self.feature_count:
                     logger.warn(
                         f"Model input shape {expected_shape} last dimension "
-                        f"does not match expected feature_count {self.feature_count}. "
+                        f"does not match expected feature_count {self.feature_count} from settings. "
                         "Ensure model is compatible."
                     )
             logger.info("TFLite model loaded and tensors allocated successfully.",
                         input_details=self.input_details, output_details=self.output_details)
         except Exception as e:
-            logger.error(f"Failed to load TFLite model or allocate tensors: {e}", exc_info=True)
+            logger.error(f"Failed to load TFLite model or allocate tensors from path: {self.model_path}. Error: {e}", exc_info=True)
             self.interpreter = None
+            if using_mlflow and self.temp_model_dir:
+                self.temp_model_dir.cleanup()
+                self.temp_model_dir = None
+        # --- End of TFLite Interpreter Loading ---
 
     async def predict_batch(self, features_batch: List[np.ndarray]) -> List[Dict[str, Any]]:
         if not self.interpreter or not TFLITE_AVAILABLE:
