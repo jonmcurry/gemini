@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     ML_FEATURE_COUNT: int = 7
     ML_APPROVAL_THRESHOLD: float = 0.8
 
+    # ML Prediction Cache Settings
+    ML_PREDICTION_CACHE_MAXSIZE: int = 10000 # Max number of entries in the prediction cache
+    ML_PREDICTION_CACHE_TTL: int = 3600      # TTL for prediction cache entries in seconds (1 hour)
+
     # Application Security Settings
     APP_ENCRYPTION_KEY: str = "must_be_32_bytes_long_for_aes256_key!"
     # IMPORTANT: This is a default development key.

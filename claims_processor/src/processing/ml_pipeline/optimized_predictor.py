@@ -1,9 +1,11 @@
-import asyncio # Added for to_thread
+import asyncio
 import structlog
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import numpy as np
-import time # Import time
+import time
+import hashlib # For cache key generation
+from cachetools import TTLCache # For caching
 
 TFLITE_AVAILABLE = False
 Interpreter = None
@@ -27,13 +29,22 @@ class OptimizedPredictor:
     def __init__(self, model_path: str, metrics_collector: MetricsCollector, feature_count: int = 7):
         self.model_path = model_path
         self.feature_count = feature_count
-        self.metrics_collector = metrics_collector # Store metrics_collector
+        self.metrics_collector = metrics_collector
         self.interpreter: Optional[Interpreter] = None
         self.input_details: Optional[List[Dict[str, Any]]] = None
         self.output_details: Optional[List[Dict[str, Any]]] = None
-        self.approval_threshold: float = 0.8 # Default
 
-        logger.info("OptimizedPredictor initializing...", model_path=self.model_path, tflite_available=TFLITE_AVAILABLE)
+        app_settings = get_settings()
+        self.approval_threshold = app_settings.ML_APPROVAL_THRESHOLD
+
+        self.prediction_cache = TTLCache(
+            maxsize=app_settings.ML_PREDICTION_CACHE_MAXSIZE,
+            ttl=app_settings.ML_PREDICTION_CACHE_TTL
+        )
+        logger.info("OptimizedPredictor initializing...", model_path=self.model_path,
+                    tflite_available=TFLITE_AVAILABLE,
+                    cache_maxsize=app_settings.ML_PREDICTION_CACHE_MAXSIZE,
+                    cache_ttl=app_settings.ML_PREDICTION_CACHE_TTL)
 
         if not TFLITE_AVAILABLE:
             logger.error("TensorFlow Lite runtime is not available. Model loading skipped.")
@@ -81,108 +92,101 @@ class OptimizedPredictor:
         if not features_batch:
             return []
 
-        logger.info(f"Performing TFLite inference for batch of size {len(features_batch)}")
-        predictions: List[Dict[str, Any]] = []
+        logger.info(f"Processing prediction for batch of size {len(features_batch)} with caching.")
 
-        try:
-            # Prepare batch input tensor
-            # Ensure all feature samples are 1D and have the correct feature_count
-            processed_feature_list = []
-            for i, features_sample in enumerate(features_batch):
-                if not isinstance(features_sample, np.ndarray):
-                    logger.warn(f"Sample {i} is not a NumPy array. Marking as error for this sample.")
-                    predictions.append({"error": "Invalid feature format", "ml_score": None, "ml_derived_decision": "ML_ERROR_FEATURE_FORMAT"})
-                    if self.metrics_collector: self.metrics_collector.record_ml_prediction(outcome="ML_ERROR_FEATURE_FORMAT", confidence_score=None)
-                    # Add a placeholder or skip; for batching, all inputs must be valid or skipped before batch formation.
-                    # For now, this error will prevent batching. A more robust solution might involve returning error for this item and processing others.
-                    # However, batch inference requires all items in the batch to be valid for np.array stacking.
-                    # Alternative: pre-filter features_batch for valid items and then process.
-                    # For this refactor, let's assume valid inputs or fail the whole batch if one is bad before np.array.
-                    # A simpler approach: if a sample is bad, we can't form the batch tensor.
-                    # Let's return individual errors for each sample if pre-batch validation fails.
-                    # This loop is just for validation before creating the batch tensor.
-                    if features_sample.ndim != 1 or features_sample.shape[0] != self.feature_count:
-                        logger.error(f"Sample {i} has incorrect shape {features_sample.shape}. Expected ({self.feature_count},). Cannot proceed with batch.")
-                        # If one sample is bad, the whole batch operation as a single tensor might be problematic.
-                        # Fallback to individual error reporting for all items in batch for simplicity for this error type.
-                        error_msg = f"Feature shape mismatch for sample {i}"
-                        for _ in features_batch: # Mark all as error if one is bad for batching
-                            predictions.append({"error": error_msg, "ml_score": None, "ml_derived_decision": "ML_ERROR_FEATURE_SHAPE"})
-                            if self.metrics_collector: self.metrics_collector.record_ml_prediction(outcome="ML_ERROR_FEATURE_SHAPE", confidence_score=None)
-                        return predictions
-                processed_feature_list.append(features_sample.astype(np.float32)) # Ensure float32
+        # Initialize results list with None placeholders
+        predictions_results: List[Optional[Dict[str, Any]]] = [None] * len(features_batch)
+        miss_indices: List[int] = []
+        miss_features: List[np.ndarray] = []
+        cache_keys_for_misses: List[str] = [] # To store cache keys for items that missed
 
-            if not processed_feature_list: # Should be caught by "if not features_batch" but as a safeguard
-                 return []
+        # 1. Input validation and Cache Lookup
+        for i, features_sample_1d in enumerate(features_batch):
+            if not isinstance(features_sample_1d, np.ndarray):
+                logger.warn(f"Sample {i} is not a NumPy array. Marking as error.")
+                predictions_results[i] = {"error": "Invalid feature format", "ml_score": None, "ml_derived_decision": "ML_ERROR_FEATURE_FORMAT"}
+                if self.metrics_collector: self.metrics_collector.record_ml_prediction(outcome="ML_ERROR_FEATURE_FORMAT", confidence_score=None)
+                continue # Skip this sample for caching/batching
 
-            batch_input_tensor = np.array(processed_feature_list)
-            if batch_input_tensor.shape[1] != self.feature_count:
-                logger.error(f"Batch input tensor has incorrect feature dimension: {batch_input_tensor.shape[1]}. Expected {self.feature_count}")
-                # This indicates a fundamental issue if it happens after the loop above.
-                error_msg = "Batch tensor feature dimension mismatch"
-                for _ in features_batch:
-                    predictions.append({"error": error_msg, "ml_score": None, "ml_derived_decision": "ML_ERROR_BATCH_TENSOR"})
-                    if self.metrics_collector: self.metrics_collector.record_ml_prediction(outcome="ML_ERROR_BATCH_TENSOR", confidence_score=None)
-                return predictions
+            if features_sample_1d.ndim != 1 or features_sample_1d.shape[0] != self.feature_count:
+                logger.warn(f"Sample {i} has incorrect shape {features_sample_1d.shape}. Expected ({self.feature_count},). Marking as error.")
+                predictions_results[i] = {"error": "Feature shape mismatch", "ml_score": None, "ml_derived_decision": "ML_ERROR_FEATURE_SHAPE"}
+                if self.metrics_collector: self.metrics_collector.record_ml_prediction(outcome="ML_ERROR_FEATURE_SHAPE", confidence_score=None)
+                continue # Skip this sample
 
-            self.interpreter.set_tensor(self.input_details[0]['index'], batch_input_tensor)
+            # Ensure dtype is float32 for consistent hashing and for the model
+            features_sample_1d = features_sample_1d.astype(np.float32)
 
-            invoke_start_time = time.perf_counter()
-            await asyncio.to_thread(self.interpreter.invoke)
-            invoke_duration_seconds = time.perf_counter() - invoke_start_time
-            if self.metrics_collector:
-                # Record duration for the whole batch. If per-sample is needed, divide by batch size.
-                self.metrics_collector.record_ml_inference_duration(invoke_duration_seconds)
+            # Generate cache key
+            cache_key = hashlib.sha256(features_sample_1d.tobytes()).hexdigest()
 
-            batch_output_data = self.interpreter.get_tensor(self.output_details[0]['index'])
+            if cache_key in self.prediction_cache:
+                predictions_results[i] = self.prediction_cache[cache_key]
+                if self.metrics_collector: self.metrics_collector.record_cache_operation(cache_type='ml_prediction', operation_type='get', outcome='hit')
+                logger.debug(f"Cache hit for sample {i}", cache_key=cache_key)
+            else:
+                if self.metrics_collector: self.metrics_collector.record_cache_operation(cache_type='ml_prediction', operation_type='get', outcome='miss')
+                miss_indices.append(i)
+                miss_features.append(features_sample_1d) # Already float32
+                cache_keys_for_misses.append(cache_key)
+                logger.debug(f"Cache miss for sample {i}", cache_key=cache_key)
 
-            # Process batch output
-            for i in range(batch_output_data.shape[0]):
-                sample_output = batch_output_data[i] # This is likely shape (1,) or (num_classes,)
+        # 2. Batch Inference for Cache Misses
+        if miss_features:
+            logger.info(f"Performing TFLite inference for {len(miss_features)} cache misses.")
+            try:
+                batch_input_tensor = np.array(miss_features) # Already list of float32 arrays
+                # Shape check for batch_input_tensor (already done for individual samples)
+                # if batch_input_tensor.shape[1] != self.feature_count: ... error handling ...
 
-                score: Optional[float] = None
-                decision = "ML_ERROR" # Default for this sample
-                ml_decision_outcome_label = "ML_ERROR" # Default for metrics
+                self.interpreter.set_tensor(self.input_details[0]['index'], batch_input_tensor)
 
-                # TFLite output for a single item in a batch might be (1,1) or (1,2) if that's how model is structured,
-                # or just (1,) or (2,). Assuming output_details[0]['shape'] is like [Batch, Classes]
-                # and sample_output is now effectively [Classes]
-                if sample_output.ndim == 1: # e.g. shape (1,) or (2,)
-                    if sample_output.shape[0] == 1: # Single score output
-                        score = float(sample_output[0])
-                    elif sample_output.shape[0] == 2: # Two-class output (prob_class0, prob_class1)
-                        score = float(sample_output[1]) # Assuming positive class is at index 1
-                    else:
-                        logger.warn(f"Unexpected TFLite model output shape for sample {i}: {sample_output.shape}. Output tensor shape: {batch_output_data.shape}")
-                        ml_decision_outcome_label = "ML_ERROR_OUTPUT_SHAPE"
-                else: # Should not happen if batch_output_data is 2D and sample_output is batch_output_data[i]
-                     logger.warn(f"Unexpected sample_output dimension for sample {i}: {sample_output.ndim}. Shape: {sample_output.shape}")
-                     ml_decision_outcome_label = "ML_ERROR_OUTPUT_DIM"
-
-
-                score_for_metric: Optional[float] = None
-                if score is not None:
-                    decision = "ML_APPROVED" if score >= self.approval_threshold else "ML_REJECTED"
-                    score_for_metric = round(score, 4)
-                    ml_decision_outcome_label = decision
-
-                predictions.append({'ml_score': score_for_metric, 'ml_derived_decision': decision})
+                invoke_start_time = time.perf_counter()
+                await asyncio.to_thread(self.interpreter.invoke)
+                invoke_duration_seconds = time.perf_counter() - invoke_start_time
                 if self.metrics_collector:
-                    self.metrics_collector.record_ml_prediction(outcome=ml_decision_outcome_label, confidence_score=score_for_metric)
-                # logger.debug for individual sample prediction can be very verbose for large batches, consider sampling or removing
-                # logger.debug(f"TFLite prediction for sample {i} in batch: score={score_for_metric if score_for_metric is not None else 'N/A'}, decision='{decision}'")
+                    self.metrics_collector.record_ml_inference_duration(invoke_duration_seconds)
 
-        except Exception as e:
-            logger.error(f"Error during TFLite batch inference: {e}", exc_info=True, batch_size=len(features_batch))
-            # If a global batch error occurs, mark all predictions in this batch as errored
-            # This overwrites any per-sample errors identified before the exception.
-            predictions = [] # Clear any partial predictions
-            for _ in features_batch:
-                predictions.append({"error": "TFLite batch inference exception", "ml_score": None, "ml_derived_decision": "ML_ERROR_INFERENCE_EXCEPTION"})
-                if self.metrics_collector:
-                     self.metrics_collector.record_ml_prediction(outcome="ML_ERROR_INFERENCE_EXCEPTION", confidence_score=None)
+                batch_output_data = self.interpreter.get_tensor(self.output_details[0]['index'])
 
-        return predictions
+                for i, (original_index, cache_key_for_miss) in enumerate(zip(miss_indices, cache_keys_for_misses)):
+                    sample_output = batch_output_data[i]
+                    score: Optional[float] = None
+                    decision = "ML_ERROR"
+                    ml_decision_outcome_label = "ML_ERROR_PROCESSING_MISS" # Default for this stage
+
+                    if sample_output.ndim == 1:
+                        if sample_output.shape[0] == 1: score = float(sample_output[0])
+                        elif sample_output.shape[0] == 2: score = float(sample_output[1])
+                        else: ml_decision_outcome_label = "ML_ERROR_OUTPUT_SHAPE_MISS"
+                    else: ml_decision_outcome_label = "ML_ERROR_OUTPUT_DIM_MISS"
+
+                    score_for_metric: Optional[float] = None
+                    if score is not None:
+                        decision = "ML_APPROVED" if score >= self.approval_threshold else "ML_REJECTED"
+                        score_for_metric = round(score, 4)
+                        ml_decision_outcome_label = decision
+
+                    current_prediction_result = {'ml_score': score_for_metric, 'ml_derived_decision': decision}
+                    predictions_results[original_index] = current_prediction_result
+                    self.prediction_cache[cache_key_for_miss] = current_prediction_result # Add to cache
+
+                    if self.metrics_collector:
+                        self.metrics_collector.record_ml_prediction(outcome=ml_decision_outcome_label, confidence_score=score_for_metric)
+
+            except Exception as e:
+                logger.error(f"Error during TFLite batch inference for cache misses: {e}", exc_info=True, num_misses=len(miss_features))
+                # Mark all missed predictions as errored if batch inference fails
+                for original_index in miss_indices:
+                    predictions_results[original_index] = {"error": "TFLite batch inference exception on miss", "ml_score": None, "ml_derived_decision": "ML_ERROR_INFERENCE_EXCEPTION"}
+                    if self.metrics_collector:
+                         self.metrics_collector.record_ml_prediction(outcome="ML_ERROR_INFERENCE_EXCEPTION", confidence_score=None)
+
+        # Ensure no None entries are left if some samples were skipped due to validation errors before caching logic
+        # This should not happen if all paths correctly assign a dict to predictions_results[i]
+        final_predictions = [res if res is not None else {"error": "Skipped due to pre-cache validation error", "ml_score": None, "ml_derived_decision": "ML_ERROR_SKIPPED"} for res in predictions_results]
+
+        return final_predictions
 
     async def health_check(self) -> Dict[str, Any]:
         if not TFLITE_AVAILABLE:

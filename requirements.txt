@@ -13,3 +13,4 @@ pandas>=2.1.0
 tflite-runtime
 tensorflow>=2.15.0
 prometheus-client>=0.19.0
+cachetools>=4.0.0
